@@ -41,6 +41,9 @@ class DeviceAnalyzer {
       distance: this._estimateDistance(peripheral.rssi),
       manufacturerHex: mfr ? mfr.toString('hex') : null,
       serviceUuids: adv.serviceUuids || [],
+      // Part of the rotation-resistant fingerprint: a device's advertised TX
+      // power is a hardware property and survives an address change.
+      txPowerLevel: adv.txPowerLevel != null ? adv.txPowerLevel : null,
     }
   }
 
