@@ -13,17 +13,33 @@ const THREAT_COLORS = {
 
 const DETECTION_GUIDE = `{bold}{cyan-fg}HOW TRACKING DETECTION WORKS{/}
 
-{bold}BLE SCANNERS (this tool){/}
-Scans Bluetooth Low Energy for known tracker signatures.
-Detects: AirTag, Tile, Samsung SmartTag, Chipolo, Pebblebee,
-and any unknown BLE device that follows you over time.
+{bold}{cyan-fg}BLE SCANNING (this tool){/}
+Scans Bluetooth Low Energy for known tracker signatures continuously.
+Also flags ANY unknown BLE device seen 5+ times over 10+ minutes.
 
-{bold}WHAT WE DETECT:{/}
- • {red-fg}AirTag{/} — Apple FindMy (manufacturer ID 0x004C, type 0x12/0x19)
- • {red-fg}Tile{/} — Service UUID 0xFEED in BLE advertisement
- • {red-fg}SmartTag{/} — Samsung, service UUID 0xFD5A / 0xFD70
- • {red-fg}Find My compatible{/} — Chipolo ONE Spot, Pebblebee, etc.
- • {yellow-fg}Unknown following device{/} — Any BLE device seen 5+ times over 10+ min
+{bold}BLE TRACKERS DETECTED:{/}
+ • {red-fg}Apple AirTag{/} — mfr data 0x004C type 0x12/0x19 (FindMy)
+ • {red-fg}Apple Find My devices{/} — Chipolo ONE Spot, Pebblebee, Invoxia, Motorola Tag
+ • {red-fg}Tile / Life360{/} — service UUID 0xFEED
+ • {red-fg}Samsung SmartTag / SmartTag2{/} — service UUID 0xFD5A / 0xFD70
+ • {red-fg}Chipolo{/} — service UUID 0xFE9F / 0xFEBE
+ • {red-fg}Pebblebee{/} — service UUID 0xFE2C / 0xFEE7
+ • {red-fg}Orbit / KeySmart{/} — service UUID 0xFFF3
+ • {red-fg}Nut / Nutale{/} — service UUID 0xAA01
+ • {red-fg}GPS tracker BLE config{/} — TK102/TK103/GT06/GL300/Concox/SinoTrack/Coban
+ • {yellow-fg}Eddystone beacon{/} — can be used for proximity/location tracking
+ • {yellow-fg}Unknown following device{/} — any BLE device persisting 10+ min
+
+{bold}{magenta-fg}WIFI SCANNING (this tool){/}
+Scans nearby access points every 30 seconds via nmcli/airport.
+Detects trackers that create their own WiFi hotspot for config/reporting.
+
+{bold}WIFI TRACKERS DETECTED:{/}
+ • {red-fg}OBD-II port trackers{/} — plug into car OBD port, create WiFi AP
+     (Vyncs, Bouncie, Linxup, Zubie, Hummingbird, generic OBD-WiFi)
+ • {red-fg}Standalone GPS + WiFi trackers{/} — SSID contains GPS/TRACKER/LOCATE
+ • {red-fg}Cellular GPS trackers with WiFi config{/} — TK103, GT06, ST-901, GL300, GV300
+ • {red-fg}Satellite tracker hotspots{/} — SPOT, Garmin inReach, Iridium GO, Bivy Stick
 
 {bold}GSM/LTE GPS TRACKERS (hidden in your car){/}
 These report location via SIM card. Harder to detect without hardware.
@@ -111,7 +127,7 @@ class Dashboard {
     // Left top: tracker list
     this._listBox = blessed.list({
       parent: s,
-      label: ' {bold}DETECTED TRACKERS{/} ',
+      label: ' {bold}DETECTED DEVICES{/}  {cyan-fg}B{/}=BLE {magenta-fg}W{/}=WiFi ',
       tags: true,
       top: 3,
       left: 0,
@@ -338,7 +354,12 @@ class Dashboard {
     const visible = this._devices.filter(d => !d.benign)
 
     if (visible.length === 0) {
-      this._listBox.setItems(['{gray-fg}  No trackers detected yet...{/}', '{gray-fg}  Scanning for AirTags, Tile, SmartTags{/}', '{gray-fg}  Press I for detection guide{/}'])
+      this._listBox.setItems([
+        '{gray-fg}  No suspicious devices detected yet...{/}',
+        '{gray-fg}  BLE: AirTag|Tile|SmartTag|GPS tracker BLE{/}',
+        '{gray-fg}  WiFi: OBD trackers|GPS hotspots{/}',
+        '{gray-fg}  Press I for full detection guide{/}',
+      ])
       return
     }
 
@@ -357,11 +378,14 @@ class Dashboard {
       NONE: `{gray-fg}[   ]{/}`,
     }
     const icon = icons[d.threat] || `{white-fg}[   ]{/}`
-    const name = (d.name || 'Unknown').substring(0, 18).padEnd(18)
+    const typeTag = d.scanType === 'wifi'
+      ? '{magenta-fg}W{/}'
+      : '{cyan-fg}B{/}'
+    const name = (d.name || 'Unknown').substring(0, 16).padEnd(16)
     const rssi = String(d.rssi || 0).padStart(4)
     const seen = this._ago(d.firstSeen || Date.now())
     const followFlag = d.following ? ` {red-fg}FOLLOWING{/}` : ''
-    return `${icon} {${tc}-fg}${name}{/} ${rssi}dBm  ${seen}${followFlag}`
+    return `${icon}${typeTag} {${tc}-fg}${name}{/} ${rssi}dBm  ${seen}${followFlag}`
   }
 
   _renderDetails() {
@@ -386,23 +410,36 @@ class Dashboard {
       ? this._isStable(device.rssiHistory) ? '{red-fg}YES (attached?){/}' : 'No'
       : 'Not enough data'
 
+    const scanLabel = device.scanType === 'wifi'
+      ? '{magenta-fg}WiFi{/}'
+      : '{cyan-fg}Bluetooth LE{/}'
+    const unknownType = device.scanType === 'wifi' ? 'Unknown WiFi Device' : 'Unknown BLE Device'
+
     const lines = [
       `  {bold}{cyan-fg}Name:{/}         {/}{bold}${device.name || 'Unknown'}{/}`,
+      `  {bold}{cyan-fg}Scan type:{/}    {/}${scanLabel}`,
       `  {bold}{cyan-fg}Address:{/}      {/}{gray-fg}${device.address || 'N/A'}{/}`,
-      `  {bold}{cyan-fg}Type:{/}         {/}{${tc}-fg}${t ? t.name : 'Unknown BLE Device'}{/}`,
+      `  {bold}{cyan-fg}Detected as:{/}  {/}{${tc}-fg}${t ? t.name : unknownType}{/}`,
       `  {bold}{cyan-fg}Brand:{/}        {/}${t ? t.brand : 'Unknown'}`,
       '',
       `  {bold}{cyan-fg}Threat:{/}       {/}{${tc}-fg}{bold}${device.threat}{/}{/}`,
       `  {bold}{cyan-fg}Score:{/}        {/}${bar} ${device.threatScore || 0}/100`,
-      `  {bold}{cyan-fg}RSSI:{/}         {/}${device.rssi || 0} dBm (est. ${device.distance || 'unknown'})`,
+      `  {bold}{cyan-fg}Signal:{/}       {/}${device.rssi || 0} dBm (est. ${device.distance || 'unknown'})`,
       `  {bold}{cyan-fg}Stable signal:{/} ${stable}`,
-      '',
-      `  {bold}{cyan-fg}First seen:{/}   {/}${this._ago(device.firstSeen)}`,
-      `  {bold}{cyan-fg}Last seen:{/}    {/}${this._ago(device.lastSeen)}`,
-      `  {bold}{cyan-fg}Appearances:{/}  {/}{bold}${device.appearances || 1}x{/}`,
-      `  {bold}{cyan-fg}Following you:{/} {/}${device.following ? `{red-fg}{bold}YES — ${followDur}{/}{/}` : 'Not yet'}`,
-      '',
     ]
+
+    // WiFi-specific fields
+    if (device.scanType === 'wifi') {
+      lines.push(`  {bold}{cyan-fg}Channel:{/}      {/}${device.channel || 'N/A'}`)
+      lines.push(`  {bold}{cyan-fg}Security:{/}     {/}${device.security || 'Unknown'}`)
+    }
+
+    lines.push('')
+    lines.push(`  {bold}{cyan-fg}First seen:{/}   {/}${this._ago(device.firstSeen)}`)
+    lines.push(`  {bold}{cyan-fg}Last seen:{/}    {/}${this._ago(device.lastSeen)}`)
+    lines.push(`  {bold}{cyan-fg}Appearances:{/}  {/}{bold}${device.appearances || 1}x{/}`)
+    lines.push(`  {bold}{cyan-fg}Following you:{/} {/}${device.following ? `{red-fg}{bold}YES — ${followDur}{/}{/}` : 'Not yet'}`)
+    lines.push('')
 
     if (t && t.notes) {
       lines.push(`  {bold}{cyan-fg}About this tracker:{/}`)
@@ -415,14 +452,19 @@ class Dashboard {
       lines.push(`  {red-fg}Check your vehicle: wheel wells, bumpers, undercarriage.{/}`)
       lines.push(`  {red-fg}Check bags and personal items for hidden devices.{/}`)
       if (device.trackerType === 'airtag') {
-        lines.push(`  {red-fg}iPhone/iOS: "Items Detected Near You" notification.{/}`)
-        lines.push(`  {red-fg}Android: "Tracker Detect" app can scan and play sound.{/}`)
+        lines.push(`  {red-fg}iOS: "Items Detected Near You" notification.{/}`)
+        lines.push(`  {red-fg}Android: "Tracker Detect" app — play sound on AirTag.{/}`)
+      }
+      if (device.scanType === 'wifi') {
+        lines.push(`  {red-fg}WiFi tracker: physically inspect vehicle for OBD-II{/}`)
+        lines.push(`  {red-fg}dongle or magnetic GPS unit with WiFi antenna.{/}`)
       }
     } else if (device.trackerType) {
       lines.push(`  {yellow-fg}Known tracker type detected. Monitor if it persists.{/}`)
       lines.push(`  {yellow-fg}If seen across multiple locations, take action.{/}`)
     } else {
-      lines.push(`  {gray-fg}Unknown BLE device. Monitoring for following pattern.{/}`)
+      const medium = device.scanType === 'wifi' ? 'WiFi' : 'BLE'
+      lines.push(`  {gray-fg}Unknown ${medium} device. Monitoring for following pattern.{/}`)
       lines.push(`  {gray-fg}Will alert if seen 5+ times over 10+ minutes.{/}`)
     }
 
