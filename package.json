@@ -1,27 +1,21 @@
 {
-  "name": "xat-client",
-  "version": "0.7.0",
-  "description": "Node.js implementation of xat.com client.",
-  "main": "./src/main.js",
-  "repository": {
-    "url": "https://github.com/huumanoid/xat-client.git",
-    "type": "git"
-  },
-  "license": "MIT",
-  "dependencies": {
-    "amflib": "github:huumanoid/node-amf#323e29f9a1d1041f5d5230b7fc350a70aaf66bb4",
-    "xml2js": "^0.4.16"
-  },
-  "devDependencies": {
-    "eslint": "^3.15.0",
-    "eslint-config-standard": "^6.2.1",
-    "eslint-plugin-markdown": "^1.0.0-beta.3",
-    "eslint-plugin-promise": "^3.4.0",
-    "eslint-plugin-standard": "^2.0.1"
+  "name": "track-detect",
+  "version": "1.0.0",
+  "description": "Detect AirTags, GPS trackers, and BLE tracking devices in real-time",
+  "main": "src/main.js",
+  "bin": {
+    "track-detect": "./src/main.js"
   },
   "scripts": {
-    "lint": "eslint \"src/**/*.js\"",
-    "lint-md": "eslint README.md"
+    "start": "node src/main.js"
   },
-  "author": "huumanoid"
+  "dependencies": {
+    "@abandonware/noble": "^1.9.2-15",
+    "blessed": "^0.1.81",
+    "chalk": "^4.1.2"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=14"
+  }
 }
