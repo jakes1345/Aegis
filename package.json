@@ -1,19 +1,29 @@
 {
   "name": "track-detect",
-  "version": "1.0.0",
-  "description": "Detect AirTags, GPS trackers, and BLE tracking devices in real-time",
+  "version": "2.0.0",
+  "description": "Detect whether you are being tracked: BLE tags, WiFi GPS trackers, hidden cellular/satellite transmitters via SDR, and IMSI catchers",
   "main": "src/main.js",
   "bin": {
     "track-detect": "./src/main.js"
   },
   "scripts": {
-    "start": "node src/main.js"
+    "start": "node src/main.js",
+    "test": "node test/run.js"
   },
   "dependencies": {
     "@abandonware/noble": "^1.9.2-15",
     "blessed": "^0.1.81",
     "chalk": "^4.1.2"
   },
+  "keywords": [
+    "airtag",
+    "tracker-detection",
+    "counter-surveillance",
+    "imsi-catcher",
+    "rtl-sdr",
+    "gps-tracker",
+    "bluetooth-le"
+  ],
   "license": "MIT",
   "engines": {
     "node": ">=14"
