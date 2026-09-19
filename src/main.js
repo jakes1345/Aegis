@@ -134,7 +134,7 @@ function context() {
   }
 }
 
-// ── Position ────────────────────────────────────────────────────────
+// ── Position ─────────────────────────────────────────────────────────────────
 
 if (opts.gps) {
   const gps = new GPSSource({ nmeaDevice: opts.gpsDevice })
@@ -162,7 +162,7 @@ if (opts.gps) {
   dashboard.setSubsystem('GPS', 'off', 'disabled')
 }
 
-// ── Bluetooth LE ───────────────────────────────────────────────────
+// ── Bluetooth LE ─────────────────────────────────────────────────────────────
 
 if (opts.ble) {
   const bleScanner = new BLEScanner()
@@ -220,7 +220,7 @@ if (opts.ble) {
   dashboard.setSubsystem('BLE', 'off', 'disabled')
 }
 
-// ── WiFi ────────────────────────────────────────────────────────────
+// ── WiFi ─────────────────────────────────────────────────────────────────────
 
 if (opts.wifi) {
   const wifiScanner = new WiFiScanner()
@@ -253,7 +253,7 @@ if (opts.wifi) {
   dashboard.setSubsystem('WiFi', 'off', 'disabled')
 }
 
-// ── Cellular / IMSI catcher ────────────────────────────────────────────
+// ── Cellular / IMSI catcher ──────────────────────────────────────────────────
 
 if (opts.cell) {
   const cellScanner = new CellularScanner({ atDevice: opts.atDevice })
@@ -293,7 +293,7 @@ if (opts.cell) {
   dashboard.setSubsystem('Cell', 'off', 'disabled')
 }
 
-// ── RF sweep ───────────────────────────────────────────────────────
+// ── RF sweep ─────────────────────────────────────────────────────────────────
 
 let sdrScanner = null
 
@@ -446,7 +446,7 @@ if (opts.sdr) {
   dashboard.setSubsystem('SDR', 'off', 'disabled')
 }
 
-// ── Housekeeping ───────────────────────────────────────────────────
+// ── Housekeeping ─────────────────────────────────────────────────────────────
 
 const cleanupTimer = setInterval(() => {
   persistence.clearOld(30 * 60 * 1000)

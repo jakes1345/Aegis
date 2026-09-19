@@ -32,7 +32,7 @@ function section(title) {
   process.stdout.write(`\n${title}\n`)
 }
 
-// ── Geo ─────────────────────────────────────────────────────────────
+// ── Geo ──────────────────────────────────────────────────────────────────────
 
 section('geo')
 {
@@ -66,7 +66,7 @@ section('geo')
   ok('a fast fix is moving', track.isMoving() === true)
 }
 
-// ── Periodicity ─────────────────────────────────────────────────────
+// ── Periodicity ──────────────────────────────────────────────────────────────
 
 section('periodicity')
 {
@@ -98,7 +98,7 @@ section('periodicity')
   ok('37 s matches nothing standard', matchesCommonInterval(37000) === null)
 }
 
-// ── Spectrum ───────────────────────────────────────────────────────
+// ── Spectrum ─────────────────────────────────────────────────────────────────
 
 section('spectrum')
 {
@@ -156,7 +156,7 @@ section('spectrum')
     drift.signals.length === 0, `got ${drift.signals.length}`)
 }
 
-// ── BLE identity across MAC rotation ─────────────────────────────────────
+// ── BLE identity across MAC rotation ─────────────────────────────────────────
 
 section('identity')
 {
@@ -205,7 +205,7 @@ section('identity')
     notLinked.rotated === false)
 }
 
-// ── Cellular parsers ────────────────────────────────────────────────
+// ── Cellular parsers ─────────────────────────────────────────────────────────
 
 section('cellular parsers')
 {
@@ -258,7 +258,7 @@ section('cellular parsers')
   ok('unparseable AT output yields nothing', parseAtOutput('OK') === null)
 }
 
-// ── NMEA ───────────────────────────────────────────────────────────
+// ── NMEA ─────────────────────────────────────────────────────────────────────
 
 section('nmea')
 {
@@ -286,7 +286,7 @@ section('nmea')
   ok('non-NMEA input is ignored', parseNMEA('hello') === null)
 }
 
-// ── Result ────────────────────────────────────────────────────────
+// ── Result ───────────────────────────────────────────────────────────────────
 
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`)
 process.exit(failed === 0 ? 0 : 1)
