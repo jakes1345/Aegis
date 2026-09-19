@@ -167,8 +167,14 @@ class RFTracker {
       reasons.push('Periodic ISM traffic is common and usually benign (smart meters, weather stations, TPMS). Movement evidence is needed before this means anything.')
     }
 
+    if (emitter.category === 'rfid') {
+      reasons.push('UHF RFID reader interrogation carrier detected. This is fixed infrastructure (parking garage, toll gantry, border checkpoint, warehouse portal) scanning for passive RFID tags in range. It cannot track you — it can only read a tag you carry. If you passed through a checkpoint and this signal appeared, your RFID-equipped credential (key fob, pass, vehicle sticker) was scanned.')
+    }
+
     let classification = 'unclassified'
-    if (movedWithUs && (isPeriodic || uplink)) {
+    if (emitter.category === 'rfid') {
+      classification = movedWithUs ? 'rfid_mobile_reader' : 'rfid_reader'
+    } else if (movedWithUs && (isPeriodic || uplink)) {
       classification = emitter.category === 'satellite' ? 'satellite_tracker' : 'mobile_tracker'
     } else if (isPeriodic && uplink) {
       classification = emitter.category === 'satellite' ? 'satellite_beacon' : 'cellular_beacon'
@@ -200,6 +206,8 @@ class RFTracker {
       satellite_tracker: 'Satellite tracker on you',
       cellular_beacon: 'Cellular beacon',
       satellite_beacon: 'Satellite beacon',
+      rfid_reader: 'UHF RFID reader portal',
+      rfid_mobile_reader: 'Mobile UHF RFID reader (moving with you)',
       mobile_emitter: 'Emitter moving with you',
       periodic_emitter: 'Periodic emitter',
       unclassified: 'RF emitter',

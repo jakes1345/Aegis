@@ -88,6 +88,23 @@ const BANDS = [
     notes: 'US ISM. LoRa/Meshtastic asset tags and long-range covert beacons.',
   },
   {
+    id: 'uhf_rfid',
+    label: 'UHF RFID reader interrogation (860-960 MHz)',
+    minHz: 860e6,
+    maxHz: 960e6,
+    category: 'rfid',
+    // Passive RFID tags are silent — they only reflect when hit by a reader
+    // carrier. What we detect here is the READER's CW carrier and commands.
+    // EU readers use 865-868 MHz (ETSI EN 302 208); US readers use 902-928 MHz
+    // (FCC part 15); some proprietary readers sweep wider.
+    // Parking garages, toll gantries, warehouse portals, and border checkpoints
+    // all run fixed UHF RFID readers. Detecting one nearby means an active
+    // interrogation sweep is in progress. Detecting your own RFID tags (e.g.
+    // keyfob, passport, vehicle registration sticker) requires a physical sweep
+    // with a Proxmark3 or Flipper Zero — software cannot scan passives.
+    notes: 'UHF RFID reader interrogation band. Readers broadcast a continuous-wave carrier and encoded commands to wake passive tags. EU readers: 865-868 MHz; US readers: 902-928 MHz. Detecting a reader means an active interrogation is happening nearby — could be a toll or access-control portal, or a covert vehicle/cargo scanner. NFC/tap-to-pay (13.56 MHz HF) is physically separate and not detectable by RTL-SDR hardware.',
+  },
+  {
     id: 'globalstar_up',
     label: 'Globalstar uplink',
     minHz: 1610e6,
@@ -153,7 +170,7 @@ const PRESETS = {
   },
   covert: {
     label: 'Covert RF beacons and bugs',
-    survey: ['ism433', 'ism868', 'ism915'],
+    survey: ['ism433', 'ism868', 'ism915', 'uhf_rfid'],
     watch: 'ism433',
   },
   all: {
