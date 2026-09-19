@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Build release APK
+        working-directory: android
+        run: gradle assembleRelease --no-daemon
+
+      - name: Sign APK (debug key for sideloading)
+        run: |
+          $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | tail -1)/apksigner sign \
+            --ks ~/.android/debug.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --out android/app/build/outputs/apk/release/track-detect-${{ github.ref_name }}.apk \
+            android/app/build/outputs/apk/release/app-release-unsigned.apk
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Track Detect ${{ github.ref_name }}
+          body: |
+            ## Track Detect ${{ github.ref_name }}
+
+            Multi-source tracker detection tool for Android.
+
+            **Detects:**
+            - BLE trackers: AirTag, Tile, Samsung SmartTag, Chipolo, Pebblebee, and unknowns
+            - GPS/LTE tracker hotspots (OBD port devices, hidden boxes)
+            - RF periodic transmitters via SDR (laptop companion tool)
+            - IMSI catcher anomalies (cellular scanner)
+
+            **Install:**
+            1. Download `track-detect-${{ github.ref_name }}.apk` below
+            2. On your phone: Settings → Apps → Special app access → Install unknown apps → allow your file manager
+            3. Tap the APK to install — approve the Play Protect warning
+            4. Grant Bluetooth, Location (precise), and Notifications permissions on first launch
+
+            **Requirements:** Android 12+ (API 31)
+          files: android/app/build/outputs/apk/release/track-detect-${{ github.ref_name }}.apk
+          draft: false
+          prerelease: false
