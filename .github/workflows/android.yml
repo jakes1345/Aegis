@@ -24,8 +24,8 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # ubuntu-latest ships Android SDK (API 35, build-tools 35.x) and sets
+      # ANDROID_HOME, so no separate setup action is needed.
 
       # No wrapper jar is committed, so Gradle is installed by the action and
       # put on PATH. Keeps a binary out of the repo.
