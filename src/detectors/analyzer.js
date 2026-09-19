@@ -1,6 +1,7 @@
 'use strict'
 
 const { SIGNATURES, BENIGN } = require('./signatures')
+const oui = require('../analysis/oui')
 
 // TX power reference at 1 meter (typical BLE device)
 const TX_POWER_REF = -59
@@ -44,6 +45,12 @@ class DeviceAnalyzer {
       // Part of the rotation-resistant fingerprint: a device's advertised TX
       // power is a hardware property and survives an address change.
       txPowerLevel: adv.txPowerLevel != null ? adv.txPowerLevel : null,
+      // IEEE OUI lookup: turns 'AA:BB:CC:...' into 'Quectel Wireless Solutions'
+      // so unknown devices are at least attributed to a chipmaker.
+      manufacturer: oui.lookup(peripheral.address),
+      // Beacon interval measured by the scanner from event timestamps (ms).
+      // Populated only when the peripheral is seen enough times to compute it.
+      beaconIntervalMs: peripheral._beaconIntervalMs || null,
     }
   }
 

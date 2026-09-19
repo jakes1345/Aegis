@@ -2,11 +2,18 @@
 
 const EventEmitter = require('events')
 
+// Minimum samples before we commit to a beacon interval estimate.
+const INTERVAL_MIN_SAMPLES = 6
+// Keep the last N timestamps per address to bound memory.
+const INTERVAL_WINDOW = 20
+
 class BLEScanner extends EventEmitter {
   constructor() {
     super()
     this._noble = null
     this._scanning = false
+    // address → { times: number[], intervalMs: number|null }
+    this._intervals = new Map()
   }
 
   start() {
@@ -42,6 +49,7 @@ class BLEScanner extends EventEmitter {
     })
 
     noble.on('discover', (peripheral) => {
+      this._trackInterval(peripheral)
       this.emit('device', peripheral)
     })
 
@@ -52,6 +60,34 @@ class BLEScanner extends EventEmitter {
     noble.on('warning', (msg) => {
       this.emit('warning', msg)
     })
+  }
+
+  _trackInterval(peripheral) {
+    const id = peripheral.address || peripheral.uuid
+    if (!id) return
+    const now = Date.now()
+
+    let entry = this._intervals.get(id)
+    if (!entry) {
+      entry = { times: [], intervalMs: null }
+      this._intervals.set(id, entry)
+    }
+
+    entry.times.push(now)
+    if (entry.times.length > INTERVAL_WINDOW) entry.times.shift()
+
+    if (entry.times.length >= INTERVAL_MIN_SAMPLES) {
+      const diffs = []
+      for (let i = 1; i < entry.times.length; i++) {
+        diffs.push(entry.times[i] - entry.times[i - 1])
+      }
+      // Median gap — more robust to missed packets than mean.
+      diffs.sort((a, b) => a - b)
+      entry.intervalMs = diffs[Math.floor(diffs.length / 2)]
+    }
+
+    // Attach to peripheral so analyzer.js can read it without extra state.
+    peripheral._beaconIntervalMs = entry.intervalMs
   }
 
   get isScanning() {

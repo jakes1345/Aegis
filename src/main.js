@@ -21,6 +21,8 @@ const { describePeriod } = require('./analysis/periodicity')
 const Dashboard = require('./ui/dashboard')
 const { Store } = require('./store')
 const { SDR_PROFILES, PRESETS, BANDS, bandById, reachable } = require('./config')
+const celltowerDb = require('./analysis/celltower-db')
+const oui = require('./analysis/oui')
 
 // How long the receiver spends looking wide before committing to one
 // frequency. Survey finds candidates; only watch mode can time them.
@@ -121,6 +123,16 @@ const wifiAnalyzer = new WiFiAnalyzer()
 
 const cellStore = new Store('cell-baseline.json')
 const imsiDetector = new IMSICatcherDetector(cellStore)
+
+// Load OUI database from cache (fast, sync) then refresh in background if stale.
+oui.loadSync()
+oui.refreshIfStale()
+
+if (celltowerDb.hasApiKey()) {
+  dashboard.log('{green-fg}OpenCelliD tower verification enabled{/}')
+} else {
+  dashboard.log('{gray-fg}Tip: set OPENCELLID_API_KEY env var for definitive IMSI catcher detection{/}')
+}
 
 dashboard.render()
 dashboard.log('{bold}Track Detect{/} starting')
@@ -281,6 +293,22 @@ if (opts.cell) {
             f.severity === 'CRITICAL' || f.severity === 'HIGH'
           )
         }
+      }
+
+      // OpenCelliD verification: if this cell is locally unknown, confirm
+      // against the global database. A cell absent from 40M+ real towers is
+      // definitive, not a heuristic. We do this async so it never blocks the
+      // synchronous observation loop.
+      if (celltowerDb.hasApiKey() && !imsiDetector.baseline.cells[cell.key]) {
+        celltowerDb.lookupCell(cell, (err, found) => {
+          if (err || found == null) return
+          if (!found.found) {
+            dashboard.addRawAlert(
+              `CELL [OpenCelliD]: Cell ${cell.cellId} (TAC ${cell.tac || '?'}) is NOT in the global tower database — strong IMSI catcher indicator`,
+              true
+            )
+          }
+        })
       }
     } catch (err) {
       dashboard.log(`{red-fg}Cell analysis error: ${err.message}{/}`, 'error')

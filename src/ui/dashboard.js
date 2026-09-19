@@ -693,6 +693,24 @@ class Dashboard {
       lines.push(`  {gray-fg}${this._wrap(t.notes, 4)}{/}`)
     }
 
+    if (device.manufacturer) {
+      lines.push('')
+      lines.push(`  {bold}{cyan-fg}Chip maker:{/}   {/}{gray-fg}${device.manufacturer}{/}`)
+    }
+
+    if (device.beaconIntervalMs != null) {
+      // AirTag beacons every ~500 ms, Tile ~700 ms, random devices vary wildly.
+      const intervalStr = device.beaconIntervalMs < 1000
+        ? `${device.beaconIntervalMs} ms`
+        : `${(device.beaconIntervalMs / 1000).toFixed(1)} s`
+      const intervalNote = device.beaconIntervalMs <= 750
+        ? ' {red-fg}(tracker-like — fixed rapid cadence){/}'
+        : device.beaconIntervalMs <= 2000
+        ? ' {yellow-fg}(periodic — consistent with a tracker){/}'
+        : ' {gray-fg}(irregular — typical of human-carried device){/}'
+      lines.push(`  {bold}{cyan-fg}Beacon rate:{/}  {/}${intervalStr}${intervalNote}`)
+    }
+
     if (device.manufacturerHex) {
       lines.push('')
       lines.push(`  {gray-fg}Mfr data: ${device.manufacturerHex.substring(0, 40)}${device.manufacturerHex.length > 40 ? '…' : ''}{/}`)
