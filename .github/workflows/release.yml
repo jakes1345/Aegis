@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
 
 permissions:
   contents: write
@@ -14,6 +20,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -32,19 +47,21 @@ jobs:
 
       - name: Sign APK (debug key for sideloading)
         run: |
-          $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | tail -1)/apksigner sign \
+          BUILD_TOOLS=$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)
+          $ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner sign \
             --ks ~/.android/debug.keystore \
             --ks-pass pass:android \
             --key-pass pass:android \
-            --out android/app/build/outputs/apk/release/track-detect-${{ github.ref_name }}.apk \
+            --out android/app/build/outputs/apk/release/track-detect-${{ steps.tag.outputs.name }}.apk \
             android/app/build/outputs/apk/release/app-release-unsigned.apk
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Track Detect ${{ github.ref_name }}
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Track Detect ${{ steps.tag.outputs.name }}
           body: |
-            ## Track Detect ${{ github.ref_name }}
+            ## Track Detect ${{ steps.tag.outputs.name }}
 
             Multi-source tracker detection tool for Android.
 
@@ -55,12 +72,12 @@ jobs:
             - IMSI catcher anomalies (cellular scanner)
 
             **Install:**
-            1. Download `track-detect-${{ github.ref_name }}.apk` below
+            1. Download `track-detect-${{ steps.tag.outputs.name }}.apk` below
             2. On your phone: Settings → Apps → Special app access → Install unknown apps → allow your file manager
             3. Tap the APK to install — approve the Play Protect warning
             4. Grant Bluetooth, Location (precise), and Notifications permissions on first launch
 
             **Requirements:** Android 12+ (API 31)
-          files: android/app/build/outputs/apk/release/track-detect-${{ github.ref_name }}.apk
+          files: android/app/build/outputs/apk/release/track-detect-${{ steps.tag.outputs.name }}.apk
           draft: false
           prerelease: false
