@@ -7,6 +7,19 @@ import com.trackdetect.TrackerType
 private const val APPLE = 0x004C
 private const val MICROSOFT = 0x0006
 
+private val COMPANY_NAMES = mapOf(
+    0x004C to "Apple", 0x0075 to "Samsung", 0x00E0 to "Google", 0x0157 to "Google",
+    0x0006 to "Microsoft", 0x01D7 to "Xiaomi", 0x0059 to "Nordic Semiconductor",
+    0x02E5 to "Espressif", 0x0499 to "Ruuvi", 0x00D7 to "Tile",
+    0x0057 to "Harman", 0x00F8 to "Bose", 0x046D to "Logitech",
+    0x007D to "Motorola", 0x022B to "Jabra", 0x006F to "Sony",
+    0x0110 to "Amazon", 0x01AE to "GoPro", 0x0087 to "Garmin",
+    0x0038 to "Texas Instruments", 0x001D to "Qualcomm", 0x0025 to "NXP",
+    0x0469 to "Fitbit", 0x005E to "Tile", 0x0017 to "Ericsson",
+    0x0048 to "Plantronics", 0x016D to "Bang & Olufsen",
+    0x09AF to "Nothing", 0x038F to "MediaTek"
+)
+
 /**
  * Tracker signatures based on public reverse engineering — OpenHaystack,
  * packet captures and vendor documentation.
@@ -63,6 +76,21 @@ object Signatures {
     val NUT = TrackerType(
         "nut", "Nut tracker", "Nut / Nutale", Threat.HIGH,
         "Crowdsourced Nut network. Cheap and widely sold outside the US."
+    )
+
+    val MOTOROLA_TAG = TrackerType(
+        "motorola_tag", "Motorola MA1", "Motorola / Apple", Threat.HIGH,
+        "Find My compatible tracker. Same Apple global crowdsourced network as AirTag."
+    )
+
+    val INVOXIA = TrackerType(
+        "invoxia", "Invoxia GPS tracker", "Invoxia", Threat.HIGH,
+        "Cellular + BLE GPS tracker designed for vehicle and asset tracking."
+    )
+
+    val CHIPOLO_SPOT = TrackerType(
+        "chipolo_spot", "Chipolo ONE Spot", "Chipolo", Threat.HIGH,
+        "Works on Apple's Find My network in addition to Chipolo's own."
     )
 
     val GPS_BLE = TrackerType(
@@ -130,17 +158,29 @@ object Signatures {
         if (record.hasShortUuid(0xFEED)) return TILE
         if (record.hasShortUuid(0xFD5A)) return SMARTTAG
         if (record.hasShortUuid(0xFD70)) return SMARTTAG2
-        if (record.hasShortUuid(0xFE9F) || record.hasShortUuid(0xFEBE) ||
-            record.hasShortUuid(0xFE2B)
-        ) return CHIPOLO
+        if (record.hasShortUuid(0xFE9F)) return CHIPOLO_SPOT     // ONE Spot on Chipolo net
+        if (record.hasShortUuid(0xFEBE) || record.hasShortUuid(0xFE2B)) return CHIPOLO
         if (record.hasShortUuid(0xFE2C) || record.hasShortUuid(0xFEE7)) return PEBBLEBEE
         if (record.hasShortUuid(0xFFF3) || record.hasShortUuid(0xFFE0)) return ORBIT
         if (record.hasShortUuid(0xAA01) || record.hasShortUuid(0xAA02)) return NUT
         if (record.hasShortUuid(0xFEAA)) return EDDYSTONE
+        if (record.hasShortUuid(0xFE85)) return INVOXIA
 
         val name = record.deviceName?.lowercase()
         if (name != null && GPS_NAME_HINTS.any { name.contains(it) }) return GPS_BLE
 
+        return null
+    }
+
+    /**
+     * Returns a human-readable brand label from the manufacturer-specific data company ID.
+     * Used as a fallback when the device name is blank and no tracker signature matched.
+     */
+    fun companyLabel(record: ScanRecord?): String? {
+        if (record == null) return null
+        COMPANY_NAMES.forEach { (id, name) ->
+            if (record.getManufacturerSpecificData(id) != null) return "$name device"
+        }
         return null
     }
 

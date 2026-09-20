@@ -1,6 +1,7 @@
 package com.trackdetect.analysis
 
 import android.location.Location
+import com.trackdetect.LatLon
 import kotlin.math.asin
 import kotlin.math.cos
 import kotlin.math.min
@@ -90,6 +91,8 @@ class ObservationArea(private val maxPlaces: Int = 60) {
     }
 
     fun movedWithUs(): Boolean = span() >= FOLLOW_DISPLACEMENT_M
+
+    fun points(): List<LatLon> = places.map { LatLon(it.lat, it.lon) }
 }
 
 /** Where we have been, and whether we are actually going anywhere. */
