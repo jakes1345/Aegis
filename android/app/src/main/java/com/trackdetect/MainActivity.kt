@@ -361,8 +361,9 @@ private fun MapScreen() {
                 }
 
                 // Current position
-                if (status.hasFix && status.lat != null && status.lon != null) {
-                    val o = LatLon(status.lat, status.lon).toOffset(proj, size)
+                val curLat = status.lat; val curLon = status.lon
+                if (status.hasFix && curLat != null && curLon != null) {
+                    val o = LatLon(curLat, curLon).toOffset(proj, size)
                     drawCircle(Color.White, 10f, o)
                     drawCircle(Blue, 7f, o)
                 }

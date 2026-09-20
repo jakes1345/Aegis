@@ -226,7 +226,7 @@ class IMSICatcher(private val store: Store) {
                 "tac_change_stationary" -> 25; "signal_outlier" -> 22
                 "unknown_cell" -> 20; "ephemeral_cell" -> 20
                 "cell_flapping" -> 18; "no_neighbors" -> 15; else -> 10
-            }
+            }.toInt()
         }.coerceIn(0, 100)
         val level = when {
             score >= 80 -> Threat.CRITICAL; score >= 50 -> Threat.HIGH
