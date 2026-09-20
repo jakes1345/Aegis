@@ -48,7 +48,8 @@ data class ScanStatus(
     val lat: Double? = null,
     val lon: Double? = null,
     val travelledM: Double = 0.0,
-    val error: String? = null
+    val error: String? = null,
+    val nearbyCount: Int = 0  // total BLE devices in range including transient ones
 )
 
 // --- Cellular / IMSI catcher ------------------------------------------------

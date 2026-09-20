@@ -213,8 +213,13 @@ private fun ScanStatusPanel(status: ScanStatus, detections: List<Detection>) {
         verticalArrangement = Arrangement.spacedBy(5.dp)
     ) {
         Text(verdict, color = verdictColor, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-        Text(if (status.scanning) "Scanning · ${detections.size} device(s)" else "Idle",
-            color = InkDim, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+        val scanText = when {
+            !status.scanning -> "Idle"
+            status.nearbyCount > detections.size ->
+                "Scanning · ${detections.size} flagged · ${status.nearbyCount} total in range"
+            else -> "Scanning · ${detections.size} device(s) flagged"
+        }
+        Text(scanText, color = InkDim, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
         Text(if (status.hasFix)
             "Fix %.4f, %.4f · ${if (status.moving) "moving" else "stationary"} · %.1f km".format(
                 status.lat ?: 0.0, status.lon ?: 0.0, status.travelledM / 1000.0)

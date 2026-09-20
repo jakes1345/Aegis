@@ -210,12 +210,20 @@ class ScanService : LifecycleService() {
             while (isActive) {
                 val now = System.currentTimeMillis()
                 tracker.prune(now)
-                val list = tracker.snapshot(now).sortedWith(
+                val all = tracker.snapshot(now)
+                // Only surface devices worth the user's attention; transient single-sighting
+                // signals from people walking by are tracked internally but not listed.
+                val list = all.filter { d ->
+                    d.following || d.persistent ||
+                        (d.tracker != null && d.sightings >= 3) ||
+                        d.sightings >= 5
+                }.sortedWith(
                     compareByDescending<Detection> { it.following }
                         .thenByDescending { it.persistent }
                         .thenByDescending { it.identified }
                         .thenByDescending { it.sightings }
                 )
+                Registry.update { it.copy(nearbyCount = all.size) }
                 Registry.publish(list)
                 updateOngoing(list)
 
@@ -246,7 +254,10 @@ class ScanService : LifecycleService() {
         val fingerprint = Fingerprint.of(record)
         val resolution = identities.resolve(address, result.rssi, fingerprint, now)
         val tracked = Signatures.match(record)
-        val name = record?.deviceName?.takeIf { it.isNotBlank() } ?: tracked?.label ?: "Unknown device"
+        val name = record?.deviceName?.takeIf { it.isNotBlank() }
+            ?: tracked?.label
+            ?: Signatures.companyLabel(record)
+            ?: "Unknown device"
         val txPower = record?.txPowerLevel?.takeIf { it != Int.MIN_VALUE }
 
         val observation = tracker.observe(
