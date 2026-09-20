@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    App icon foreground: a shield with a radar sweep arc inside.
+    Designed for adaptive icon use at viewportWidth/Height = 108dp.
+    Shield body: #1A237E (dark indigo).  Radar arc: #00E5FF (cyan).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Shield body -->
+    <path
+        android:fillColor="#1A237E"
+        android:pathData="M54,14 L83,26 L83,56 Q83,78 54,94 Q25,78 25,56 L25,26 Z" />
+
+    <!-- Shield edge highlight -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#3F51B5"
+        android:strokeWidth="1.8"
+        android:pathData="M54,16 L81,27.5 L81,56 Q81,76.5 54,91.5 Q27,76.5 27,56 L27,27.5 Z" />
+
+    <!-- Radar outer arc (upper semicircle centred at 54,57) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:pathData="M37,57 A17,17 0 0,1 71,57" />
+
+    <!-- Radar middle arc -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="2.5"
+        android:strokeAlpha="0.75"
+        android:strokeLineCap="round"
+        android:pathData="M44,57 A10,10 0 0,1 64,57" />
+
+    <!-- Radar sweep line (pointing upper-right at ~45°) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M54,57 L67,43" />
+
+    <!-- Centre dot -->
+    <path
+        android:fillColor="#00E5FF"
+        android:pathData="M54,57 m-4,0 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+
+</vector>
