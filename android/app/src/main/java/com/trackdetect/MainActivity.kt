@@ -18,12 +18,15 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
+import androidx.core.view.WindowCompat
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -100,6 +103,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         AppSettings.load(this)
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
         val onboardingAlreadyDone = isOnboardingDone(this)
@@ -372,7 +376,7 @@ private fun MainApp(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: () 
     )
 
     Column(Modifier.fillMaxSize()) {
-        Box(Modifier.weight(1f)) {
+        Box(Modifier.weight(1f).statusBarsPadding()) {
             when (tab) {
                 0 -> ScanScreen(
                     onStart, onStop, hasPermissions,
@@ -388,32 +392,40 @@ private fun MainApp(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: () 
                 5 -> WifiScreen()
             }
         }
-        Row(
-            Modifier.fillMaxWidth().background(Panel).padding(vertical = 4.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly
+        NavigationBar(
+            containerColor = Panel,
+            tonalElevation = 0.dp,
+            modifier = Modifier.fillMaxWidth().navigationBarsPadding()
         ) {
             tabs.forEachIndexed { i, label ->
-                val active = tab == i
-                TextButton(
+                NavigationBarItem(
+                    selected = tab == i,
                     onClick = { tab = i },
-                    modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(horizontal = 2.dp, vertical = 8.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            label,
-                            color = if (active) Accent else Muted,
-                            fontSize = 11.sp,
-                            fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
-                            letterSpacing = 0.5.sp,
-                            maxLines = 1
-                        )
-                        if (alerts[i]) {
-                            Spacer(Modifier.width(3.dp))
-                            Box(Modifier.size(5.dp).background(Critical, CircleShape))
+                    icon = {
+                        Box {
+                            TabIcon(index = i, selected = tab == i)
+                            if (alerts[i]) {
+                                Box(
+                                    Modifier
+                                        .size(7.dp)
+                                        .background(Critical, CircleShape)
+                                        .align(Alignment.TopEnd)
+                                        .offset(x = 2.dp, y = (-2).dp)
+                                )
+                            }
                         }
-                    }
-                }
+                    },
+                    label = {
+                        Text(label, fontSize = 10.sp, letterSpacing = 0.3.sp, maxLines = 1)
+                    },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = Accent,
+                        selectedTextColor = Accent,
+                        indicatorColor = Accent.copy(alpha = 0.15f),
+                        unselectedIconColor = Muted,
+                        unselectedTextColor = Muted
+                    )
+                )
             }
         }
     }
@@ -427,6 +439,87 @@ private fun MainApp(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: () 
             containerColor = Panel
         ) {
             ThreatExplainerSheet(target = target, onDismiss = { explainerTarget = null })
+        }
+    }
+}
+
+// ── Tab icons ─────────────────────────────────────────────────────────────────
+
+@Composable
+private fun TabIcon(index: Int, selected: Boolean) {
+    val color = if (selected) Accent else Muted
+    Canvas(Modifier.size(22.dp)) {
+        val cx = center.x
+        val cy = center.y
+        when (index) {
+            0 -> { // SCAN — radar rings
+                drawCircle(color.copy(alpha = 0.35f), radius = size.minDimension * 0.46f, center = center, style = Stroke(1f))
+                drawCircle(color.copy(alpha = 0.65f), radius = size.minDimension * 0.3f, center = center, style = Stroke(1.5f))
+                drawCircle(color, radius = size.minDimension * 0.14f, center = center)
+            }
+            1 -> { // MAP — location pin
+                val pinR = size.minDimension * 0.3f
+                val pinTop = Offset(cx, cy - pinR * 1.2f)
+                val path = Path().apply {
+                    addOval(androidx.compose.ui.geometry.Rect(cx - pinR, cy - pinR * 2.2f, cx + pinR, cy))
+                    moveTo(cx, cy)
+                    lineTo(cx - pinR * 0.5f, cy + pinR * 0.6f)
+                    lineTo(cx + pinR * 0.5f, cy + pinR * 0.6f)
+                    close()
+                }
+                drawPath(path, color)
+                drawCircle(Panel, radius = pinR * 0.38f, center = Offset(cx, cy - pinR))
+            }
+            2 -> { // LOG — stacked lines
+                val w = size.width * 0.75f
+                val gaps = listOf(0.25f, 0.5f, 0.75f)
+                val widths = listOf(w, w * 0.78f, w * 0.56f)
+                gaps.zip(widths).forEach { (frac, lineW) ->
+                    drawLine(color, Offset(cx - lineW / 2f, size.height * frac), Offset(cx + lineW / 2f, size.height * frac), strokeWidth = 2f)
+                }
+            }
+            3 -> { // CELL — signal bars
+                val barW = size.width * 0.13f
+                val gap = size.width * 0.07f
+                val totalW = barW * 4 + gap * 3
+                val startX = cx - totalW / 2f
+                for (b in 0..3) {
+                    val barH = size.height * (0.25f + b * 0.18f)
+                    val x = startX + b * (barW + gap)
+                    val barColor = if (selected || b < 2) color else color.copy(alpha = 0.3f)
+                    drawRect(barColor, topLeft = Offset(x, size.height - barH - 2f), size = Size(barW, barH))
+                }
+            }
+            4 -> { // NFC — near-field arcs
+                val arcSizes = listOf(0.85f, 0.55f, 0.3f)
+                arcSizes.forEachIndexed { i, scale ->
+                    val r = size.minDimension * scale * 0.5f
+                    drawArc(
+                        color = color.copy(alpha = 1f - i * 0.3f),
+                        startAngle = 210f, sweepAngle = 120f,
+                        useCenter = false,
+                        topLeft = Offset(cx - r, cy - r),
+                        size = Size(r * 2, r * 2),
+                        style = Stroke(2f - i * 0.4f)
+                    )
+                }
+                drawCircle(color, radius = 2.5f, center = Offset(cx - size.minDimension * 0.35f, cy))
+            }
+            else -> { // WIFI — wifi arcs
+                val arcSizes = listOf(0.9f, 0.6f, 0.3f)
+                arcSizes.forEachIndexed { i, scale ->
+                    val r = size.minDimension * scale * 0.5f
+                    drawArc(
+                        color = color.copy(alpha = if (selected || i > 0) 1f else 0.5f),
+                        startAngle = 200f, sweepAngle = 140f,
+                        useCenter = false,
+                        topLeft = Offset(cx - r, cy - r * 0.5f),
+                        size = Size(r * 2, r * 2),
+                        style = Stroke(if (i == 0) 2f else 1.5f)
+                    )
+                }
+                drawCircle(color, radius = 2.5f, center = Offset(cx, size.height * 0.8f))
+            }
         }
     }
 }
