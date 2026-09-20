@@ -130,7 +130,8 @@ class Tracker {
             places = entry.area.size,
             rotations = entry.rotations,
             addresses = entry.addresses,
-            approxMetres = entry.approxMetres
+            approxMetres = entry.approxMetres,
+            points = entry.area.points()
         )
 
         return Observation(detection, entry.following && !wasFollowing)
@@ -164,7 +165,8 @@ class Tracker {
                 places = entry.area.size,
                 rotations = entry.rotations,
                 addresses = entry.addresses,
-                approxMetres = entry.approxMetres
+                approxMetres = entry.approxMetres,
+                points = entry.area.points()
             )
         }
 

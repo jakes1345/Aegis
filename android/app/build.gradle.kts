@@ -15,8 +15,8 @@ android {
         // for devices nobody is going to test this on.
         minSdk = 31
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     buildTypes {
