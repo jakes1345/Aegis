@@ -108,10 +108,16 @@ class ScanService : LifecycleService() {
         if (running) return START_STICKY
         running = true
 
-        ServiceCompat.startForeground(
-            this, NOTIFICATION_ID, buildOngoing(0, 0),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-        )
+        try {
+            ServiceCompat.startForeground(
+                this, NOTIFICATION_ID, buildOngoing(0, 0),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            )
+        } catch (e: SecurityException) {
+            Registry.update { it.copy(scanning = false, error = "Location permission required to scan") }
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         startScanning()
         startLocation()

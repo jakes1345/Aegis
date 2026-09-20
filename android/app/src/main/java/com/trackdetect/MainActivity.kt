@@ -543,7 +543,9 @@ private fun ScanScreen(
     val context = LocalContext.current
     val now = rememberNow()
 
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { onStart() }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+        if (REQUIRED.all { grants[it] == true }) onStart()
+    }
 
     // Devices the user has vouched for drop out of the threat picture and sink to the bottom.
     val live = remember(detections, trusted) { detections.filter { it.key !in trusted } }
