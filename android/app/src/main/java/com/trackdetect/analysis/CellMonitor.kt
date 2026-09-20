@@ -58,6 +58,14 @@ class CellMonitor(private val context: Context) {
         return build(registered, neighbors)
     }
 
+    /**
+     * Timing advance is reported as [CellInfo.UNAVAILABLE] (Int.MAX_VALUE) by
+     * modems that do not expose it, and the valid ranges are 0..219 on GSM and
+     * 0..1282 on LTE. Anything outside that is treated as unknown rather than
+     * fed into a heuristic as a real zero.
+     */
+    private fun validTa(ta: Int, max: Int): Int? = ta.takeIf { it in 0..max }
+
     private fun build(info: CellInfo, neighbors: Int): ServingCell? {
         val now = System.currentTimeMillis()
         return when (info) {
@@ -70,7 +78,8 @@ class CellMonitor(private val context: Context) {
                     tac = id.tac.takeIf { it != Int.MAX_VALUE }?.toString(),
                     cellId = ci.toString(), rat = Rat.LTE,
                     signalDbm = info.cellSignalStrength.dbm.takeIf { it > -160 && it < 0 },
-                    neighbors = neighbors, ts = now
+                    neighbors = neighbors, ts = now,
+                    timingAdvance = validTa(info.cellSignalStrength.timingAdvance, 1282)
                 )
             }
             is CellInfoWcdma -> {
@@ -94,7 +103,8 @@ class CellMonitor(private val context: Context) {
                     tac = id.lac.takeIf { it != Int.MAX_VALUE }?.toString(),
                     cellId = cid.toString(), rat = Rat.GSM,
                     signalDbm = info.cellSignalStrength.dbm.takeIf { it > -160 && it < 0 },
-                    neighbors = neighbors, ts = now
+                    neighbors = neighbors, ts = now,
+                    timingAdvance = validTa(info.cellSignalStrength.timingAdvance, 219)
                 )
             }
             else -> buildNr(info, neighbors, now)

@@ -32,6 +32,8 @@ class Tracker {
         var addresses = 1
         var following = false
         var persistent = false
+        var score = 0
+        var confidence = FollowConfidence.NONE
         val area = ObservationArea()
     }
 
@@ -104,6 +106,8 @@ class Tracker {
         // defeat exactly this kind of detection does.
         if (entry.rotations > 0) score += 8
         score = score.coerceIn(0, 100)
+        entry.score = score
+        entry.confidence = confidence
 
         val threat = when {
             entry.following -> Threat.CRITICAL
@@ -152,15 +156,13 @@ class Tracker {
                     entry.persistent -> Threat.MEDIUM
                     else -> Threat.LOW
                 },
-                score = 0,
+                score = entry.score,
                 firstSeen = entry.firstSeen,
                 lastSeen = entry.lastSeen,
                 sightings = entry.sightings,
                 persistent = entry.persistent,
                 following = entry.following,
-                confidence = if (entry.following) FollowConfidence.CONFIRMED
-                else if (entry.persistent) FollowConfidence.NOT_MOVED_ENOUGH
-                else FollowConfidence.NONE,
+                confidence = entry.confidence,
                 displacementM = entry.area.span(),
                 places = entry.area.size,
                 rotations = entry.rotations,

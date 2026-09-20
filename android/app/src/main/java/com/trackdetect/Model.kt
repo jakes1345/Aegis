@@ -72,7 +72,13 @@ data class ServingCell(
     val rat: Rat,
     val signalDbm: Int?,
     val neighbors: Int?,
-    val ts: Long
+    val ts: Long,
+    /**
+     * GSM / LTE timing advance as reported by the modem, or null when the
+     * technology (UMTS, NR) or the modem does not expose it. Zero means the
+     * transmitter is within one TA step of you — ~550 m on GSM, ~78 m on LTE.
+     */
+    val timingAdvance: Int? = null
 ) {
     val key: String get() = "${mcc ?: "?"}-${mnc ?: "?"}-${tac ?: "?"}-$cellId"
 }
@@ -99,7 +105,12 @@ data class CellStatus(
 
 // --- Timeline ---------------------------------------------------------------
 
-enum class EventKind { FOLLOWING, CATCHER, NFC_TAG, SCAN_START, SCAN_STOP }
+enum class EventKind {
+    FOLLOWING, CATCHER, NFC_TAG, SCAN_START, SCAN_STOP,
+    WIFI_ANOMALY,
+    /** BLE tracker persisting while cell anomaly is also active — correlated surveillance. */
+    CORRELATED_SURVEILLANCE
+}
 
 data class TimelineEvent(
     val id: String,
