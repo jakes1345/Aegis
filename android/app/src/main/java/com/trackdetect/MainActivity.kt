@@ -18,12 +18,15 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
+import androidx.core.view.WindowCompat
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,6 +56,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.trackdetect.CatcherFinding
 import com.trackdetect.analysis.NfcScanner
 import com.trackdetect.analysis.Report
 import kotlinx.coroutines.delay
@@ -99,18 +103,29 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        AppSettings.load(this)
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
+        val onboardingAlreadyDone = isOnboardingDone(this)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(background = Ground, surface = Panel)) {
                 Surface(color = Ground, modifier = Modifier.fillMaxSize()) {
-                    MainApp(
-                        onStart = { startService(Intent(this, ScanService::class.java)) },
-                        onStop = {
-                            startService(Intent(this, ScanService::class.java)
-                                .apply { action = ScanService.ACTION_STOP })
-                        },
-                        hasPermissions = { REQUIRED.all { granted(it) } }
-                    )
+                    var onboardingDone by remember { mutableStateOf(onboardingAlreadyDone) }
+                    if (!onboardingDone) {
+                        OnboardingScreen(
+                            startScanService = { startService(Intent(this, ScanService::class.java)) },
+                            onComplete = { onboardingDone = true }
+                        )
+                    } else {
+                        MainApp(
+                            onStart = { startService(Intent(this, ScanService::class.java)) },
+                            onStop = {
+                                startService(Intent(this, ScanService::class.java)
+                                    .apply { action = ScanService.ACTION_STOP })
+                            },
+                            hasPermissions = { REQUIRED.all { granted(it) } }
+                        )
+                    }
                 }
             }
         }
@@ -318,8 +333,16 @@ private fun PanelBox(modifier: Modifier = Modifier, content: @Composable ColumnS
     )
 }
 
+// ── Threat explainer target ────────────────────────────────────────────────────
+
+private sealed class ExplainerTarget {
+    data class BleDevice(val detection: Detection) : ExplainerTarget()
+    data class CellIndicator(val finding: CatcherFinding) : ExplainerTarget()
+}
+
 // ── Root composable ───────────────────────────────────────────────────────────
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MainApp(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: () -> Boolean) {
     var tab by remember { mutableIntStateOf(0) }
@@ -330,6 +353,16 @@ private fun MainApp(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: () 
     val cell by Registry.cell.collectAsStateWithLifecycle()
     val nfc by Registry.nfc.collectAsStateWithLifecycle()
     val wifi by Registry.wifi.collectAsStateWithLifecycle()
+
+    // Settings navigation and threat explainer state
+    var showSettings by remember { mutableStateOf(false) }
+    var explainerTarget by remember { mutableStateOf<ExplainerTarget?>(null) }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
+    if (showSettings) {
+        SettingsScreen(onBack = { showSettings = false })
+        return
+    }
 
     // One red dot per tab that currently holds something worth looking at.
     val followingLive = detections.any { it.following && it.key !in trusted }
@@ -343,42 +376,149 @@ private fun MainApp(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: () 
     )
 
     Column(Modifier.fillMaxSize()) {
-        Box(Modifier.weight(1f)) {
+        Box(Modifier.weight(1f).statusBarsPadding()) {
             when (tab) {
-                0 -> ScanScreen(onStart, onStop, hasPermissions)
+                0 -> ScanScreen(
+                    onStart, onStop, hasPermissions,
+                    onSettingsClick = { showSettings = true },
+                    onShowExplainer = { d -> explainerTarget = ExplainerTarget.BleDevice(d) }
+                )
                 1 -> MapScreen()
                 2 -> TimelineScreen()
-                3 -> CellScreen()
+                3 -> CellScreen(
+                    onShowExplainer = { f -> explainerTarget = ExplainerTarget.CellIndicator(f) }
+                )
                 4 -> NfcScreen()
                 5 -> WifiScreen()
             }
         }
-        Row(
-            Modifier.fillMaxWidth().background(Panel).padding(vertical = 4.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly
+        NavigationBar(
+            containerColor = Panel,
+            tonalElevation = 0.dp,
+            modifier = Modifier.fillMaxWidth().navigationBarsPadding()
         ) {
             tabs.forEachIndexed { i, label ->
-                val active = tab == i
-                TextButton(
+                NavigationBarItem(
+                    selected = tab == i,
                     onClick = { tab = i },
-                    modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(horizontal = 2.dp, vertical = 8.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            label,
-                            color = if (active) Accent else Muted,
-                            fontSize = 11.sp,
-                            fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
-                            letterSpacing = 0.5.sp,
-                            maxLines = 1
-                        )
-                        if (alerts[i]) {
-                            Spacer(Modifier.width(3.dp))
-                            Box(Modifier.size(5.dp).background(Critical, CircleShape))
+                    icon = {
+                        Box {
+                            TabIcon(index = i, selected = tab == i)
+                            if (alerts[i]) {
+                                Box(
+                                    Modifier
+                                        .size(7.dp)
+                                        .background(Critical, CircleShape)
+                                        .align(Alignment.TopEnd)
+                                        .offset(x = 2.dp, y = (-2).dp)
+                                )
+                            }
                         }
-                    }
+                    },
+                    label = {
+                        Text(label, fontSize = 10.sp, letterSpacing = 0.3.sp, maxLines = 1)
+                    },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = Accent,
+                        selectedTextColor = Accent,
+                        indicatorColor = Accent.copy(alpha = 0.15f),
+                        unselectedIconColor = Muted,
+                        unselectedTextColor = Muted
+                    )
+                )
+            }
+        }
+    }
+
+    // Threat explainer bottom sheet
+    val target = explainerTarget
+    if (target != null) {
+        ModalBottomSheet(
+            onDismissRequest = { explainerTarget = null },
+            sheetState = sheetState,
+            containerColor = Panel
+        ) {
+            ThreatExplainerSheet(target = target, onDismiss = { explainerTarget = null })
+        }
+    }
+}
+
+// ── Tab icons ─────────────────────────────────────────────────────────────────
+
+@Composable
+private fun TabIcon(index: Int, selected: Boolean) {
+    val color = if (selected) Accent else Muted
+    Canvas(Modifier.size(22.dp)) {
+        val cx = center.x
+        val cy = center.y
+        when (index) {
+            0 -> { // SCAN — radar rings
+                drawCircle(color.copy(alpha = 0.35f), radius = size.minDimension * 0.46f, center = center, style = Stroke(1f))
+                drawCircle(color.copy(alpha = 0.65f), radius = size.minDimension * 0.3f, center = center, style = Stroke(1.5f))
+                drawCircle(color, radius = size.minDimension * 0.14f, center = center)
+            }
+            1 -> { // MAP — location pin
+                val pinR = size.minDimension * 0.3f
+                val pinTop = Offset(cx, cy - pinR * 1.2f)
+                val path = Path().apply {
+                    addOval(androidx.compose.ui.geometry.Rect(cx - pinR, cy - pinR * 2.2f, cx + pinR, cy))
+                    moveTo(cx, cy)
+                    lineTo(cx - pinR * 0.5f, cy + pinR * 0.6f)
+                    lineTo(cx + pinR * 0.5f, cy + pinR * 0.6f)
+                    close()
                 }
+                drawPath(path, color)
+                drawCircle(Panel, radius = pinR * 0.38f, center = Offset(cx, cy - pinR))
+            }
+            2 -> { // LOG — stacked lines
+                val w = size.width * 0.75f
+                val gaps = listOf(0.25f, 0.5f, 0.75f)
+                val widths = listOf(w, w * 0.78f, w * 0.56f)
+                gaps.zip(widths).forEach { (frac, lineW) ->
+                    drawLine(color, Offset(cx - lineW / 2f, size.height * frac), Offset(cx + lineW / 2f, size.height * frac), strokeWidth = 2f)
+                }
+            }
+            3 -> { // CELL — signal bars
+                val barW = size.width * 0.13f
+                val gap = size.width * 0.07f
+                val totalW = barW * 4 + gap * 3
+                val startX = cx - totalW / 2f
+                for (b in 0..3) {
+                    val barH = size.height * (0.25f + b * 0.18f)
+                    val x = startX + b * (barW + gap)
+                    val barColor = if (selected || b < 2) color else color.copy(alpha = 0.3f)
+                    drawRect(barColor, topLeft = Offset(x, size.height - barH - 2f), size = Size(barW, barH))
+                }
+            }
+            4 -> { // NFC — near-field arcs
+                val arcSizes = listOf(0.85f, 0.55f, 0.3f)
+                arcSizes.forEachIndexed { i, scale ->
+                    val r = size.minDimension * scale * 0.5f
+                    drawArc(
+                        color = color.copy(alpha = 1f - i * 0.3f),
+                        startAngle = 210f, sweepAngle = 120f,
+                        useCenter = false,
+                        topLeft = Offset(cx - r, cy - r),
+                        size = Size(r * 2, r * 2),
+                        style = Stroke(2f - i * 0.4f)
+                    )
+                }
+                drawCircle(color, radius = 2.5f, center = Offset(cx - size.minDimension * 0.35f, cy))
+            }
+            else -> { // WIFI — wifi arcs
+                val arcSizes = listOf(0.9f, 0.6f, 0.3f)
+                arcSizes.forEachIndexed { i, scale ->
+                    val r = size.minDimension * scale * 0.5f
+                    drawArc(
+                        color = color.copy(alpha = if (selected || i > 0) 1f else 0.5f),
+                        startAngle = 200f, sweepAngle = 140f,
+                        useCenter = false,
+                        topLeft = Offset(cx - r, cy - r * 0.5f),
+                        size = Size(r * 2, r * 2),
+                        style = Stroke(if (i == 0) 2f else 1.5f)
+                    )
+                }
+                drawCircle(color, radius = 2.5f, center = Offset(cx, size.height * 0.8f))
             }
         }
     }
@@ -387,7 +527,13 @@ private fun MainApp(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: () 
 // ── Scan (BLE) screen ─────────────────────────────────────────────────────────
 
 @Composable
-private fun ScanScreen(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: () -> Boolean) {
+private fun ScanScreen(
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+    hasPermissions: () -> Boolean,
+    onSettingsClick: () -> Unit = {},
+    onShowExplainer: (Detection) -> Unit = {}
+) {
     val detections by Registry.detections.collectAsStateWithLifecycle()
     val status by Registry.status.collectAsStateWithLifecycle()
     val trusted by Registry.trusted.collectAsStateWithLifecycle()
@@ -414,10 +560,15 @@ private fun ScanScreen(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: 
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text("TRACK DETECT", color = Ink, fontSize = 22.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-                TextButton(onClick = {
-                    val i = Report.share(context, status, detections, timeline, cell, nfc)
-                    context.startActivity(Intent.createChooser(i, "Share evidence report"))
-                }) { Text("EXPORT", color = Muted, fontSize = 11.sp, letterSpacing = 1.sp) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = {
+                        val i = Report.share(context, status, detections, timeline, cell, nfc)
+                        context.startActivity(Intent.createChooser(i, "Share evidence report"))
+                    }) { Text("EXPORT", color = Muted, fontSize = 11.sp, letterSpacing = 1.sp) }
+                    TextButton(onClick = onSettingsClick) {
+                        Text("⚙", color = Muted, fontSize = 18.sp)
+                    }
+                }
             }
         }
 
@@ -462,7 +613,13 @@ private fun ScanScreen(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: 
                 }
             }
             items(ordered, key = { it.key }) { d ->
-                DetectionRow(d, trusted = d.key in trusted, now = now)
+                DetectionRow(
+                    d = d,
+                    trusted = d.key in trusted,
+                    now = now,
+                    onShowExplainer = if (d.threat == Threat.CRITICAL || d.threat == Threat.HIGH)
+                        { { onShowExplainer(d) } } else null
+                )
             }
         }
 
@@ -589,7 +746,12 @@ private fun RssiBar(rssi: Int) {
 }
 
 @Composable
-private fun DetectionRow(d: Detection, trusted: Boolean, now: Long) {
+private fun DetectionRow(
+    d: Detection,
+    trusted: Boolean,
+    now: Long,
+    onShowExplainer: (() -> Unit)? = null
+) {
     var expanded by remember(d.key) { mutableStateOf(false) }
     val stripe = if (trusted) Rule else threatColor(d.threat)
     val chevron by animateFloatAsState(
@@ -643,13 +805,13 @@ private fun DetectionRow(d: Detection, trusted: Boolean, now: Long) {
                 )
             }
 
-            if (expanded) DetectionDetail(d, trusted)
+            if (expanded) DetectionDetail(d, trusted, onShowExplainer)
         }
     }
 }
 
 @Composable
-private fun DetectionDetail(d: Detection, trusted: Boolean) {
+private fun DetectionDetail(d: Detection, trusted: Boolean, onShowExplainer: (() -> Unit)? = null) {
     Column(Modifier.fillMaxWidth().padding(top = 4.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Hairline()
 
@@ -749,6 +911,22 @@ private fun DetectionDetail(d: Detection, trusted: Boolean) {
                 ) { Text("MARK SAFE", color = Clear, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
                 Text("Marks this device as yours and removes it from the threat level.", color = Muted, fontSize = 10.sp,
                     modifier = Modifier.weight(1f))
+            }
+        }
+
+        // "What is this?" explainer button for high/critical threats
+        if (onShowExplainer != null && !trusted) {
+            TextButton(
+                onClick = onShowExplainer,
+                shape = RoundedCornerShape(3.dp),
+                border = BorderStroke(1.dp, Accent.copy(alpha = 0.5f)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    "WHAT IS THIS? HOW DO I RESPOND?",
+                    color = Accent, fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold, letterSpacing = 1.sp
+                )
             }
         }
     }
@@ -1148,7 +1326,7 @@ private fun EventLocationSnapshot(lat: Double, lon: Double, status: ScanStatus) 
 // ── Cell / IMSI screen ────────────────────────────────────────────────────────
 
 @Composable
-private fun CellScreen() {
+private fun CellScreen(onShowExplainer: ((CatcherFinding) -> Unit)? = null) {
     val cell by Registry.cell.collectAsStateWithLifecycle()
 
     LazyColumn(
@@ -1217,7 +1395,13 @@ private fun CellScreen() {
                         modifier = Modifier.padding(top = 4.dp)
                     )
                 }
-                items(cell.findings, key = { it.id }) { FindingRow(it) }
+                items(cell.findings, key = { it.id }) { f ->
+                    FindingRow(
+                        f = f,
+                        onShowExplainer = if (f.severity == Severity.CRITICAL || f.severity == Severity.HIGH)
+                            { { onShowExplainer?.invoke(f) } } else null
+                    )
+                }
             } else {
                 item(key = "§no-indicators") {
                     Text("No active indicators against the current baseline.", color = Clear, fontSize = 12.sp)
@@ -1293,9 +1477,17 @@ private fun CellInfoRow(label: String, value: String) {
 }
 
 @Composable
-private fun FindingRow(f: CatcherFinding) {
+private fun FindingRow(f: CatcherFinding, onShowExplainer: (() -> Unit)? = null) {
     val col = severityColor(f.severity)
-    Row(Modifier.fillMaxWidth().clip(CardShape).background(Panel).height(IntrinsicSize.Min)) {
+    val clickMod = if (onShowExplainer != null) Modifier.clickable { onShowExplainer() } else Modifier
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(CardShape)
+            .background(Panel)
+            .then(clickMod)
+            .height(IntrinsicSize.Min)
+    ) {
         Box(Modifier.width(3.dp).fillMaxHeight().background(col))
         Column(Modifier.weight(1f).padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(
@@ -1305,8 +1497,16 @@ private fun FindingRow(f: CatcherFinding) {
             ) {
                 Text(f.title, color = col, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                 ThreatBadge(f.severity.name, col)
+                if (onShowExplainer != null) {
+                    Text("?", color = col.copy(alpha = 0.8f), fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(start = 2.dp))
+                }
             }
             Text(f.detail, color = InkDim, fontSize = 12.sp, lineHeight = 17.sp)
+            if (onShowExplainer != null) {
+                Text("Tap for explanation and response guidance", color = col.copy(alpha = 0.6f),
+                    fontSize = 10.sp, letterSpacing = 0.5.sp)
+            }
         }
     }
 }
@@ -1487,5 +1687,301 @@ private fun WifiRow(a: WifiAnomaly) {
                 Text(fmtTime(a.ts), color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
             }
         }
+    }
+}
+
+// ── Threat explainer bottom sheet ─────────────────────────────────────────────
+
+private data class ExplainerContent(
+    val headline: String,
+    val whatIsThis: String,
+    val whatToDo: String,
+    val howCertain: String,
+    val severity: Color
+)
+
+private fun bleExplainerContent(d: Detection): ExplainerContent {
+    val col = when (d.threat) {
+        Threat.CRITICAL -> Color(0xFFF2545B)
+        Threat.HIGH -> Color(0xFFFF7A3D)
+        else -> Color(0xFFE8B33D)
+    }
+    return when {
+        d.following -> ExplainerContent(
+            headline = "Confirmed Following — ${d.name}",
+            whatIsThis = "A Bluetooth tracker has been verified as following your movements. " +
+                "It appeared at multiple locations ${d.displacementM.roundToInt()} metres apart while you were " +
+                "moving, which cannot be explained by proximity alone. ${d.tracker?.let { "This matches a known ${it.brand} ${it.label}." } ?: "No commercial tracker signature matched, but the movement pattern is conclusive."}",
+            whatToDo = "Stop and search the vehicle or your belongings now. Check: wheel wells, bumper covers and cavities, " +
+                "OBD-II diagnostic port (under dashboard), under seats and floor mats, inside bag linings and seams. " +
+                "If found, do not discard it on the roadside — it is evidence. Photograph it in place before removing it. " +
+                "Consider filing a police report and contacting legal counsel.",
+            howCertain = "High confidence. Confirmation requires the device to appear at locations " +
+                "${d.displacementM.roundToInt()} m apart during your movement. " +
+                "Threat score: ${d.score}/100 across ${d.sightings} sightings.",
+            severity = col
+        )
+        d.persistent && d.identified -> ExplainerContent(
+            headline = "Known Tracker — ${d.name}",
+            whatIsThis = "A ${d.tracker?.brand ?: "commercial"} ${d.tracker?.label ?: "tracker"} has been " +
+                "present for an extended period. Known trackers are purpose-built surveillance devices. " +
+                "Extended presence without confirmed movement suggests it may be attached to your vehicle or belongings.",
+            whatToDo = "Monitor this device. If it remains present as you travel, it will be promoted to " +
+                "FOLLOWING status automatically. If you believe it does not belong to you, physically search " +
+                "your vehicle and belongings. Pay attention to whether the signal strength (RSSI) stays consistent, " +
+                "which would indicate it is on or very near your person.",
+            howCertain = "Medium-to-high confidence. Device is identified as a commercial tracker with " +
+                "${d.sightings} sightings over an extended period. Following confirmation requires GPS movement. " +
+                "Threat score: ${d.score}/100.",
+            severity = col
+        )
+        d.persistent -> ExplainerContent(
+            headline = "Persistent Unknown Device — ${d.name}",
+            whatIsThis = "An unidentified Bluetooth device has been present continuously for an extended period. " +
+                "This could be a benign device (a neighbour's router, a fixed sensor) or a tracker that does not " +
+                "match the known signature database. Its persistence pattern is unusual for a passing device.",
+            whatToDo = "Watch for this device across different locations. If it follows you as you travel, " +
+                "it will be flagged as FOLLOWING. If it is stationary and you remain in one place, it is " +
+                "likely environmental. Mark it as TRUSTED below if you know what it is.",
+            howCertain = "Low-to-medium confidence. No known tracker signature matched — flagged on " +
+                "behaviour alone. Threat score: ${d.score}/100 over ${d.sightings} sightings.",
+            severity = col
+        )
+        else -> ExplainerContent(
+            headline = "${d.threat.name} Threat — ${d.name}",
+            whatIsThis = "This device has characteristics associated with surveillance trackers. " +
+                "${d.tracker?.let { "It matches the signature of a ${it.brand} ${it.label}." } ?: "No exact tracker signature matched, but its signal pattern warrants monitoring."}",
+            whatToDo = "Continue monitoring. The scan needs more time and movement to determine whether " +
+                "this device is following you. Keep the scan running as you travel.",
+            howCertain = "Building confidence. Score ${d.score}/100 · ${d.sightings} sightings. " +
+                "GPS confirmation of following requires approximately 300 m of shared movement.",
+            severity = col
+        )
+    }
+}
+
+private fun cellExplainerContent(f: CatcherFinding): ExplainerContent {
+    val col = when (f.severity) {
+        Severity.CRITICAL -> Color(0xFFF2545B)
+        Severity.HIGH -> Color(0xFFFF7A3D)
+        Severity.MEDIUM -> Color(0xFFE8B33D)
+        Severity.LOW -> Color(0xFF6F7A8B)
+    }
+    val (what, todo, certain) = when (f.id) {
+        "rat_downgrade" -> Triple(
+            "Your device has been forced from a newer radio technology (4G/5G) down to an older one (2G/3G). " +
+            "IMSI catchers do this deliberately because older protocols have weaker encryption and are easier " +
+            "to intercept. Legitimate networks only downgrade in areas with no newer coverage.",
+            "Avoid making voice calls or sending SMS until you leave the area. Use end-to-end encrypted " +
+            "messaging apps over WiFi or data. Do not transmit sensitive information. Move away from the " +
+            "area and observe whether the technology level returns to normal.",
+            "High confidence indicator. Technology downgrade at a location where higher tech was previously " +
+            "seen is a primary IMSI catcher signature."
+        )
+        "cellid_tac_mismatch" -> Triple(
+            "A cell tower ID that you have seen before is now claiming to be in a different area (tracking " +
+            "area code). Real base stations have fixed, permanent area assignments. A portable IMSI catcher " +
+            "moving through the area will produce inconsistent area codes.",
+            "Monitor for additional indicators. A single mismatch could be a network reconfiguration, but " +
+            "combined with other findings it is significant. Avoid sensitive calls in this area.",
+            "High confidence indicator when combined with other findings. Alone it may reflect legitimate " +
+            "network changes, but it warrants heightened caution."
+        )
+        "tac_change_stationary" -> Triple(
+            "Your device registered a different tracking area while you were not moving. " +
+            "Tracking area changes normally happen when you travel across cell boundaries. When you are " +
+            "stationary, a change indicates a new transmitter has appeared near you and forced re-registration.",
+            "Note your exact location and time. A stationary area change combined with other indicators " +
+            "is a strong surveillance signal. Consider moving away from the area.",
+            "Medium confidence. Stationary area changes can occur due to legitimate network maintenance, " +
+            "but are uncommon and warrant attention alongside other findings."
+        )
+        "signal_outlier" -> Triple(
+            "The cell signal is significantly stronger than the historical maximum for this area. " +
+            "A portable transmitter placed near you — in a vehicle, building, or backpack — produces " +
+            "a much stronger signal than a distant tower.",
+            "Check your surroundings for parked vehicles with unusual equipment, people lingering nearby, " +
+            "or recently placed objects. A strong signal alone is insufficient for action, but note the " +
+            "location and observe whether it moves with you.",
+            "Medium confidence. Signal strength varies for many reasons. This indicator is most meaningful " +
+            "when combined with technology downgrade or unknown cell findings."
+        )
+        "unknown_cell" -> Triple(
+            "A cell tower that has never appeared in this area before has become your serving cell. " +
+            "You have been to this location many times, and the tower infrastructure here is well-established. " +
+            "Portable IMSI catchers appear as unknown cells in familiar areas.",
+            "A new cell at a familiar location deserves caution. If you also see technology downgrade or " +
+            "signal strength anomalies, treat this as a serious surveillance indicator. Do not make sensitive " +
+            "calls. Move away and observe whether the new cell disappears.",
+            "Medium confidence. New towers do get installed occasionally, but this detection requires " +
+            "high baseline maturity (many prior visits) before triggering."
+        )
+        "ephemeral_cell", "ephemeral_cell_strict" -> Triple(
+            "A cell tower appeared briefly as your serving cell, then vanished. Real base stations " +
+            "broadcast continuously — they do not appear for a few minutes and disappear. " +
+            "A portable surveillance device driven into and away from an area looks exactly like this.",
+            "Note the time and location. An ephemeral cell that appeared and disappeared suggests a " +
+            "mobile surveillance asset that has moved on. Review your surroundings at the time of detection.",
+            "Medium-to-high confidence. Ephemeral cells have few legitimate explanations. " +
+            "A duration under 90 seconds is the strictest threshold."
+        )
+        "cell_flapping" -> Triple(
+            "Your device has switched between multiple different cell towers rapidly while you were " +
+            "stationary. IMSI catchers force repeated re-registrations to capture authentication events. " +
+            "Normal network handover does not produce this pattern at a single location.",
+            "Avoid making calls or sending messages while this is occurring. If it persists, " +
+            "move away from the area. The flapping pattern suggests active interference with your " +
+            "device's network registration.",
+            "Medium confidence. Rapid cell switching can also result from poor coverage areas, " +
+            "but is unusual when stationary in a normally covered location."
+        )
+        "no_neighbors" -> Triple(
+            "Your serving cell is reporting zero neighbouring cells. Real base stations always have " +
+            "overlapping coverage with adjacent towers — this is fundamental to how cellular networks " +
+            "are designed. A portable IMSI catcher operating alone has no neighbours to report.",
+            "This is a supporting indicator rather than an action trigger alone. Watch for it " +
+            "alongside technology downgrade or unknown cell findings, at which point you should " +
+            "follow the high-confidence response guidance.",
+            "Low confidence as a standalone indicator. Meaningful when combined with other findings."
+        )
+        "timing_advance_zero" -> Triple(
+            "LTE timing advance of zero means the transmitter is within approximately 78 metres of " +
+            "your device. Macro cell towers are never this close to you. A portable IMSI catcher in " +
+            "a parked vehicle or nearby building would produce exactly this reading.",
+            "A transmitter within 78 metres is immediately actionable. Scan your visual surroundings " +
+            "for parked vehicles with rooftop antennas or unusual equipment. Do not make sensitive " +
+            "calls. Move away and observe whether the indicator follows you.",
+            "High confidence. LTE timing advance is a precise physical measurement — zero means very " +
+            "close proximity to the transmitter."
+        )
+        "signal_spike" -> Triple(
+            "The signal strength on your current cell tower jumped suddenly between two consecutive " +
+            "readings. A macro cell tower at a fixed location has a stable signal. A mobile transmitter " +
+            "moving towards you — in a vehicle, for example — produces exactly this kind of spike.",
+            "A sudden signal spike suggests a mobile surveillance asset moving closer to your position. " +
+            "Be aware of your surroundings. If the spike is combined with other indicators, follow " +
+            "the high-confidence response protocol immediately.",
+            "Medium confidence. Signal spikes can result from device movements, building reflections, " +
+            "or other environmental factors, but are notable when combined with other findings."
+        )
+        "rat_oscillation" -> Triple(
+            "Your device has switched between multiple radio technologies (2G, 3G, 4G) rapidly in " +
+            "a short window. IMSI catchers force devices through technology cycles to capture separate " +
+            "authentication events on each technology, revealing the device's IMSI.",
+            "Multiple technology switches in a short window strongly indicate active interference. " +
+            "Avoid all calls and data use. Use WiFi with a VPN for any communications. " +
+            "Move out of the area and observe whether the switching stops.",
+            "High confidence. Rapid multi-technology oscillation is a strong signature of active " +
+            "IMSI capture operations."
+        )
+        else -> Triple(
+            "An anomaly was detected in your cellular environment that deviates from your established " +
+            "baseline. The specific indicator ID is: ${f.id}. See the full detail for more context.",
+            "Monitor for additional indicators. If multiple anomalies appear simultaneously, " +
+            "treat the situation as a potential IMSI catcher and avoid sensitive communications.",
+            "Confidence level: ${f.severity.name.lowercase()}."
+        )
+    }
+    return ExplainerContent(
+        headline = f.title,
+        whatIsThis = what,
+        whatToDo = todo,
+        howCertain = certain,
+        severity = col
+    )
+}
+
+@Composable
+private fun ThreatExplainerSheet(target: ExplainerTarget, onDismiss: () -> Unit) {
+    val content = when (target) {
+        is ExplainerTarget.BleDevice -> bleExplainerContent(target.detection)
+        is ExplainerTarget.CellIndicator -> cellExplainerContent(target.finding)
+    }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp)
+            .padding(top = 8.dp, bottom = 32.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // Drag handle (visual only)
+        Box(
+            Modifier
+                .width(40.dp)
+                .height(4.dp)
+                .background(Muted.copy(alpha = 0.4f), RoundedCornerShape(2.dp))
+                .align(Alignment.CenterHorizontally)
+        )
+
+        // Headline
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Top
+        ) {
+            Text(
+                content.headline,
+                color = content.severity,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Rule))
+
+        // What is this?
+        ExplainerSection(
+            heading = "WHAT IS THIS?",
+            body = content.whatIsThis,
+            headingColor = Accent
+        )
+
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Rule))
+
+        // What should I do?
+        ExplainerSection(
+            heading = "WHAT SHOULD I DO?",
+            body = content.whatToDo,
+            headingColor = Accent
+        )
+
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Rule))
+
+        // How certain is this?
+        ExplainerSection(
+            heading = "HOW CERTAIN IS THIS?",
+            body = content.howCertain,
+            headingColor = Muted
+        )
+
+        // Dismiss button
+        TextButton(
+            onClick = onDismiss,
+            shape = RoundedCornerShape(4.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("CLOSE", color = Muted, letterSpacing = 1.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun ExplainerSection(heading: String, body: String, headingColor: Color) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            heading,
+            color = headingColor,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.5.sp
+        )
+        Text(
+            body,
+            color = InkDim,
+            fontSize = 13.sp,
+            lineHeight = 19.sp
+        )
     }
 }

@@ -178,7 +178,9 @@ class ScanService : LifecycleService() {
                     Registry.publishCell(CellStatus(available = false, reason = reason))
                 } else {
                     val cell = cellMonitor.sample()
-                    if (cell != null) {
+                    if (cell == null) {
+                        Registry.publishCell(CellStatus(available = false, reason = "Waiting for cell data — ensure location permission is granted"))
+                    } else {
                         val fix = track.current
                         val findings = imsiCatcher.recordAndAnalyze(cell, fix)
                         val (score, level) = imsiCatcher.scoreAndLevel(findings)
@@ -253,9 +255,9 @@ class ScanService : LifecycleService() {
                 } else emptyList()
                 Registry.publishMap(MapData(trail, deviceTrails, cellMarkers))
 
-                // WiFi anomaly scan every ~60s (40 publish cycles at 1500ms each)
+                // WiFi anomaly scan: immediately on first cycle, then every ~60s
                 publishCycle++
-                if (publishCycle % 40 == 0) {
+                if (publishCycle == 1 || publishCycle % 40 == 0) {
                     val wifiAnomalies = WifiScanner.scan(this@ScanService)
                     Registry.publishWifi(wifiAnomalies)
                     if (wifiAnomalies.isNotEmpty()) {
