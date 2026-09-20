@@ -56,7 +56,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.trackdetect.analysis.CatcherFinding
+import com.trackdetect.CatcherFinding
 import com.trackdetect.analysis.NfcScanner
 import com.trackdetect.analysis.Report
 import kotlinx.coroutines.delay
