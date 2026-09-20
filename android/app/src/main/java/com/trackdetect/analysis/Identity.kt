@@ -74,6 +74,21 @@ class IdentityResolver(
     private val byFingerprint = HashMap<String, MutableSet<String>>()
     private var counter = 0
 
+    fun prune(now: Long, maxAgeMs: Long = 30 * 60_000L) {
+        val cutoff = now - maxAgeMs
+        val staleIds = byId.values.filter { it.lastSeen < cutoff }.map { it.id }
+        staleIds.forEach { id ->
+            val identity = byId.remove(id) ?: return@forEach
+            identity.addresses.forEach { byAddress.remove(it) }
+            if (identity.fingerprint != null) {
+                byFingerprint[identity.fingerprint]?.let { set ->
+                    set.remove(id)
+                    if (set.isEmpty()) byFingerprint.remove(identity.fingerprint)
+                }
+            }
+        }
+    }
+
     fun resolve(address: String, rssi: Int, fingerprint: String?, now: Long): Resolution {
         byAddress[address]?.let { id ->
             val identity = byId.getValue(id)

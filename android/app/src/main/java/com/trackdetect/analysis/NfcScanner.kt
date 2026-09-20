@@ -15,13 +15,17 @@ object NfcScanner {
         val type = classifyType(techs)
         val payload = readNdef(tag)
         val isPayment = isPaymentCard(tag, techs)
-        val suspicious = !isPayment && (techs.contains("MifareClassic") || type == "ISO 14443-4")
+        // Only flag actually anomalous patterns: unexpected ISO-DEP on non-payment card
+        // with no readable NDEF payload (could be a covert token/tracker). Broad class-level
+        // flagging (all MifareClassic, all ISO14443-4) incorrectly flags office badges,
+        // transit cards, passports, and hotel keys.
+        val suspicious = !isPayment && type == "ISO 14443-4" && payload == null
         val note = when {
             isPayment -> "Payment or transit card"
-            techs.contains("MifareClassic") ->
-                "MIFARE Classic — commonly embedded in covert tracking hardware and access cards"
-            techs.contains("IsoDep") ->
-                "ISO 14443-4 smart card — verify intended purpose"
+            techs.contains("MifareClassic") -> "MIFARE Classic access card or key fob"
+            techs.contains("IsoDep") && payload == null ->
+                "ISO 14443-4 smart card — no readable payload (access credential or covert token)"
+            techs.contains("IsoDep") -> "ISO 14443-4 smart card"
             techs.contains("MifareUltralight") -> "MIFARE Ultralight — disposable NFC sticker"
             payload != null && payload.startsWith("https://") -> "NFC URL tag"
             else -> "Generic NFC tag"

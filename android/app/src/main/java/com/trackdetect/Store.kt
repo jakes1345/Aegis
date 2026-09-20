@@ -1,6 +1,10 @@
 package com.trackdetect
 
 import android.content.Context
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.File
 
@@ -22,6 +26,7 @@ class Store(context: Context, filename: String) {
 
     private val file = File(context.filesDir, filename)
     private val lock = Any()
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
     private var data: JSONObject? = null
@@ -44,12 +49,14 @@ class Store(context: Context, filename: String) {
     val json: JSONObject
         get() = data ?: load { JSONObject() }
 
-    /** Marks the store dirty and flushes if enough time has passed since the last write. */
+    /** Marks the store dirty and schedules a flush on the IO dispatcher if enough time has passed. */
     fun touch(minIntervalMs: Long = 5_000L) {
         synchronized(lock) {
             dirty = true
             val now = System.currentTimeMillis()
-            if (now - lastFlush >= minIntervalMs) flushLocked()
+            if (now - lastFlush >= minIntervalMs) {
+                ioScope.launch { synchronized(lock) { flushLocked() } }
+            }
         }
     }
 

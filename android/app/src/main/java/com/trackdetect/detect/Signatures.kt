@@ -158,10 +158,12 @@ object Signatures {
         if (record.hasShortUuid(0xFEED)) return TILE
         if (record.hasShortUuid(0xFD5A)) return SMARTTAG
         if (record.hasShortUuid(0xFD70)) return SMARTTAG2
-        if (record.hasShortUuid(0xFE9F)) return CHIPOLO_SPOT     // ONE Spot on Chipolo net
+        // 0xFE9F is used by Google Nearby but also Chipolo ONE Spot; fingerprint match only
         if (record.hasShortUuid(0xFEBE) || record.hasShortUuid(0xFE2B)) return CHIPOLO
-        if (record.hasShortUuid(0xFE2C) || record.hasShortUuid(0xFEE7)) return PEBBLEBEE
-        if (record.hasShortUuid(0xFFF3) || record.hasShortUuid(0xFFE0)) return ORBIT
+        // 0xFE2C = Google Fast Pair, 0xFEE7 = Tencent — both previously misassigned to Pebblebee
+        // Pebblebee uses proprietary service UUIDs not yet reversed; skip until confirmed
+        // 0xFFE0/0xFFF3 are generic HM-10 UART UUIDs used by countless non-Orbit devices
+        if (record.hasShortUuid(0xFFF3) && record.hasShortUuid(0xFFE0)) return ORBIT
         if (record.hasShortUuid(0xAA01) || record.hasShortUuid(0xAA02)) return NUT
         if (record.hasShortUuid(0xFEAA)) return EDDYSTONE
         if (record.hasShortUuid(0xFE85)) return INVOXIA

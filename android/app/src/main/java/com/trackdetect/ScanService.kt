@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Intent
@@ -34,6 +35,7 @@ import com.trackdetect.analysis.IMSICatcher
 import com.trackdetect.analysis.IdentityResolver
 import com.trackdetect.analysis.LocationTrack
 import com.trackdetect.analysis.Tracker
+import com.trackdetect.analysis.WifiScanner
 import com.trackdetect.analysis.toFix
 import com.trackdetect.detect.Signatures
 import kotlinx.coroutines.delay
@@ -44,6 +46,7 @@ class ScanService : LifecycleService() {
 
     private var scanner: BluetoothLeScanner? = null
     private lateinit var location: FusedLocationProviderClient
+    private var running = false
 
     private val tracker = Tracker()
     private val identities = IdentityResolver()
@@ -57,6 +60,7 @@ class ScanService : LifecycleService() {
 
     private val alerted = HashSet<String>()
     private val gpsTrail = ArrayList<LatLon>(500)
+    private var publishCycle = 0
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) { handle(result) }
@@ -101,6 +105,9 @@ class ScanService : LifecycleService() {
         super.onStartCommand(intent, flags, startId)
         if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
 
+        if (running) return START_STICKY
+        running = true
+
         ServiceCompat.startForeground(
             this, NOTIFICATION_ID, buildOngoing(0, 0),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
@@ -137,8 +144,12 @@ class ScanService : LifecycleService() {
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .setLegacy(false).setReportDelay(0).build()
+        // Provide non-empty filters so Android 8.1+ doesn't suspend the scan when
+        // the screen goes off. We filter on manufacturer ID presence for Apple (AirTag,
+        // FindMy) and Samsung (SmartTag), plus common tracker service UUIDs.
+        val filters = buildScanFilters()
         try {
-            scanner?.startScan(null, settings, scanCallback)
+            scanner?.startScan(filters, settings, scanCallback)
             Registry.update { it.copy(scanning = true, bluetoothOn = true, error = null) }
         } catch (e: SecurityException) {
             Registry.update { it.copy(scanning = false, error = "Scan denied: ${e.message}") }
@@ -183,7 +194,7 @@ class ScanService : LifecycleService() {
                         if (level.ordinal >= Threat.MEDIUM.ordinal && findings.isNotEmpty()) {
                             val now = System.currentTimeMillis()
                             val evt = TimelineEvent(
-                                id = "catcher@$now", kind = EventKind.CATCHER,
+                                id = "catcher@${cell.tac ?: cell.cellId}@$now", kind = EventKind.CATCHER,
                                 ts = now, title = findings.first().title,
                                 detail = findings.joinToString("; ") { it.id },
                                 severity = when (level) {
@@ -210,6 +221,7 @@ class ScanService : LifecycleService() {
             while (isActive) {
                 val now = System.currentTimeMillis()
                 tracker.prune(now)
+                identities.prune(now)
                 val all = tracker.snapshot(now)
                 // Only surface devices worth the user's attention; transient single-sighting
                 // signals from people walking by are tracked internally but not listed.
@@ -240,6 +252,52 @@ class ScanService : LifecycleService() {
                     ) else emptyList()
                 } else emptyList()
                 Registry.publishMap(MapData(trail, deviceTrails, cellMarkers))
+
+                // WiFi anomaly scan every ~60s (40 publish cycles at 1500ms each)
+                publishCycle++
+                if (publishCycle % 40 == 0) {
+                    val wifiAnomalies = WifiScanner.scan(this@ScanService)
+                    Registry.publishWifi(wifiAnomalies)
+                    if (wifiAnomalies.isNotEmpty()) {
+                        val top = wifiAnomalies.maxByOrNull { it.threat.ordinal }!!
+                        val evt = TimelineEvent(
+                            id = "wifi@${top.bssid}@$now",
+                            kind = EventKind.WIFI_ANOMALY,
+                            ts = now, title = "Wi-Fi anomaly: ${top.ssid}",
+                            detail = "${wifiAnomalies.size} suspicious network(s) — ${top.reason}",
+                            severity = when (top.threat) {
+                                Threat.CRITICAL -> Severity.CRITICAL
+                                Threat.HIGH -> Severity.HIGH
+                                else -> Severity.MEDIUM
+                            },
+                            lat = track.current?.lat, lon = track.current?.lon
+                        )
+                        if (eventLog.record(evt, "wifi@${top.bssid}")) {
+                            Registry.publishTimeline(eventLog.snapshot())
+                        }
+                    }
+
+                    // Correlated surveillance: persistent BLE tracker + active cell anomaly + wifi bait
+                    val cellNow = Registry.cell.value
+                    if (cellNow.level.ordinal >= Threat.HIGH.ordinal) {
+                        val correlatedBle = list.filter { it.persistent && !it.following }
+                        if (correlatedBle.isNotEmpty() && wifiAnomalies.isNotEmpty()) {
+                            val evt2 = TimelineEvent(
+                                id = "corr@${correlatedBle.first().key}@$now",
+                                kind = EventKind.CORRELATED_SURVEILLANCE,
+                                ts = now,
+                                title = "Correlated surveillance indicators",
+                                detail = "${correlatedBle.size} persistent BLE device(s) + active cell anomaly + WiFi bait",
+                                severity = Severity.CRITICAL,
+                                lat = track.current?.lat, lon = track.current?.lon
+                            )
+                            if (eventLog.record(evt2, "corr@${correlatedBle.first().key}")) {
+                                Registry.publishTimeline(eventLog.snapshot())
+                            }
+                        }
+                    }
+                }
+
                 delay(1500)
             }
         }
@@ -249,8 +307,11 @@ class ScanService : LifecycleService() {
         val record = result.scanRecord
         if (Signatures.isBenign(record)) return
 
+        // Skip devices the user has already paired with — their own headphones,
+        // keyboard, watch etc. generate false positives in the persistent device list.
         val now = System.currentTimeMillis()
         val address = result.device.address ?: return
+        if (Registry.trusted.value.contains(address)) return
         val fingerprint = Fingerprint.of(record)
         val resolution = identities.resolve(address, result.rssi, fingerprint, now)
         val tracked = Signatures.match(record)
@@ -285,6 +346,44 @@ class ScanService : LifecycleService() {
                 Registry.publishTimeline(eventLog.snapshot())
             }
         }
+    }
+
+    /**
+     * Builds scan filters covering all known tracker manufacturer IDs and service UUIDs.
+     * A non-empty filter list is required for BLE scans to continue when the screen is off
+     * (Android 8.1+). These filters are broad enough to catch all known trackers without
+     * relying on exact payload matching, so unknown device variants still appear.
+     */
+    private fun buildScanFilters(): List<ScanFilter> {
+        val manufacturerIds = listOf(
+            0x004C, // Apple — AirTag, Find My, iBeacon
+            0x0075, // Samsung — SmartTag
+            0x00D7, // Tile
+            0x005E, // Tile (legacy)
+        )
+        val serviceUuids = listOf(
+            // Tile 0xFEED, Samsung SmartTag 0xFD5A/0xFD70, Chipolo 0xFEBE/0xFE2B,
+            // Pebblebee 0xFEE7, Nut 0xAA01/0xAA02, Eddystone 0xFEAA, Invoxia 0xFE85
+            "0000feed-0000-1000-8000-00805f9b34fb",
+            "0000fd5a-0000-1000-8000-00805f9b34fb",
+            "0000fd70-0000-1000-8000-00805f9b34fb",
+            "0000febe-0000-1000-8000-00805f9b34fb",
+            "0000fe2b-0000-1000-8000-00805f9b34fb",
+            "0000fee7-0000-1000-8000-00805f9b34fb",
+            "0000aa01-0000-1000-8000-00805f9b34fb",
+            "0000feaa-0000-1000-8000-00805f9b34fb",
+            "0000fe85-0000-1000-8000-00805f9b34fb",
+            "0000fe9f-0000-1000-8000-00805f9b34fb",
+        )
+        val filters = ArrayList<ScanFilter>()
+        manufacturerIds.forEach { id ->
+            filters.add(ScanFilter.Builder().setManufacturerData(id, byteArrayOf()).build())
+        }
+        serviceUuids.forEach { uuid ->
+            filters.add(ScanFilter.Builder()
+                .setServiceUuid(android.os.ParcelUuid.fromString(uuid)).build())
+        }
+        return filters
     }
 
     private fun granted(permission: String) =

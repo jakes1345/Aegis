@@ -1,0 +1,7 @@
+# Gradle and IDE output; local.properties holds a machine-specific SDK path.
+.gradle/
+build/
+.kotlin/
+local.properties
+.idea/
+*.iml

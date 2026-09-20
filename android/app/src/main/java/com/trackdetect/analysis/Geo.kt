@@ -19,9 +19,14 @@ const val PLACE_RADIUS_M = 100.0
 /** Below this speed we are not travelling, so co-presence proves nothing. */
 const val MOVING_SPEED_MS = 1.5
 
-data class Fix(val lat: Double, val lon: Double, val speed: Float?, val time: Long)
+data class Fix(val lat: Double, val lon: Double, val speed: Float?, val time: Long, val accuracy: Float? = null)
 
-fun Location.toFix() = Fix(latitude, longitude, if (hasSpeed()) speed else null, System.currentTimeMillis())
+fun Location.toFix() = Fix(
+    latitude, longitude,
+    if (hasSpeed()) speed else null,
+    System.currentTimeMillis(),
+    if (hasAccuracy()) accuracy else null
+)
 
 fun haversine(a: Fix, b: Fix): Double {
     val dLat = Math.toRadians(b.lat - a.lat)
@@ -47,6 +52,8 @@ class ObservationArea(private val maxPlaces: Int = 60) {
     val size: Int get() = places.size
 
     fun add(fix: Fix) {
+        // Reject coarse fixes (e.g. cell/WiFi positioning) to avoid false FOLLOWING
+        if (fix.accuracy != null && fix.accuracy > 50f) return
         for (p in places) {
             if (haversine(Fix(p.lat, p.lon, null, 0), fix) <= PLACE_RADIUS_M) {
                 p.count++

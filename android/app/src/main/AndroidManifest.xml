@@ -14,6 +14,10 @@
     <!-- Cellular identity — needed to read serving cell info -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
 
+    <!-- Wi-Fi anomaly scan reads the system's cached scan results only; it never
+         triggers a scan, so CHANGE_WIFI_STATE is deliberately not requested. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
     <!-- NFC / HF RFID passive tag sweep -->
     <uses-permission android:name="android.permission.NFC" />
 
