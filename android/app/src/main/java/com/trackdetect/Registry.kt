@@ -43,6 +43,15 @@ object Registry {
 
     fun clearNfc() { _nfc.value = emptyList() }
 
+    private val _wifi = MutableStateFlow<List<WifiAnomaly>>(emptyList())
+    val wifi: StateFlow<List<WifiAnomaly>> = _wifi.asStateFlow()
+    fun publishWifi(anomalies: List<WifiAnomaly>) { _wifi.value = anomalies }
+
+    private val _trusted = MutableStateFlow<Set<String>>(emptySet())
+    val trusted: StateFlow<Set<String>> = _trusted.asStateFlow()
+    fun trust(key: String) { _trusted.value = _trusted.value + key }
+    fun untrust(key: String) { _trusted.value = _trusted.value - key }
+
     fun reset() {
         _detections.value = emptyList()
         _status.value = ScanStatus()

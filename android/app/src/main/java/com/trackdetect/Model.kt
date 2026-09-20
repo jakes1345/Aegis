@@ -124,6 +124,17 @@ data class NfcTag(
     val ts: Long
 )
 
+// --- WiFi anomaly -----------------------------------------------------------
+
+data class WifiAnomaly(
+    val ssid: String,
+    val bssid: String,
+    val rssi: Int,
+    val reason: String,       // e.g. "known_catcher_ssid", "open_unsecured", "duplicate_ssid"
+    val threat: Threat,
+    val ts: Long
+)
+
 // --- Map --------------------------------------------------------------------
 
 data class DeviceTrail(
