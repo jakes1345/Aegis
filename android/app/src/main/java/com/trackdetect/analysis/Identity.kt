@@ -74,24 +74,52 @@ class IdentityResolver(
     private val byFingerprint = HashMap<String, MutableSet<String>>()
     private var counter = 0
 
+    // resolve() runs on the Bluetooth callback thread and prune() on the service's
+    // coroutine, so every access to the three maps below has to be guarded. Without
+    // this the pruning pass iterates a map the scan thread is writing to and the
+    // service dies on ConcurrentModificationException mid-scan.
+    @Synchronized
     fun prune(now: Long, maxAgeMs: Long = 30 * 60_000L) {
         val cutoff = now - maxAgeMs
-        val staleIds = byId.values.filter { it.lastSeen < cutoff }.map { it.id }
-        staleIds.forEach { id ->
-            val identity = byId.remove(id) ?: return@forEach
-            identity.addresses.forEach { byAddress.remove(it) }
-            if (identity.fingerprint != null) {
-                byFingerprint[identity.fingerprint]?.let { set ->
-                    set.remove(id)
-                    if (set.isEmpty()) byFingerprint.remove(identity.fingerprint)
-                }
+        byId.values.filter { it.lastSeen < cutoff }.map { it.id }.forEach { forget(it) }
+
+        // A thirty-minute window in a station or a shopping centre, with every
+        // privacy-conscious device rotating its address every quarter hour, is enough
+        // to accumulate a very large number of one-off identities. Cap it by dropping
+        // the least recently heard — they are the ones least likely to be on you.
+        if (byId.size > MAX_IDENTITIES) {
+            byId.values
+                .sortedBy { it.lastSeen }
+                .take(byId.size - MAX_IDENTITIES)
+                .map { it.id }
+                .forEach { forget(it) }
+        }
+    }
+
+    private fun forget(id: String) {
+        val identity = byId.remove(id) ?: return
+        identity.addresses.forEach { byAddress.remove(it) }
+        if (identity.fingerprint != null) {
+            byFingerprint[identity.fingerprint]?.let { set ->
+                set.remove(id)
+                if (set.isEmpty()) byFingerprint.remove(identity.fingerprint)
             }
         }
     }
 
+    /** Forgets every identity. Used by "clear all data". */
+    @Synchronized
+    fun clear() {
+        byId.clear()
+        byAddress.clear()
+        byFingerprint.clear()
+    }
+
+    @Synchronized
     fun resolve(address: String, rssi: Int, fingerprint: String?, now: Long): Resolution {
-        byAddress[address]?.let { id ->
-            val identity = byId.getValue(id)
+        // byId may not hold the id if a prune raced ahead of a stale byAddress entry;
+        // fall through to re-creating the identity rather than throwing.
+        byAddress[address]?.let { id -> byId[id] }?.let { identity ->
             identity.lastSeen = now
             identity.lastRssi = rssi
             return Resolution(identity, false, null)
@@ -136,5 +164,10 @@ class IdentityResolver(
             byFingerprint.getOrPut(fingerprint) { HashSet() }.add(identity.id)
         }
         return Resolution(identity, false, null)
+    }
+
+    private companion object {
+        /** Ceiling on simultaneously remembered identities — see [prune]. */
+        const val MAX_IDENTITIES = 4000
     }
 }

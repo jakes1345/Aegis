@@ -97,7 +97,7 @@ class ObservationArea(private val maxPlaces: Int = 60) {
         return max
     }
 
-    fun movedWithUs(): Boolean = span() >= FOLLOW_DISPLACEMENT_M
+    fun movedWithUs(thresholdM: Double = FOLLOW_DISPLACEMENT_M): Boolean = span() >= thresholdM
 
     fun points(): List<LatLon> = places.map { LatLon(it.lat, it.lon) }
 }

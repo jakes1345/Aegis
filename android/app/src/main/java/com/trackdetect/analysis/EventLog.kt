@@ -65,6 +65,10 @@ class EventLog(private val store: Store, private val cap: Int = 500) {
         val arr = JSONArray()
         for (e in events) arr.put(toJson(e))
         store.json.put("events", arr)
+        // Mutating the JSON in place leaves the store unaware it has changed, and
+        // flush() short-circuits when it is not dirty — so without this the timeline
+        // was rebuilt in memory on every event and never once written to disk.
+        store.markDirty()
         store.flush()
     }
 

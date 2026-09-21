@@ -49,6 +49,15 @@ class Store(context: Context, filename: String) {
     val json: JSONObject
         get() = data ?: load { JSONObject() }
 
+    /**
+     * Marks the store as having unwritten changes without scheduling anything.
+     * A caller that mutates [json] directly and then wants it on disk needs this —
+     * [flush] deliberately does nothing when there is nothing to write.
+     */
+    fun markDirty() {
+        synchronized(lock) { dirty = true }
+    }
+
     /** Marks the store dirty and schedules a flush on the IO dispatcher if enough time has passed. */
     fun touch(minIntervalMs: Long = 5_000L) {
         synchronized(lock) {
@@ -62,6 +71,22 @@ class Store(context: Context, filename: String) {
 
     fun flush() {
         synchronized(lock) { flushLocked() }
+    }
+
+    /**
+     * Replaces the contents with [fresh] and writes immediately.
+     *
+     * "Clear all data" used to just delete the files, which did nothing while the
+     * scanner was running: this object still held the parsed JSON and wrote it
+     * straight back on the next flush.
+     */
+    fun replace(fresh: JSONObject) {
+        synchronized(lock) {
+            data = fresh
+            dirty = true
+            lastFlush = 0L
+            flushLocked()
+        }
     }
 
     private fun flushLocked() {

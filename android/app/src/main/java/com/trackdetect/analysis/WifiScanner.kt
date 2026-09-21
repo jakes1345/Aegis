@@ -1,43 +1,46 @@
 package com.trackdetect.analysis
 
 import android.content.Context
+import android.net.wifi.ScanResult
 import android.net.wifi.WifiManager
 import com.trackdetect.Threat
 import com.trackdetect.WifiAnomaly
 
+/**
+ * Looks for access points that behave like bait rather than like infrastructure.
+ *
+ * The hard part here is not finding suspicious networks, it is not crying wolf. An
+ * earlier version flagged `xfinitywifi`, `attwifi`, `netgear` and every network
+ * broadcasting on more than two frequencies — which is to say every carrier hotspot
+ * and every dual-band router in the country. A scanner that lights up on a walk down
+ * the street teaches you to ignore it, so each rule below has to describe something
+ * a normal network does not do.
+ */
 object WifiScanner {
 
-    // SSIDs used by known IMSI catcher bait configurations and DHS/law enforcement tools.
-    // Sources: Stingrays, Harris Corporation documents, Hailstorm/Kingfish/Harpoon configs,
-    // academic papers on IMSI catchers, and public security research.
-    private val KNOWN_CATCHER_SSIDS = setOf(
-        // Generic network bait SSIDs used by Stingray/Hailstorm
-        "starbucks", "starbucks wifi", "xfinitywifi", "xfinity", "attwifi", "att wifi",
-        "tmobile", "t-mobile", "verizon", "verizonwifi", "sprint", "sprintwifi",
-        "optimumwifi", "optimum wifi", "cablewifi",
-        // Known IMSI catcher defaults (Harris, L3Harris, DRT)
+    /**
+     * Default SSIDs of actual interception and research equipment. Deliberately short:
+     * a network being *popular* is not evidence, and carrier hotspot names belong to
+     * the open-network rule below, where being unencrypted is what carries the signal.
+     */
+    private val KNOWN_TOOL_SSIDS = setOf(
         "drt", "hailstorm", "kingfish", "stingray", "dirtbox", "triggerfish",
-        // Generic law-enforcement bait patterns
-        "police_wifi", "cop_wifi", "feds_wifi", "gov_wifi", "federal_wifi",
-        // Commonly deployed carrier bait APs
-        "free_public_wifi", "free wifi", "free_wifi", "publicwifi", "public wifi",
-        "hotel_wifi", "hotel wifi", "airport wifi", "airportwifi",
-        // Android IMSI test SSIDs and known research tools
-        "androidwifi", "android_wifi", "test_ssid", "testssid", "wifi_test",
-        // EvilTwin / known attack vectors
-        "default", "linksys", "netgear", "dlink", "asus", "belkin"
+        "gossamer", "harpoon", "crossbow", "porpoise",
+        "androidwifi", "test_ssid", "testssid", "wifi_test",
+        "pineapple", "wifipineapple", "hak5", "evil_twin", "eviltwin"
     )
 
-    // Legitimate carrier names in SSIDs are suspicious when the network is open/unencrypted
+    /** Operator brands. An open network wearing one of these is the classic bait. */
     private val CARRIER_NAMES = setOf(
-        "at&t", "verizon", "t-mobile", "tmobile", "sprint", "boost", "cricket",
+        "at&t", "att", "verizon", "t-mobile", "tmobile", "sprint", "boost", "cricket",
         "metro", "metropcs", "straight talk", "tracfone", "consumer cellular",
         "us cellular", "uscellular", "c spire", "spectrum", "charter", "comcast",
-        "xfinity", "cox", "optimum", "altice", "frontier", "centurylink", "lumen"
+        "xfinity", "cox", "optimum", "altice", "frontier", "centurylink", "lumen",
+        "vodafone", "orange", "telefonica", "movistar", "o2", "ee", "three"
     )
 
     fun scan(context: Context): List<WifiAnomaly> {
-        val wifi = context.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             ?: return emptyList()
         val results = try { wifi.scanResults } catch (_: SecurityException) { return emptyList() }
         if (results.isNullOrEmpty()) return emptyList()
@@ -45,63 +48,73 @@ object WifiScanner {
         val anomalies = ArrayList<WifiAnomaly>()
         val now = System.currentTimeMillis()
 
-        // Track BSSIDs per SSID to detect evil-twin / BSSID spoofing
-        val ssidToBssids = HashMap<String, MutableList<String>>()
-        val ssidToChannels = HashMap<String, MutableSet<Int>>()
+        // Same SSID seen on the same frequency from several radios, and whether any
+        // access point on that SSID is encrypted — both needed for the twin rules.
+        val bssidsPerSsidFreq = HashMap<String, MutableSet<String>>()
+        val securedSsids = HashSet<String>()
 
         for (r in results) {
-            val ssid = r.SSID?.trim()?.lowercase() ?: continue
-            if (ssid.isEmpty()) continue
+            val ssid = normalise(r.SSID) ?: continue
             val bssid = r.BSSID ?: continue
+            bssidsPerSsidFreq.getOrPut("$ssid@${r.frequency}") { mutableSetOf() }.add(bssid)
+            if (!isOpen(r)) securedSsids.add(ssid)
+        }
 
-            ssidToBssids.getOrPut(ssid) { mutableListOf() }.add(bssid)
-            ssidToChannels.getOrPut(ssid) { mutableSetOf() }.add(r.frequency)
+        for (r in results) {
+            val ssid = normalise(r.SSID) ?: continue
+            val bssid = r.BSSID ?: continue
+            val label = r.SSID?.trim()?.trim('"').orEmpty().ifBlank { ssid }
+            val open = isOpen(r)
 
-            // 1. Known IMSI-catcher bait SSID
-            if (KNOWN_CATCHER_SSIDS.contains(ssid)) {
-                anomalies.add(WifiAnomaly(
-                    ssid = r.SSID ?: ssid, bssid = bssid, rssi = r.level,
-                    reason = "known_catcher_ssid",
-                    threat = Threat.HIGH, ts = now
-                ))
+            // 1 — Default SSID of known interception or pentest equipment.
+            if (KNOWN_TOOL_SSIDS.contains(ssid)) {
+                anomalies.add(WifiAnomaly(label, bssid, r.level, "known_catcher_ssid", Threat.HIGH, now))
                 continue
             }
 
-            // 2. Open network advertising a carrier name — classic IMSI catcher bait
-            val isOpen = r.capabilities?.contains("[ESS]") == true &&
-                !r.capabilities.contains("WPA") && !r.capabilities.contains("WEP")
-            if (isOpen && CARRIER_NAMES.any { ssid.contains(it) }) {
-                anomalies.add(WifiAnomaly(
-                    ssid = r.SSID ?: ssid, bssid = bssid, rssi = r.level,
-                    reason = "carrier_open_network",
-                    threat = Threat.HIGH, ts = now
-                ))
+            // 2 — An operator's brand on an unencrypted network. Real carrier hotspots
+            // use Passpoint or WPA2-Enterprise; an open one wearing the name is bait.
+            if (open && CARRIER_NAMES.any { ssid.contains(it) }) {
+                anomalies.add(WifiAnomaly(label, bssid, r.level, "carrier_open_network", Threat.HIGH, now))
                 continue
             }
 
-            // 3. Extremely strong signal — could indicate a nearby fake AP
-            if (r.level > -40) {
-                anomalies.add(WifiAnomaly(
-                    ssid = r.SSID ?: ssid, bssid = bssid, rssi = r.level,
-                    reason = "signal_anomaly",
-                    threat = Threat.MEDIUM, ts = now
-                ))
+            // 3 — An open network using the name of a network that is encrypted
+            // elsewhere in range. That is an evil twin of a real access point, and
+            // unlike a strong signal it has no innocent explanation.
+            if (open && securedSsids.contains(ssid)) {
+                anomalies.add(WifiAnomaly(label, bssid, r.level, "open_twin_of_secured", Threat.HIGH, now))
             }
         }
 
-        // 4. Same SSID on multiple channels (evil-twin indicator)
-        for ((ssid, channels) in ssidToChannels) {
-            if (channels.size >= 3) {
-                val bssids = ssidToBssids[ssid] ?: continue
-                anomalies.add(WifiAnomaly(
-                    ssid = ssid, bssid = bssids.first(), rssi = -60,
-                    reason = "duplicate_ssid",
-                    threat = Threat.MEDIUM, ts = now
-                ))
+        // 4 — Three or more radios broadcasting one SSID on the *same* frequency.
+        // A mesh kit or a dual-band router spreads itself across bands and channels
+        // precisely to avoid this; stacking up on one channel does not happen by design.
+        for ((key, bssids) in bssidsPerSsidFreq) {
+            if (bssids.size >= 3) {
+                val ssid = key.substringBeforeLast('@')
+                anomalies.add(WifiAnomaly(ssid, bssids.first(), -60, "duplicate_ssid", Threat.MEDIUM, now))
             }
         }
 
-        // Deduplicate by SSID+reason
-        return anomalies.distinctBy { "${it.ssid}|${it.reason}" }
+        return anomalies.distinctBy { "${it.bssid}|${it.reason}" }
+    }
+
+    /** Lower-cased SSID with the quoting some Android versions add stripped off. */
+    private fun normalise(raw: String?): String? =
+        raw?.trim()?.trim('"')?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+
+    /**
+     * True only when the network carries no encryption at all.
+     *
+     * The old check asked whether the capability string mentioned "WPA" or "WEP",
+     * which quietly classified every WPA3 network — advertised as `[RSN-SAE-CCMP]` —
+     * as wide open, and then flagged it.
+     */
+    private fun isOpen(r: ScanResult): Boolean {
+        val caps = r.capabilities ?: return false
+        val secured = listOf("WPA", "WEP", "RSN", "SAE", "PSK", "EAP", "OWE", "WAPI")
+            .any { caps.contains(it, ignoreCase = true) }
+        return !secured
     }
 }

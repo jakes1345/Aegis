@@ -12,11 +12,15 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -38,6 +42,7 @@ import com.trackdetect.analysis.Tracker
 import com.trackdetect.analysis.WifiScanner
 import com.trackdetect.analysis.toFix
 import com.trackdetect.detect.Signatures
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -48,7 +53,7 @@ class ScanService : LifecycleService() {
     private lateinit var location: FusedLocationProviderClient
     private var running = false
 
-    private val tracker = Tracker()
+    private lateinit var tracker: Tracker
     private val identities = IdentityResolver()
     private val track = LocationTrack()
 
@@ -62,10 +67,23 @@ class ScanService : LifecycleService() {
     private val gpsTrail = ArrayList<LatLon>(500)
     private var publishCycle = 0
 
+    /** Whether a scan is currently registered with the adapter. */
+    private var scanActive = false
+
+    /** Screen state decides which filter strategy the scan can use — see [startScanning]. */
+    @Volatile
+    private var screenOn = true
+
+    /** Last ongoing-notification text, so it is only re-posted when it actually changes. */
+    private var lastOngoingText: String? = null
+
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) { handle(result) }
         override fun onBatchScanResults(results: MutableList<ScanResult>) { results.forEach { handle(it) } }
         override fun onScanFailed(errorCode: Int) {
+            // A scan that is already running is not an error worth showing.
+            if (errorCode == ScanCallback.SCAN_FAILED_ALREADY_STARTED) return
+            scanActive = false
             Registry.update { it.copy(scanning = false, error = "Bluetooth scan failed ($errorCode)") }
         }
     }
@@ -87,11 +105,48 @@ class ScanService : LifecycleService() {
         }
     }
 
+    /**
+     * Two things outside this service change whether it can see anything: the screen
+     * turning off (which changes what filters the scan needs) and Bluetooth being
+     * switched on or off. Without watching for the latter, turning Bluetooth on after
+     * starting a scan left the app sitting on "Bluetooth is off" forever.
+     */
+    private val systemReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_ON -> { screenOn = true; restartScan() }
+                Intent.ACTION_SCREEN_OFF -> { screenOn = false; restartScan() }
+                BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                    when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                        BluetoothAdapter.STATE_ON -> restartScan()
+                        BluetoothAdapter.STATE_OFF -> {
+                            scanActive = false
+                            Registry.update {
+                                it.copy(scanning = false, bluetoothOn = false, error = "Bluetooth is off")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
+        // The service can be started at boot without the activity ever running, so it
+        // loads settings and the trusted list itself rather than assuming they are up.
+        AppSettings.load(this)
+        Registry.bindTrustStore(this)
+
+        tracker = Tracker(
+            persistMs = { AppSettings.persistenceThresholdMs },
+            followM = { AppSettings.followThresholdM.toDouble() }
+        )
+
         createChannels()
         getSystemService(BluetoothManager::class.java)?.adapter?.bluetoothLeScanner.also { scanner = it }
         location = LocationServices.getFusedLocationProviderClient(this)
+        screenOn = getSystemService(PowerManager::class.java)?.isInteractive ?: true
 
         cellStore = Store(this, "imsi_baseline.json")
         timelineStore = Store(this, "timeline.json")
@@ -103,7 +158,22 @@ class ScanService : LifecycleService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
+
+        when (intent?.action) {
+            ACTION_STOP -> {
+                AppSettings.setScanEnabled(this, false)
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_CLEAR -> {
+                // Wiping the files on disk is not enough while this service is alive:
+                // it holds the baseline and the event log in memory and would write
+                // them straight back out on the next flush.
+                clearAllData()
+                if (!running) { stopSelf(); return START_NOT_STICKY }
+                return START_STICKY
+            }
+        }
 
         if (running) return START_STICKY
         running = true
@@ -114,25 +184,57 @@ class ScanService : LifecycleService() {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
             )
         } catch (e: SecurityException) {
+            running = false
             Registry.update { it.copy(scanning = false, error = "Location permission required to scan") }
             stopSelf()
             return START_NOT_STICKY
         }
+
+        AppSettings.setScanEnabled(this, true)
+        registerSystemReceiver()
 
         startScanning()
         startLocation()
         startCellPolling()
         startPublishing()
 
-        val startEvt = TimelineEvent(
-            id = "scan_start@${System.currentTimeMillis()}", kind = EventKind.SCAN_START,
-            ts = System.currentTimeMillis(), title = "Scanning started", detail = "",
-            severity = Severity.LOW
+        recordEvent(
+            TimelineEvent(
+                id = "scan_start@${System.currentTimeMillis()}", kind = EventKind.SCAN_START,
+                ts = System.currentTimeMillis(), title = "Scanning started", detail = "",
+                severity = Severity.LOW
+            )
         )
-        eventLog.record(startEvt)
-        Registry.publishTimeline(eventLog.snapshot())
 
         return START_STICKY
+    }
+
+    private fun registerSystemReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+        }
+        ContextCompat.registerReceiver(
+            this, systemReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+    }
+
+    private fun restartScan() {
+        if (!running) return
+        stopScanning()
+        startScanning()
+    }
+
+    private fun stopScanning() {
+        if (!scanActive) return
+        try {
+            if (granted(Manifest.permission.BLUETOOTH_SCAN)) scanner?.stopScan(scanCallback)
+        } catch (_: SecurityException) {
+        } catch (_: IllegalStateException) {
+            // Adapter turned off underneath us; nothing left to stop.
+        }
+        scanActive = false
     }
 
     private fun startScanning() {
@@ -147,18 +249,27 @@ class ScanService : LifecycleService() {
             return
         }
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(AppSettings.scanMode)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .setLegacy(false).setReportDelay(0).build()
-        // Provide non-empty filters so Android 8.1+ doesn't suspend the scan when
-        // the screen goes off. We filter on manufacturer ID presence for Apple (AirTag,
-        // FindMy) and Samsung (SmartTag), plus common tracker service UUIDs.
-        val filters = buildScanFilters()
+
+        // Android 8.1+ suspends an *unfiltered* scan once the screen goes off, so a
+        // filter list is the price of scanning with the phone in a pocket. But any
+        // filter list is also a whitelist, and the whole point of this app is the
+        // hardwired GPS/LTE box that advertises nothing anyone has catalogued —
+        // scanning only for Apple, Samsung and Tile made the headline case
+        // undetectable. So: no filters while the screen is on, which is when unknown
+        // devices can be discovered, and the known-tracker filters while it is off,
+        // which is when the scan would otherwise stop entirely.
+        val filters = if (screenOn) emptyList() else buildScanFilters()
         try {
             scanner?.startScan(filters, settings, scanCallback)
+            scanActive = true
             Registry.update { it.copy(scanning = true, bluetoothOn = true, error = null) }
         } catch (e: SecurityException) {
             Registry.update { it.copy(scanning = false, error = "Scan denied: ${e.message}") }
+        } catch (e: IllegalStateException) {
+            Registry.update { it.copy(scanning = false, error = "Bluetooth unavailable: ${e.message}") }
         }
     }
 
@@ -176,8 +287,10 @@ class ScanService : LifecycleService() {
         }
     }
 
+    // Cell sampling reads the modem and writes the baseline to disk. Both belong off
+    // the main thread — on it, every poll janked the UI of whatever was on screen.
     private fun startCellPolling() {
-        lifecycleScope.launch {
+        lifecycleScope.launch(Dispatchers.IO) {
             while (isActive) {
                 val reason = cellMonitor.unavailableReason()
                 if (reason != null) {
@@ -225,12 +338,13 @@ class ScanService : LifecycleService() {
     }
 
     private fun startPublishing() {
-        lifecycleScope.launch {
+        lifecycleScope.launch(Dispatchers.Default) {
             while (isActive) {
                 val now = System.currentTimeMillis()
                 tracker.prune(now)
                 identities.prune(now)
                 val all = tracker.snapshot(now)
+                val trusted = Registry.trusted.value
                 // Only surface devices worth the user's attention; transient single-sighting
                 // signals from people walking by are tracked internally but not listed.
                 val list = all.filter { d ->
@@ -245,7 +359,9 @@ class ScanService : LifecycleService() {
                 )
                 Registry.update { it.copy(nearbyCount = all.size) }
                 Registry.publish(list)
-                updateOngoing(list)
+                // The ongoing notification counts what the user would act on, which
+                // excludes anything they have already marked as their own.
+                updateOngoing(list.filter { it.address !in trusted })
 
                 val trail = synchronized(gpsTrail) { ArrayList(gpsTrail) }
                 val deviceTrails = list.filter { it.points.isNotEmpty() }.map {
@@ -286,9 +402,10 @@ class ScanService : LifecycleService() {
                     }
 
                     // Correlated surveillance: persistent BLE tracker + active cell anomaly + wifi bait
-                    val cellNow = Registry.cell.value
-                    if (cellNow.level.ordinal >= Threat.HIGH.ordinal) {
-                        val correlatedBle = list.filter { it.persistent && !it.following }
+                    if (Registry.cell.value.level.ordinal >= Threat.HIGH.ordinal) {
+                        val correlatedBle = list.filter {
+                            it.persistent && !it.following && it.address !in trusted
+                        }
                         if (correlatedBle.isNotEmpty() && wifiAnomalies.isNotEmpty()) {
                             val evt2 = TimelineEvent(
                                 id = "corr@${correlatedBle.first().key}@$now",
@@ -315,8 +432,7 @@ class ScanService : LifecycleService() {
         val record = result.scanRecord
         if (Signatures.isBenign(record)) return
 
-        // Skip devices the user has already paired with — their own headphones,
-        // keyboard, watch etc. generate false positives in the persistent device list.
+        // Skip devices the user has explicitly marked as their own.
         val now = System.currentTimeMillis()
         val address = result.device.address ?: return
         if (Registry.trusted.value.contains(address)) return
@@ -341,26 +457,58 @@ class ScanService : LifecycleService() {
         if (observation.becameFollowing && alerted.add(observation.detection.key)) {
             notifyFollowing(observation.detection)
             val fix = track.current
-            val evt = TimelineEvent(
-                id = "following@${observation.detection.key}@$now",
-                kind = EventKind.FOLLOWING,
-                ts = now,
-                title = "${observation.detection.name} is following you",
-                detail = "Confirmed over ${observation.detection.displacementM.toInt()} m, ${observation.detection.sightings} sightings",
-                severity = Severity.CRITICAL,
-                lat = fix?.lat, lon = fix?.lon
+            recordEvent(
+                TimelineEvent(
+                    id = "following@${observation.detection.key}@$now",
+                    kind = EventKind.FOLLOWING,
+                    ts = now,
+                    title = "${observation.detection.name} is following you",
+                    detail = "Confirmed over ${observation.detection.displacementM.toInt()} m, ${observation.detection.sightings} sightings",
+                    severity = Severity.CRITICAL,
+                    lat = fix?.lat, lon = fix?.lon
+                ),
+                dedupeKey = "following@${observation.detection.key}"
             )
-            if (eventLog.record(evt, "following@${observation.detection.key}")) {
-                Registry.publishTimeline(eventLog.snapshot())
-            }
+        }
+    }
+
+    /** Records an event off the calling thread — [EventLog.record] writes to disk. */
+    private fun recordEvent(event: TimelineEvent, dedupeKey: String? = null) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            if (eventLog.record(event, dedupeKey)) Registry.publishTimeline(eventLog.snapshot())
         }
     }
 
     /**
-     * Builds scan filters covering all known tracker manufacturer IDs and service UUIDs.
-     * A non-empty filter list is required for BLE scans to continue when the screen is off
-     * (Android 8.1+). These filters are broad enough to catch all known trackers without
-     * relying on exact payload matching, so unknown device variants still appear.
+     * Runs synchronously and deliberately so: when the service is not otherwise
+     * running this is followed immediately by stopSelf(), and work posted to
+     * lifecycleScope would be cancelled before it reached the disk. It is two small
+     * JSON writes on an explicit, one-off user action.
+     */
+    private fun clearAllData() {
+        eventLog.clear()
+        imsiCatcher.resetBaseline()
+        tracker.clear()
+        identities.clear()
+        alerted.clear()
+        synchronized(gpsTrail) { gpsTrail.clear() }
+        publishCycle = 0
+        lastOngoingText = null
+
+        Registry.reset()
+        Registry.clearNfc()
+        Registry.publishTimeline(emptyList())
+        Registry.publishWifi(emptyList())
+        // Registry.reset() puts the status back to its defaults, which would otherwise
+        // leave a live scan reporting itself as idle.
+        Registry.update { it.copy(scanning = running && scanActive, bluetoothOn = true) }
+    }
+
+    /**
+     * Filters covering the tracker manufacturer IDs and service UUIDs worth keeping a
+     * scan alive for while the screen is off. These are a whitelist — anything not
+     * listed is invisible — which is why they are only used in that one case, and the
+     * screen-on scan runs unfiltered.
      */
     private fun buildScanFilters(): List<ScanFilter> {
         val manufacturerIds = listOf(
@@ -371,17 +519,20 @@ class ScanService : LifecycleService() {
         )
         val serviceUuids = listOf(
             // Tile 0xFEED, Samsung SmartTag 0xFD5A/0xFD70, Chipolo 0xFEBE/0xFE2B,
-            // Pebblebee 0xFEE7, Nut 0xAA01/0xAA02, Eddystone 0xFEAA, Invoxia 0xFE85
+            // Nut 0xAA01/0xAA02, Eddystone 0xFEAA, Invoxia 0xFE85,
+            // Orbit/KeySmart 0xFFE0/0xFFF3 (generic HM-10 UART, paired check in Signatures)
             "0000feed-0000-1000-8000-00805f9b34fb",
             "0000fd5a-0000-1000-8000-00805f9b34fb",
             "0000fd70-0000-1000-8000-00805f9b34fb",
             "0000febe-0000-1000-8000-00805f9b34fb",
             "0000fe2b-0000-1000-8000-00805f9b34fb",
-            "0000fee7-0000-1000-8000-00805f9b34fb",
             "0000aa01-0000-1000-8000-00805f9b34fb",
+            "0000aa02-0000-1000-8000-00805f9b34fb",
             "0000feaa-0000-1000-8000-00805f9b34fb",
             "0000fe85-0000-1000-8000-00805f9b34fb",
             "0000fe9f-0000-1000-8000-00805f9b34fb",
+            "0000ffe0-0000-1000-8000-00805f9b34fb",
+            "0000fff3-0000-1000-8000-00805f9b34fb",
         )
         val filters = ArrayList<ScanFilter>()
         manufacturerIds.forEach { id ->
@@ -418,23 +569,32 @@ class ScanService : LifecycleService() {
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
     )
 
-    private fun buildOngoing(watching: Int, following: Int): Notification {
-        val text = when {
-            following > 0 -> "$following confirmed following you"
-            watching > 0 -> "Watching $watching device${if (watching == 1) "" else "s"}"
-            else -> "Scanning for trackers"
-        }
-        return NotificationCompat.Builder(this, CHANNEL_ONGOING)
-            .setContentTitle("Track Detect").setContentText(text)
+    private fun ongoingText(watching: Int, following: Int) = when {
+        following > 0 -> "$following confirmed following you"
+        watching > 0 -> "Watching $watching device${if (watching == 1) "" else "s"}"
+        else -> "Scanning for trackers"
+    }
+
+    private fun buildOngoing(watching: Int, following: Int): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ONGOING)
+            .setContentTitle("Track Detect").setContentText(ongoingText(watching, following))
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setOngoing(true).setContentIntent(contentIntent())
             .setCategory(NotificationCompat.CATEGORY_SERVICE).build()
-    }
 
+    /**
+     * The publish loop runs every 1.5 s; re-posting the notification that often gets
+     * the app rate-limited by the system and costs battery for no visible change. Post
+     * only when the text actually differs.
+     */
     private fun updateOngoing(list: List<Detection>) {
         if (!granted(Manifest.permission.POST_NOTIFICATIONS)) return
+        val following = list.count { it.following }
+        val text = ongoingText(list.size, following)
+        if (text == lastOngoingText) return
+        lastOngoingText = text
         getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, buildOngoing(list.size, list.count { it.following }))
+            .notify(NOTIFICATION_ID, buildOngoing(list.size, following))
     }
 
     private fun notifyFollowing(detection: Detection) {
@@ -468,17 +628,20 @@ class ScanService : LifecycleService() {
     }
 
     override fun onDestroy() {
-        try { if (granted(Manifest.permission.BLUETOOTH_SCAN)) scanner?.stopScan(scanCallback) }
-        catch (_: SecurityException) {}
-        location.removeLocationUpdates(locationCallback)
+        stopScanning()
+        if (running) {
+            try { unregisterReceiver(systemReceiver) } catch (_: IllegalArgumentException) {}
+            location.removeLocationUpdates(locationCallback)
+            // Recorded synchronously: the process may not outlive this callback.
+            eventLog.record(
+                TimelineEvent(
+                    id = "scan_stop@${System.currentTimeMillis()}", kind = EventKind.SCAN_STOP,
+                    ts = System.currentTimeMillis(), title = "Scanning stopped", detail = "",
+                    severity = Severity.LOW
+                )
+            )
+        }
         Registry.update { it.copy(scanning = false) }
-
-        val stopEvt = TimelineEvent(
-            id = "scan_stop@${System.currentTimeMillis()}", kind = EventKind.SCAN_STOP,
-            ts = System.currentTimeMillis(), title = "Scanning stopped", detail = "",
-            severity = Severity.LOW
-        )
-        eventLog.record(stopEvt)
         cellStore.flush()
         timelineStore.flush()
         super.onDestroy()
@@ -488,6 +651,7 @@ class ScanService : LifecycleService() {
 
     companion object {
         const val ACTION_STOP = "com.trackdetect.STOP"
+        const val ACTION_CLEAR = "com.trackdetect.CLEAR"
         private const val CHANNEL_ONGOING = "scanning"
         private const val CHANNEL_ALERT = "alerts"
         private const val CHANNEL_CELL = "cell_alerts"

@@ -20,7 +20,13 @@ import org.json.JSONObject
 class IMSICatcher(private val store: Store) {
 
     private data class HistEntry(val cell: ServingCell, val ts: Long)
-    private data class Ephemeral(val cell: ServingCell, val registeredAt: Long, var gone: Boolean = false, var reported: Boolean = false)
+    private data class Ephemeral(
+        val cell: ServingCell,
+        val registeredAt: Long,
+        var gone: Boolean = false,
+        var reported: Boolean = false,
+        var reportedLoose: Boolean = false
+    )
 
     private val recent = ArrayDeque<HistEntry>()
     private val ephemeral = LinkedHashMap<String, Ephemeral>()
@@ -82,13 +88,24 @@ class IMSICatcher(private val store: Store) {
     private fun runChecks(cell: ServingCell, fix: Fix?, now: Long): List<CatcherFinding> {
         val findings = mutableListOf<CatcherFinding>()
         val data = store.json
-        val cells = data.optJSONObject("cells") ?: JSONObject()
         val tacs = data.optJSONObject("tacs") ?: JSONObject()
         val cellTacs = data.optJSONObject("cellTacs") ?: JSONObject()
 
         val tKey = tacKey(cell)
         val tacRec = tacs.optJSONObject(tKey)
         val tacMaturity = tacRec?.optInt("maturity", 0) ?: 0
+
+        // Several heuristics only mean anything while you are standing still: crossing
+        // cells, swapping radio technology and signal jumps are all what travelling
+        // normally looks like. Speed is authoritative when the fix reports it;
+        // otherwise fall back to how far the last two fixes are apart.
+        val speed = fix?.speed
+        val previousFix = prevFix
+        val stationary = when {
+            speed != null -> speed < MOVING_SPEED_MS
+            previousFix != null && fix != null -> haversine(previousFix, fix) < 200.0
+            else -> true
+        }
 
         // 1 — RAT downgrade
         val maxRatRank = tacRec?.optInt("maxRatRank", 0) ?: 0
@@ -100,9 +117,12 @@ class IMSICatcher(private val store: Store) {
             )
         }
 
-        // 2 — Cell ID / TAC mismatch
-        val knownTac = cellTacs.optString(ctKey(cell), null)
-        if (knownTac != null && knownTac != (cell.tac ?: "?")) {
+        // 2 — Cell ID / TAC mismatch.
+        // Only compare real tracking areas against real tracking areas. A modem that
+        // reported no TAC on the first sighting used to record "?" and then flag every
+        // later reading as a mismatch, permanently, on the strength of its own gap.
+        val knownTac = cellTacs.optString(ctKey(cell), null)?.takeIf { it != "?" }
+        if (knownTac != null && cell.tac != null && knownTac != cell.tac) {
             findings += CatcherFinding(
                 id = "cellid_tac_mismatch", severity = Severity.HIGH,
                 title = "Cell ID in wrong area",
@@ -148,23 +168,24 @@ class IMSICatcher(private val store: Store) {
             }
         }
 
-        // 6 — Ephemeral cell
+        // 6 — Ephemeral cell.
+        // The id carries the cell so two vanished towers stay two findings; the UI
+        // lists findings by id and duplicates used to take the Cell tab down.
         for ((key, e) in ephemeral) {
-            if (e.gone && key != cell.key) {
+            if (e.gone && !e.reportedLoose && key != cell.key) {
                 val lifetime = now - e.registeredAt
                 if (lifetime < 5 * 60_000L) {
                     findings += CatcherFinding(
-                        id = "ephemeral_cell", severity = Severity.MEDIUM,
+                        id = "ephemeral_cell:${e.cell.cellId}", severity = Severity.MEDIUM,
                         title = "Ephemeral tower",
                         detail = "Cell ${e.cell.cellId} (${e.cell.rat.label}) appeared as serving cell then vanished within ${lifetime / 1000}s. Portable equipment is driven in and away."
                     )
-                    e.gone = false
+                    e.reportedLoose = true
                 }
             }
         }
 
         // 7 — Cell flapping while stationary
-        val stationary = fix?.speed?.let { it < MOVING_SPEED_MS } ?: true
         if (stationary) {
             val uniqueRecent = recent.map { it.cell.key }.toSet().size
             if (uniqueRecent >= 4) {
@@ -176,8 +197,14 @@ class IMSICatcher(private val store: Store) {
             }
         }
 
-        // 8 — No neighbours
-        if (cell.neighbors != null && cell.neighbors == 0 && tacMaturity >= 5) {
+        // 8 — No neighbours.
+        // Plenty of modems never populate neighbouring cells at all, and on those the
+        // count is zero forever. Treating that as an indicator pinned a permanent
+        // finding on the device, so it only counts once this phone has proved it can
+        // report neighbours at least once.
+        if (cell.neighbors != null && cell.neighbors == 0 && tacMaturity >= 5 &&
+            data.optBoolean("neighborsEverSeen", false)
+        ) {
             findings += CatcherFinding(
                 id = "no_neighbors", severity = Severity.LOW,
                 title = "No visible neighbours",
@@ -185,11 +212,15 @@ class IMSICatcher(private val store: Store) {
             )
         }
 
-        // 9 — Timing advance zero on LTE (within ~78m of transmitter)
-        // A TA of 0 on LTE means the modem is ≤78m from the transmitter.
-        // Real macro cells are never this close; a catcher in a vehicle or building is.
+        // 9 — Timing advance zero on LTE (within ~78m of transmitter).
+        // A TA of 0 on LTE means the modem is ≤78m from the transmitter. Real macro
+        // cells are never this close; a catcher in a vehicle or building is. Same
+        // caveat as neighbours: a modem that always reports 0 is not reporting at all,
+        // so this waits until a real non-zero advance has been seen on this device.
         val ta = cell.timingAdvance
-        if (ta != null && ta == 0 && cell.rat.name == "LTE" && tacMaturity >= 5) {
+        if (ta != null && ta == 0 && cell.rat == com.trackdetect.Rat.LTE && tacMaturity >= 5 &&
+            data.optBoolean("taEverNonZero", false)
+        ) {
             findings += CatcherFinding(
                 id = "timing_advance_zero", severity = Severity.HIGH,
                 title = "Transmitter within 78m (LTE timing advance = 0)",
@@ -197,10 +228,12 @@ class IMSICatcher(private val store: Store) {
             )
         }
 
-        // 10 — Signal spike between consecutive readings
+        // 10 — Signal spike between consecutive readings, while stationary.
+        // Walking out of a building swings the signal by more than this, so a spike
+        // only says something when you have not moved.
         val prevDbm = prev?.signalDbm
         val curDbm = cell.signalDbm
-        if (prevDbm != null && curDbm != null && prev?.key == cell.key) {
+        if (stationary && prevDbm != null && curDbm != null && prev?.key == cell.key) {
             val spike = curDbm - prevDbm
             if (spike >= 20) {
                 findings += CatcherFinding(
@@ -211,13 +244,15 @@ class IMSICatcher(private val store: Store) {
             }
         }
 
-        // 11 — Rapid RAT oscillation (forced downgrade/upgrade cycle indicates IMSI paging)
+        // 11 — Rapid RAT oscillation (forced downgrade/upgrade cycle indicates IMSI paging).
+        // Only while stationary: a drive across town legitimately walks 5G → LTE → 3G
+        // and back, which is not evidence of anything.
         val recentRats = recent.takeLast(8).map { it.cell.rat }.distinct()
-        if (recentRats.size >= 3) {
+        if (stationary && recentRats.size >= 3) {
             findings += CatcherFinding(
                 id = "rat_oscillation", severity = Severity.HIGH,
                 title = "Rapid radio technology switching",
-                detail = "Device switched between ${recentRats.joinToString { it.label }} technologies in the last 2 min. IMSI catchers force devices through technology cycles to capture authentication events."
+                detail = "Device switched between ${recentRats.joinToString { it.label }} technologies in the last 2 min while stationary. IMSI catchers force devices through technology cycles to capture authentication events."
             )
         }
 
@@ -227,7 +262,7 @@ class IMSICatcher(private val store: Store) {
                 val lifetime = now - e.registeredAt
                 if (lifetime in 30_000L..90_000L) {
                     findings += CatcherFinding(
-                        id = "ephemeral_cell_strict", severity = Severity.HIGH,
+                        id = "ephemeral_cell_strict:${e.cell.cellId}", severity = Severity.HIGH,
                         title = "Very brief serving cell (${lifetime / 1000}s)",
                         detail = "Cell ${e.cell.cellId} (${e.cell.rat.label}) served as primary cell for only ${lifetime / 1000}s. Real base stations serve continuously for hours; portable catchers connect briefly then move on."
                     )
@@ -236,7 +271,9 @@ class IMSICatcher(private val store: Store) {
             }
         }
 
-        return findings
+        // The Cell tab keys its list on the finding id, so a duplicate id is a crash
+        // rather than a cosmetic problem. Guarantee uniqueness here.
+        return findings.distinctBy { it.id }
     }
 
     private fun updateBaseline(cell: ServingCell, now: Long) {
@@ -265,14 +302,24 @@ class IMSICatcher(private val store: Store) {
         for (i in 0 until knownCells.length()) if (knownCells.optString(i) == cell.cellId) { alreadyKnown = true; break }
         if (!alreadyKnown) knownCells.put(cell.cellId)
 
-        if (!cellTacs.has(ctKey)) cellTacs.put(ctKey, cell.tac ?: "?")
+        // Only remember a tracking area we actually read. Recording "?" for a modem
+        // that withheld it turns every later reading into a false mismatch.
+        if (cell.tac != null && !cellTacs.has(ctKey)) cellTacs.put(ctKey, cell.tac)
+
+        // Remember whether this handset reports neighbour counts and timing advance at
+        // all. The heuristics that key off "zero" are meaningless on a modem that
+        // never reports anything else, and have to stay quiet there.
+        if ((cell.neighbors ?: 0) > 0) data.put("neighborsEverSeen", true)
+        if ((cell.timingAdvance ?: 0) > 0) data.put("taEverNonZero", true)
 
         store.touch()
     }
 
     fun scoreAndLevel(findings: List<CatcherFinding>): Pair<Int, Threat> {
+        // Ephemeral findings carry the cell in their id to stay unique; score on the
+        // heuristic name in front of the colon.
         val score = findings.sumOf {
-            when (it.id) {
+            when (it.id.substringBefore(':')) {
                 "rat_downgrade" -> 35; "cellid_tac_mismatch" -> 30
                 "tac_change_stationary" -> 25; "signal_outlier" -> 22
                 "unknown_cell" -> 20; "ephemeral_cell" -> 20
@@ -287,6 +334,21 @@ class IMSICatcher(private val store: Store) {
             score >= 30 -> Threat.MEDIUM; score > 0 -> Threat.LOW; else -> Threat.NONE
         }
         return score to level
+    }
+
+    /** Wipes the learned baseline and the in-memory history behind it. */
+    @Synchronized
+    fun resetBaseline() {
+        recent.clear()
+        ephemeral.clear()
+        prev = null
+        prevFix = null
+        store.replace(
+            JSONObject()
+                .put("cells", JSONObject())
+                .put("tacs", JSONObject())
+                .put("cellTacs", JSONObject())
+        )
     }
 
     fun stats(): Triple<Int, Int, Float> {

@@ -12,9 +12,9 @@ tracker in your bumper and it equally describes a neighbour's Tile through a
 wall, so those apps mostly generate false alarms and get uninstalled.
 
 This one only reports **FOLLOWING** when the same device has been heard from two
-places at least **300 m apart**. Until then it says PERSISTENT and tells you
-which piece of evidence is missing — either you have not travelled far enough
-yet, or there is no position fix to judge by.
+places at least **300 m apart** (adjustable in Settings). Until then it says
+PERSISTENT and tells you which piece of evidence is missing — either you have
+not travelled far enough yet, or there is no position fix to judge by.
 
 ## Getting an APK without a build environment
 
@@ -49,9 +49,31 @@ binary out of the repository.
 | Precise location | Android requires it for BLE scanning, and this app genuinely uses the fix — it is what proves a device travelled with you |
 | Notifications | The one alert that matters, when something crosses into confirmed-following |
 | Foreground service | Scanning has to continue while the screen is off, or it never accumulates enough evidence |
+| Phone state | Reads your own modem's serving cell for the IMSI-catcher checks |
+| Wi-Fi state | Reads the system's existing scan results; the app never triggers a Wi-Fi scan of its own |
+| NFC | The passive HF tag sweep on the NFC tab |
+| Background location | Only so scanning survives a reboot, and only when you had it running |
+
+Declining notifications costs you the alert, not the detector — scanning still runs.
 
 Nothing leaves the phone. There is no network permission in the manifest at all,
 which you can verify yourself.
+
+## Screen on versus screen off
+
+Android suspends an *unfiltered* BLE scan once the screen goes off, and any filter
+list is also a whitelist — so a scan built to survive a pocket can only ever find
+devices someone already catalogued. That is the wrong trade for the case this app
+exists for, which is the unbranded box wired into a wheel well.
+
+So it runs both. Screen on, the scan is unfiltered and anything advertising at all
+can be discovered, including hardware with no known signature. Screen off, it falls
+back to filters covering the known tracker manufacturers and service UUIDs, which is
+what keeps it running at all. A device first seen while the screen was on stays
+tracked either way.
+
+The practical consequence: leave the screen on for a minute or two when you first
+start a sweep, so unknown hardware gets a chance to be discovered.
 
 ## What it detects
 

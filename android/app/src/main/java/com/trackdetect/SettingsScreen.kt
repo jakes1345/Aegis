@@ -34,17 +34,28 @@ object AppSettings {
     private const val KEY_AGGRESSIVE_SCAN = "aggressive_scan"
     private const val KEY_FOLLOW_THRESHOLD = "follow_threshold_m"
     private const val KEY_PERSISTENCE_THRESHOLD = "persistence_threshold_min"
+    private const val KEY_SCAN_ENABLED = "scan_enabled"
 
     const val DEFAULT_FOLLOW_THRESHOLD_M = 300f
     const val DEFAULT_PERSISTENCE_THRESHOLD_MIN = 10f
 
-    private var _aggressiveScan = false
-    private var _followThresholdM = DEFAULT_FOLLOW_THRESHOLD_M
-    private var _persistenceThresholdMin = DEFAULT_PERSISTENCE_THRESHOLD_MIN
+    @Volatile private var _aggressiveScan = false
+    @Volatile private var _followThresholdM = DEFAULT_FOLLOW_THRESHOLD_M
+    @Volatile private var _persistenceThresholdMin = DEFAULT_PERSISTENCE_THRESHOLD_MIN
+    @Volatile private var _scanEnabled = false
 
     val aggressiveScan: Boolean get() = _aggressiveScan
     val followThresholdM: Float get() = _followThresholdM
     val persistenceThresholdMin: Float get() = _persistenceThresholdMin
+
+    /** The persistence threshold in the units [com.trackdetect.analysis.Tracker] works in. */
+    val persistenceThresholdMs: Long get() = (_persistenceThresholdMin * 60_000f).toLong()
+
+    /**
+     * Whether the user last left scanning switched on. Read at boot so the detector
+     * comes back only for someone who actually had it running.
+     */
+    val scanEnabled: Boolean get() = _scanEnabled
 
     /** BLE scan mode that ScanService should use. */
     val scanMode: Int
@@ -56,6 +67,13 @@ object AppSettings {
         _aggressiveScan = p.getBoolean(KEY_AGGRESSIVE_SCAN, false)
         _followThresholdM = p.getFloat(KEY_FOLLOW_THRESHOLD, DEFAULT_FOLLOW_THRESHOLD_M)
         _persistenceThresholdMin = p.getFloat(KEY_PERSISTENCE_THRESHOLD, DEFAULT_PERSISTENCE_THRESHOLD_MIN)
+        _scanEnabled = p.getBoolean(KEY_SCAN_ENABLED, false)
+    }
+
+    fun setScanEnabled(context: Context, value: Boolean) {
+        _scanEnabled = value
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_SCAN_ENABLED, value).apply()
     }
 
     fun setAggressiveScan(context: Context, value: Boolean) {
@@ -92,7 +110,7 @@ private val SCardShape   = RoundedCornerShape(4.dp)
 // ── SettingsScreen composable ──────────────────────────────────────────────────
 
 @Composable
-fun SettingsScreen(onBack: () -> Unit) {
+fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
     val context = LocalContext.current
     val trusted by Registry.trusted.collectAsStateWithLifecycle()
     val status by Registry.status.collectAsStateWithLifecycle()
@@ -122,10 +140,11 @@ fun SettingsScreen(onBack: () -> Unit) {
             },
             confirmButton = {
                 TextButton(onClick = {
-                    Registry.reset()
-                    Registry.clearNfc()
-                    context.deleteFile("imsi_baseline.json")
-                    context.deleteFile("timeline.json")
+                    // The scanner owns the baseline and the event log in memory, so it
+                    // has to do the clearing. Deleting the files from here only worked
+                    // while the service was stopped — otherwise the next flush wrote
+                    // everything straight back.
+                    onClearData()
                     showClearDialog = false
                 }) {
                     Text("CLEAR", color = SCriticalClr, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
@@ -143,6 +162,11 @@ fun SettingsScreen(onBack: () -> Unit) {
         Modifier
             .fillMaxSize()
             .background(SGroundClr)
+            // This screen replaces the whole tab tree, so it does not inherit the
+            // insets applied around the tabs and has to keep clear of the system
+            // bars itself — otherwise the BACK row sits under the status bar.
+            .statusBarsPadding()
+            .navigationBarsPadding()
             .padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
@@ -395,8 +419,11 @@ fun SettingsScreen(onBack: () -> Unit) {
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 SSettingsKv("App", "Track Detect")
-                SSettingsKv("Version", "1.2 (build 3)")
-                SSettingsKv("Package", "com.trackdetect")
+                SSettingsKv(
+                    "Version",
+                    "${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})"
+                )
+                SSettingsKv("Package", BuildConfig.APPLICATION_ID)
 
                 Box(Modifier.fillMaxWidth().height(1.dp).background(SRuleClr))
 
