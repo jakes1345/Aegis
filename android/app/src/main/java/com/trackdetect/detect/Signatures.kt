@@ -186,16 +186,27 @@ object Signatures {
         return null
     }
 
-    /** Free-space path loss estimate. Rough, and honest about being rough. */
+    /**
+     * Free-space path loss estimate. Rough, and honest about being rough.
+     *
+     * The curve wants the RSSI you would measure at one metre, not the radio's
+     * transmit power — and `ScanRecord.getTxPowerLevel()` is the latter, frequently a
+     * positive number. Feeding it in raw made the ratio negative, and a negative ratio
+     * to the tenth power produced readings like "~540000 km away". Converting through
+     * the ~41 dB of path loss over the first metre at 2.4 GHz gives the reference the
+     * formula is actually expecting.
+     */
     fun approximateMetres(rssi: Int, txPower: Int?): Double? {
-        if (rssi == 0) return null
-        val reference = txPower ?: -59
+        if (rssi >= 0) return null
+        val reference = (txPower?.minus(41) ?: -59).coerceIn(-100, -30)
         val ratio = rssi.toDouble() / reference.toDouble()
+        if (ratio <= 0.0) return null
         val metres = if (ratio < 1.0) {
             Math.pow(ratio, 10.0)
         } else {
             0.89976 * Math.pow(ratio, 7.7095) + 0.111
         }
-        return if (metres.isFinite() && metres > 0) metres else null
+        // Beyond this the estimate is meaningless anyway, and BLE does not reach.
+        return if (metres.isFinite() && metres > 0 && metres < 1000) metres else null
     }
 }
