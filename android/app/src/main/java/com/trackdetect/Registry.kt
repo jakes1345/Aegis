@@ -1,5 +1,6 @@
 package com.trackdetect
 
+import android.content.Context
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -47,10 +48,50 @@ object Registry {
     val wifi: StateFlow<List<WifiAnomaly>> = _wifi.asStateFlow()
     fun publishWifi(anomalies: List<WifiAnomaly>) { _wifi.value = anomalies }
 
+    // --- Trusted devices -----------------------------------------------------
+    //
+    // Keyed on the Bluetooth address, which is what the scanner has in hand when it
+    // decides whether to skip a device. It used to be keyed on the identity id
+    // instead — a counter handed out fresh on every service start — so marking
+    // something safe silenced nothing, and after a restart the saved id belonged to
+    // whatever device happened to be seen seventh.
+    //
+    // Addresses on a rotating device are not stable by design, but the devices worth
+    // trusting are the user's own headphones, watch and car, and those keep one.
+
+    private const val TRUSTED_KEY = "trusted_addresses"
+
     private val _trusted = MutableStateFlow<Set<String>>(emptySet())
     val trusted: StateFlow<Set<String>> = _trusted.asStateFlow()
-    fun trust(key: String) { _trusted.value = _trusted.value + key }
-    fun untrust(key: String) { _trusted.value = _trusted.value - key }
+
+    /** Application context, held so trust survives the process being killed. */
+    @Volatile
+    private var appContext: Context? = null
+
+    /** Call once per process, from both the activity and the service. */
+    fun bindTrustStore(context: Context) {
+        val app = context.applicationContext
+        appContext = app
+        _trusted.value = app
+            .getSharedPreferences(AppSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            .getStringSet(TRUSTED_KEY, emptySet())
+            ?.toSet() ?: emptySet()
+    }
+
+    fun trust(address: String) = setTrusted(_trusted.value + address)
+
+    fun untrust(address: String) = setTrusted(_trusted.value - address)
+
+    private fun setTrusted(next: Set<String>) {
+        _trusted.value = next
+        appContext
+            ?.getSharedPreferences(AppSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            ?.edit()
+            // A defensive copy: SharedPreferences must not be handed a set that is
+            // later mutated, and callers keep a reference to the flow's value.
+            ?.putStringSet(TRUSTED_KEY, HashSet(next))
+            ?.apply()
+    }
 
     fun reset() {
         _detections.value = emptyList()
