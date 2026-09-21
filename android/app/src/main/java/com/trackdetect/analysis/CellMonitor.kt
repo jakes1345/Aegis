@@ -15,6 +15,10 @@ import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
 import com.trackdetect.Rat
 import com.trackdetect.ServingCell
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.Executors
+import kotlin.coroutines.resume
 
 /**
  * Reads the serving cell your baseband is actually camped on, natively.
@@ -39,24 +43,54 @@ class CellMonitor(private val context: Context) {
         return null
     }
 
-    /** The serving cell right now, or null if it cannot be read. */
-    fun sample(): ServingCell? {
+    /**
+     * The serving cell right now, or null if it cannot be read.
+     *
+     * Since Android 10 `getAllCellInfo()` hands back whatever the platform last
+     * cached, which on an idle handset can be minutes old or empty — the Cell tab
+     * would sit on a stale tower and none of the timing-based heuristics would ever
+     * see a change. So this asks the modem for a fresh reading and only falls back to
+     * the cache when the request times out or the modem refuses.
+     */
+    suspend fun sample(): ServingCell? {
         val manager = tm ?: return null
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
             != PackageManager.PERMISSION_GRANTED
         ) return null
 
-        val all = try {
-            manager.allCellInfo
-        } catch (_: SecurityException) {
-            return null
-        } ?: return null
+        val fresh = withTimeoutOrNull(REQUEST_TIMEOUT_MS) { requestFresh(manager) }
+        val all = fresh?.takeIf { it.isNotEmpty() }
+            ?: try { manager.allCellInfo } catch (_: SecurityException) { null }
+            ?: return null
         if (all.isEmpty()) return null
 
         val registered = all.firstOrNull { it.isRegistered } ?: return null
         val neighbors = all.count { !it.isRegistered }
         return build(registered, neighbors)
     }
+
+    private suspend fun requestFresh(manager: TelephonyManager): List<CellInfo>? =
+        suspendCancellableCoroutine { cont ->
+            try {
+                manager.requestCellInfoUpdate(
+                    executor,
+                    object : TelephonyManager.CellInfoCallback() {
+                        override fun onCellInfo(cellInfo: MutableList<CellInfo>) {
+                            if (cont.isActive) cont.resume(cellInfo)
+                        }
+
+                        override fun onError(errorCode: Int, detail: Throwable?) {
+                            if (cont.isActive) cont.resume(null)
+                        }
+                    }
+                )
+            } catch (_: SecurityException) {
+                if (cont.isActive) cont.resume(null)
+            } catch (_: IllegalStateException) {
+                // Thrown when the modem is busy or the request is rate limited.
+                if (cont.isActive) cont.resume(null)
+            }
+        }
 
     /**
      * Timing advance is reported as [CellInfo.UNAVAILABLE] (Int.MAX_VALUE) by
@@ -108,6 +142,19 @@ class CellMonitor(private val context: Context) {
                 )
             }
             else -> buildNr(info, neighbors, now)
+        }
+    }
+
+    companion object {
+        private const val REQUEST_TIMEOUT_MS = 5_000L
+
+        /**
+         * The platform delivers cell info on this executor. One shared single thread
+         * is enough for a poll every fifteen seconds and keeps the callback off the
+         * service's main thread.
+         */
+        private val executor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "cell-info").apply { isDaemon = true }
         }
     }
 
