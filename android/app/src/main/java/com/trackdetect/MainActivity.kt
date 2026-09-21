@@ -23,7 +23,9 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.core.view.WindowCompat
@@ -70,7 +72,7 @@ import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-// ── Colour tokens ─────────────────────────────────────────────────────────────
+// ── Colour tokens ───────────────────────────────────────────────────────
 
 private val Ground     = Color(0xFF0E1116)
 private val Panel      = Color(0xFF161B23)
@@ -88,6 +90,7 @@ private val Blue       = Color(0xFF4A8FD4)
 
 private val CardShape = RoundedCornerShape(4.dp)
 
+/** Everything the app asks for up front. */
 private val REQUIRED = arrayOf(
     Manifest.permission.BLUETOOTH_SCAN,
     Manifest.permission.BLUETOOTH_CONNECT,
@@ -95,7 +98,19 @@ private val REQUIRED = arrayOf(
     Manifest.permission.POST_NOTIFICATIONS
 )
 
-// ── Activity ──────────────────────────────────────────────────────────────────
+/**
+ * The subset without which scanning cannot run at all: the scan itself, and the
+ * location permission that a location-typed foreground service is refused without.
+ *
+ * Notifications are separate on purpose. Requiring them meant declining the
+ * notification prompt silently blocked the whole detector.
+ */
+private val ESSENTIAL = arrayOf(
+    Manifest.permission.BLUETOOTH_SCAN,
+    Manifest.permission.ACCESS_FINE_LOCATION
+)
+
+// ── Activity ───────────────────────────────────────────────────────────
 
 class MainActivity : ComponentActivity() {
 
@@ -105,30 +120,66 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         AppSettings.load(this)
+        Registry.bindTrustStore(this)
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
         val onboardingAlreadyDone = isOnboardingDone(this)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(background = Ground, surface = Panel)) {
                 Surface(color = Ground, modifier = Modifier.fillMaxSize()) {
                     var onboardingDone by remember { mutableStateOf(onboardingAlreadyDone) }
+
+                    val onboardingPermissions = rememberLauncherForActivityResult(
+                        ActivityResultContracts.RequestMultiplePermissions()
+                    ) { grants ->
+                        if (ESSENTIAL.all { grants[it] == true }) startScanning()
+                    }
+
                     if (!onboardingDone) {
                         OnboardingScreen(
-                            startScanService = { startService(Intent(this, ScanService::class.java)) },
+                            // Onboarding used to start the service straight off the
+                            // last page without ever asking for a permission, so the
+                            // service failed startForeground for want of location
+                            // access and stopped itself. Tapping "Start" appeared to
+                            // do nothing at all on a fresh install.
+                            startScanService = {
+                                val missing = REQUIRED.filterNot { granted(it) }
+                                if (missing.isEmpty()) startScanning()
+                                else onboardingPermissions.launch(missing.toTypedArray())
+                            },
                             onComplete = { onboardingDone = true }
                         )
                     } else {
                         MainApp(
-                            onStart = { startService(Intent(this, ScanService::class.java)) },
-                            onStop = {
-                                startService(Intent(this, ScanService::class.java)
-                                    .apply { action = ScanService.ACTION_STOP })
-                            },
-                            hasPermissions = { REQUIRED.all { granted(it) } }
+                            onStart = { startScanning() },
+                            onStop = { sendToService(ScanService.ACTION_STOP) },
+                            onClearData = { sendToService(ScanService.ACTION_CLEAR) },
+                            hasPermissions = { ESSENTIAL.all { granted(it) } }
                         )
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Starts the scanner as a foreground service. Plain startService() is refused
+     * whenever the app is not already foreground, which made restarting from a
+     * notification or a cold intent unreliable.
+     */
+    private fun startScanning() {
+        ContextCompat.startForegroundService(this, Intent(this, ScanService::class.java))
+    }
+
+    /**
+     * Control messages (stop, clear) use plain startService: the activity is by
+     * definition in the foreground when the user taps those, and startForegroundService
+     * would oblige the service to promote itself even when it is only being asked to
+     * clear data and shut down again.
+     */
+    private fun sendToService(serviceAction: String) {
+        val intent = Intent(this, ScanService::class.java)
+        intent.action = serviceAction
+        startService(intent)
     }
 
     override fun onResume() {
@@ -148,7 +199,7 @@ class MainActivity : ComponentActivity() {
         ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED
 }
 
-// ── Formatting helpers ────────────────────────────────────────────────────────
+// ── Formatting helpers ──────────────────────────────────────────────────
 
 private val fullFmt    = SimpleDateFormat("MMM d HH:mm:ss", Locale.US)
 private val clockFmt   = SimpleDateFormat("HH:mm:ss", Locale.US)
@@ -214,7 +265,7 @@ private fun dayLabel(ts: Long, now: Long): String {
     return fmt.format(Date(ts)).uppercase(Locale.US)
 }
 
-// ── Threat colouring ──────────────────────────────────────────────────────────
+// ── Threat colouring ─────────────────────────────────────────────────────
 
 private fun threatColor(t: Threat): Color = when (t) {
     Threat.CRITICAL -> Critical
@@ -244,7 +295,7 @@ private fun trailColor(t: Threat, following: Boolean): Color = when {
     else -> Blue
 }
 
-// ── Shared building blocks ────────────────────────────────────────────────────
+// ── Shared building blocks ────────────────────────────────────────────────
 
 /** Wall-clock that ticks every [periodMs] so relative times stay honest. */
 @Composable
@@ -333,18 +384,23 @@ private fun PanelBox(modifier: Modifier = Modifier, content: @Composable ColumnS
     )
 }
 
-// ── Threat explainer target ────────────────────────────────────────────────────
+// ── Threat explainer target ─────────────────────────────────────────────────
 
 private sealed class ExplainerTarget {
     data class BleDevice(val detection: Detection) : ExplainerTarget()
     data class CellIndicator(val finding: CatcherFinding) : ExplainerTarget()
 }
 
-// ── Root composable ───────────────────────────────────────────────────────────
+// ── Root composable ───────────────────────────────────────────────────────
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun MainApp(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: () -> Boolean) {
+private fun MainApp(
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+    onClearData: () -> Unit,
+    hasPermissions: () -> Boolean
+) {
     var tab by remember { mutableIntStateOf(0) }
     val tabs = listOf("SCAN", "MAP", "LOG", "CELL", "NFC", "WIFI")
 
@@ -360,12 +416,12 @@ private fun MainApp(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: () 
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     if (showSettings) {
-        SettingsScreen(onBack = { showSettings = false })
+        SettingsScreen(onBack = { showSettings = false }, onClearData = onClearData)
         return
     }
 
     // One red dot per tab that currently holds something worth looking at.
-    val followingLive = detections.any { it.following && it.key !in trusted }
+    val followingLive = detections.any { it.following && it.address !in trusted }
     val alerts = listOf(
         followingLive,
         followingLive && detections.any { it.following && it.points.isNotEmpty() },
@@ -443,7 +499,7 @@ private fun MainApp(onStart: () -> Unit, onStop: () -> Unit, hasPermissions: () 
     }
 }
 
-// ── Tab icons ─────────────────────────────────────────────────────────────────
+// ── Tab icons ──────────────────────────────────────────────────────────
 
 @Composable
 private fun TabIcon(index: Int, selected: Boolean) {
@@ -524,7 +580,7 @@ private fun TabIcon(index: Int, selected: Boolean) {
     }
 }
 
-// ── Scan (BLE) screen ─────────────────────────────────────────────────────────
+// ── Scan (BLE) screen ────────────────────────────────────────────────────
 
 @Composable
 private fun ScanScreen(
@@ -544,12 +600,14 @@ private fun ScanScreen(
     val now = rememberNow()
 
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
-        if (REQUIRED.all { grants[it] == true }) onStart()
+        // Start as soon as the scan can actually run. Notifications being declined
+        // costs the alert, not the detector.
+        if (ESSENTIAL.all { grants[it] == true }) onStart()
     }
 
     // Devices the user has vouched for drop out of the threat picture and sink to the bottom.
-    val live = remember(detections, trusted) { detections.filter { it.key !in trusted } }
-    val ordered = remember(detections, trusted) { detections.sortedBy { it.key in trusted } }
+    val live = remember(detections, trusted) { detections.filter { it.address !in trusted } }
+    val ordered = remember(detections, trusted) { detections.sortedBy { it.address in trusted } }
 
     LazyColumn(
         Modifier.fillMaxSize().padding(horizontal = 16.dp),
@@ -617,7 +675,7 @@ private fun ScanScreen(
             items(ordered, key = { it.key }) { d ->
                 DetectionRow(
                     d = d,
-                    trusted = d.key in trusted,
+                    trusted = d.address in trusted,
                     now = now,
                     onShowExplainer = if (d.threat == Threat.CRITICAL || d.threat == Threat.HIGH)
                         { { onShowExplainer(d) } } else null
@@ -684,7 +742,7 @@ private fun ThreatMeter(live: List<Detection>, cell: CellStatus) {
 
 @Composable
 private fun ScanStatusPanel(status: ScanStatus, detections: List<Detection>, trusted: Set<String>) {
-    val live = detections.filter { it.key !in trusted }
+    val live = detections.filter { it.address !in trusted }
     val following = live.count { it.following }
     val (verdict, verdictColor) = when {
         following > 0 -> "$following CONFIRMED FOLLOWING" to Critical
@@ -899,7 +957,7 @@ private fun DetectionDetail(d: Detection, trusted: Boolean, onShowExplainer: (()
         ) {
             if (trusted) {
                 TextButton(
-                    onClick = { Registry.untrust(d.key) },
+                    onClick = { Registry.untrust(d.address) },
                     shape = RoundedCornerShape(3.dp),
                     border = BorderStroke(1.dp, Rule)
                 ) { Text("TRUSTED ✓", color = Muted, fontSize = 11.sp, letterSpacing = 1.sp) }
@@ -907,7 +965,7 @@ private fun DetectionDetail(d: Detection, trusted: Boolean, onShowExplainer: (()
                     modifier = Modifier.weight(1f))
             } else {
                 TextButton(
-                    onClick = { Registry.trust(d.key) },
+                    onClick = { Registry.trust(d.address) },
                     shape = RoundedCornerShape(3.dp),
                     border = BorderStroke(1.dp, Clear.copy(alpha = 0.6f))
                 ) { Text("MARK SAFE", color = Clear, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
@@ -934,7 +992,7 @@ private fun DetectionDetail(d: Detection, trusted: Boolean, onShowExplainer: (()
     }
 }
 
-// ── Map screen ────────────────────────────────────────────────────────────────
+// ── Map screen ─────────────────────────────────────────────────────────
 
 private data class MapProj(val cLat: Double, val cLon: Double, val pxPerM: Float)
 
@@ -1175,7 +1233,7 @@ private fun LegendItem(color: Color, label: String, mark: Mark) {
     }
 }
 
-// ── Timeline screen ───────────────────────────────────────────────────────────
+// ── Timeline screen ──────────────────────────────────────────────────────
 
 @Composable
 private fun TimelineScreen() {
@@ -1325,7 +1383,7 @@ private fun EventLocationSnapshot(lat: Double, lon: Double, status: ScanStatus) 
     }
 }
 
-// ── Cell / IMSI screen ────────────────────────────────────────────────────────
+// ── Cell / IMSI screen ───────────────────────────────────────────────────
 
 @Composable
 private fun CellScreen(onShowExplainer: ((CatcherFinding) -> Unit)? = null) {
@@ -1513,7 +1571,7 @@ private fun FindingRow(f: CatcherFinding, onShowExplainer: (() -> Unit)? = null)
     }
 }
 
-// ── NFC screen ────────────────────────────────────────────────────────────────
+// ── NFC screen ─────────────────────────────────────────────────────────
 
 @Composable
 private fun NfcScreen() {
@@ -1617,14 +1675,13 @@ private fun NfcTagRow(t: NfcTag) {
     }
 }
 
-// ── WiFi screen ───────────────────────────────────────────────────────────────
+// ── WiFi screen ────────────────────────────────────────────────────────
 
 private fun wifiReason(reason: String): String = when (reason) {
-    "known_catcher_ssid" -> "Known IMSI-catcher bait SSID"
-    "signal_anomaly" -> "Abnormally strong signal — device may be nearby"
-    "carrier_open_network" -> "Carrier name on open network — possible fake AP"
-    "duplicate_bssid" -> "Same SSID on multiple channels — may be spoofed"
-    "duplicate_ssid" -> "Same SSID broadcast by multiple access points — may be spoofed"
+    "known_catcher_ssid" -> "Default SSID of known interception equipment"
+    "carrier_open_network" -> "Carrier name on an unencrypted network — likely bait"
+    "open_twin_of_secured" -> "Open copy of a network that is encrypted nearby — evil twin"
+    "duplicate_ssid" -> "Three or more access points sharing one SSID on one channel"
     "open_unsecured" -> "Open, unsecured network — traffic can be intercepted"
     else -> reason.replace('_', ' ').replaceFirstChar { it.uppercase(Locale.US) }
 }
@@ -1692,7 +1749,7 @@ private fun WifiRow(a: WifiAnomaly) {
     }
 }
 
-// ── Threat explainer bottom sheet ─────────────────────────────────────────────
+// ── Threat explainer bottom sheet ───────────────────────────────────────────
 
 private data class ExplainerContent(
     val headline: String,
@@ -1769,7 +1826,9 @@ private fun cellExplainerContent(f: CatcherFinding): ExplainerContent {
         Severity.MEDIUM -> Color(0xFFE8B33D)
         Severity.LOW -> Color(0xFF6F7A8B)
     }
-    val (what, todo, certain) = when (f.id) {
+    // Findings that can fire for more than one cell carry it after a colon, so the
+    // explainer keys off the heuristic name in front of it.
+    val (what, todo, certain) = when (f.id.substringBefore(':')) {
         "rat_downgrade" -> Triple(
             "Your device has been forced from a newer radio technology (4G/5G) down to an older one (2G/3G). " +
             "IMSI catchers do this deliberately because older protocols have weaker encryption and are easier " +
@@ -1903,6 +1962,10 @@ private fun ThreatExplainerSheet(target: ExplainerTarget, onDismiss: () -> Unit)
     Column(
         Modifier
             .fillMaxWidth()
+            // These explainers run to several paragraphs. Without a scroll the tail of
+            // the text and the CLOSE button fall off the bottom of the sheet on a
+            // normal-height phone, leaving no way to read or dismiss them.
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp)
             .padding(top = 8.dp, bottom = 32.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
