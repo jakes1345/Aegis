@@ -8,6 +8,9 @@ import com.trackdetect.TrackerType
 const val PERSIST_THRESHOLD_MS = 10 * 60 * 1000L
 const val PERSIST_MIN_SIGHTINGS = 5
 
+/** Ceiling on simultaneously tracked devices — see [Tracker.prune]. */
+private const val MAX_ENTRIES = 4000
+
 /**
  * Tracks how long a device stays with you and — where there is a position fix —
  * whether it actually travelled with you.
@@ -17,7 +20,15 @@ const val PERSIST_MIN_SIGHTINGS = 5
  * neighbour's Tile through a wall. Only displacement separates them, so with no
  * position source the stronger claim is simply never made.
  */
-class Tracker {
+class Tracker(
+    /**
+     * Read through lambdas rather than captured once, so moving a slider in Settings
+     * takes effect on the next observation instead of at the next app start. The
+     * defaults keep the class usable on its own.
+     */
+    private val persistMs: () -> Long = { PERSIST_THRESHOLD_MS },
+    private val followM: () -> Double = { FOLLOW_DISPLACEMENT_M }
+) {
 
     private class Entry(val key: String) {
         var address = ""
@@ -76,9 +87,9 @@ class Tracker {
 
         val duration = now - entry.firstSeen
         entry.persistent =
-            duration >= PERSIST_THRESHOLD_MS && entry.sightings >= PERSIST_MIN_SIGHTINGS
+            duration >= persistMs() && entry.sightings >= PERSIST_MIN_SIGHTINGS
 
-        val movedWithUs = entry.area.movedWithUs()
+        val movedWithUs = entry.area.movedWithUs(followM())
         entry.following = entry.persistent && movedWithUs
 
         val confidence = when {
@@ -181,5 +192,21 @@ class Tracker {
     fun prune(now: Long, maxAgeMs: Long = 30 * 60 * 1000L) {
         val cutoff = now - maxAgeMs
         entries.entries.removeAll { it.value.lastSeen < cutoff && !it.value.following }
+
+        // Somewhere crowded can produce thousands of one-sighting devices inside the
+        // retention window. Drop the least recently heard, but never anything that has
+        // proved it travels with you or is holding a persistence pattern — those are
+        // the entire point of keeping any of this.
+        if (entries.size > MAX_ENTRIES) {
+            entries.values
+                .filterNot { it.following || it.persistent }
+                .sortedBy { it.lastSeen }
+                .take(entries.size - MAX_ENTRIES)
+                .forEach { entries.remove(it.key) }
+        }
     }
+
+    /** Forgets every device. Used by "clear all data". */
+    @Synchronized
+    fun clear() = entries.clear()
 }
