@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.0.0)'
+        description: 'Release tag (e.g. v1.3.0)'
         required: true
-        default: 'v1.0.0'
+        default: 'v1.3.0'
 
 permissions:
   contents: write
@@ -25,9 +25,9 @@ jobs:
         id: tag
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "name=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           else
-            echo "name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up JDK 17
@@ -45,52 +45,106 @@ jobs:
         working-directory: android
         run: gradle assembleRelease --no-daemon
 
-      - name: Generate debug keystore for signing
+      # Android refuses to install an update whose signing certificate differs from
+      # the one already on the device. This step used to run `keytool -genkey` on
+      # every release, which mints a brand new keypair each time — so every release
+      # was signed by a different certificate and could only be installed by
+      # uninstalling the previous build first, taking the cell baseline, the event
+      # log and the trusted-device list with it.
+      #
+      # With the ANDROID_KEYSTORE_BASE64 secret set, every release is signed by the
+      # same key and installs straight over the last one. Without it we fall back to
+      # the old throwaway key so the build still produces something installable, and
+      # the release notes say plainly that it needs a clean install.
+      - name: Prepare signing key
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          mkdir -p ~/.android
-          keytool -genkey -v \
-            -keystore ~/.android/debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+          mkdir -p "$RUNNER_TEMP/signing"
+          KS="$RUNNER_TEMP/signing/release.keystore"
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$KS"
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+            echo "Signing with the persistent release key."
+          else
+            keytool -genkeypair -v \
+              -keystore "$KS" \
+              -storepass android \
+              -keypass android \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set, so this APK is signed with a throwaway key and cannot be installed over an earlier release."
+          fi
 
-      - name: Sign APK (debug key for sideloading)
+      - name: Sign APK
+        env:
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'android' }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD || 'android' }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'androiddebugkey' }}
+          TAG: ${{ steps.tag.outputs.name }}
         run: |
-          BUILD_TOOLS=$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)
-          $ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner sign \
-            --ks ~/.android/debug.keystore \
-            --ks-pass pass:android \
-            --key-pass pass:android \
-            --out android/app/build/outputs/apk/release/track-detect-${{ steps.tag.outputs.name }}.apk \
+          BUILD_TOOLS=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner"
+          OUT="android/app/build/outputs/apk/release/track-detect-${TAG}.apk"
+          "$APKSIGNER" sign \
+            --ks "$RUNNER_TEMP/signing/release.keystore" \
+            --ks-pass env:KS_PASS \
+            --key-pass env:KEY_PASS \
+            --ks-key-alias "$KEY_ALIAS" \
+            --out "$OUT" \
             android/app/build/outputs/apk/release/app-release-unsigned.apk
+          # The certificate digest is what decides whether a phone will accept this
+          # as an update to the installed build, so print it: two releases that
+          # share this value will install over each other, and two that do not
+          # never will, whatever their version numbers say.
+          "$APKSIGNER" verify --print-certs "$OUT"
+
+      - name: Compose release notes
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+          STABLE: ${{ steps.signing.outputs.stable }}
+        run: |
+          {
+            echo "## Track Detect ${TAG}"
+            echo
+            echo "Android tracker detector: BLE tags, Wi-Fi bait networks, IMSI-catcher"
+            echo "anomalies against a baseline it learns locally, and a passive NFC sweep."
+            echo "There is no network permission in the manifest — nothing leaves the phone."
+            echo
+            echo "**Install**"
+            echo
+            if [ "$STABLE" = "true" ]; then
+              echo "1. Download \`track-detect-${TAG}.apk\` below and tap it."
+              echo "2. It installs straight over an earlier release and keeps your baseline, event log and trusted devices."
+              echo "3. First install only: Settings → Apps → Special app access → Install unknown apps → allow your file manager."
+              echo "4. Grant Nearby devices and Location (precise). Notifications is optional — declining it costs the alert, not the detector."
+            else
+              echo "> [!WARNING]"
+              echo "> This build is signed with a throwaway key, so Android will refuse to install it"
+              echo "> over an earlier release. You have to uninstall the old version first, which"
+              echo "> clears the cell baseline, the event log and the trusted-device list."
+              echo
+              echo "1. Uninstall any existing Track Detect."
+              echo "2. Download \`track-detect-${TAG}.apk\` below and tap it."
+              echo "3. Settings → Apps → Special app access → Install unknown apps → allow your file manager."
+              echo "4. Grant Nearby devices and Location (precise). Notifications is optional — declining it costs the alert, not the detector."
+            fi
+            echo
+            echo "**Requirements:** Android 12+ (API 31)"
+          } > "$RUNNER_TEMP/notes.md"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           name: Track Detect ${{ steps.tag.outputs.name }}
-          body: |
-            ## Track Detect ${{ steps.tag.outputs.name }}
-
-            Multi-source tracker detection tool for Android.
-
-            **Detects:**
-            - BLE trackers: AirTag, Tile, Samsung SmartTag, Chipolo, Pebblebee, and unknowns
-            - GPS/LTE tracker hotspots (OBD port devices, hidden boxes)
-            - RF periodic transmitters via SDR (laptop companion tool)
-            - IMSI catcher anomalies (cellular scanner)
-
-            **Install:**
-            1. Download `track-detect-${{ steps.tag.outputs.name }}.apk` below
-            2. On your phone: Settings → Apps → Special app access → Install unknown apps → allow your file manager
-            3. Tap the APK to install — approve the Play Protect warning
-            4. Grant Bluetooth, Location (precise), and Notifications permissions on first launch
-
-            **Requirements:** Android 12+ (API 31)
+          body_path: ${{ runner.temp }}/notes.md
+          generate_release_notes: true
           files: android/app/build/outputs/apk/release/track-detect-${{ steps.tag.outputs.name }}.apk
           draft: false
           prerelease: false
