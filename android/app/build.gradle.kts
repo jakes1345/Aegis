@@ -15,8 +15,8 @@ android {
         // for devices nobody is going to test this on.
         minSdk = 31
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
     }
 
     buildTypes {
@@ -40,6 +40,9 @@ android {
 
     buildFeatures {
         compose = true
+        // So the About section can report the real version instead of a hand-typed
+        // string that drifts out of date the first time the version changes.
+        buildConfig = true
     }
 }
 
