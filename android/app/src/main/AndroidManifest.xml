@@ -14,8 +14,7 @@
     <!-- Cellular identity — needed to read serving cell info -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
 
-    <!-- Wi-Fi anomaly scan reads the system's cached scan results only; it never
-         triggers a scan, so CHANGE_WIFI_STATE is deliberately not requested. -->
+    <!-- Wi-Fi anomaly scan reads the system's cached scan results only -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
     <!-- NFC / HF RFID passive tag sweep -->
@@ -23,6 +22,10 @@
 
     <!-- Restart scanning after reboot -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Map tile downloads — anonymous; no user data leaves the device -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
     <uses-feature android:name="android.hardware.nfc" android:required="false" />
@@ -44,7 +47,6 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- NFC tag dispatch — all tech types so nothing is missed -->
             <intent-filter>
                 <action android:name="android.nfc.action.NDEF_DISCOVERED" />
                 <category android:name="android.intent.category.DEFAULT" />

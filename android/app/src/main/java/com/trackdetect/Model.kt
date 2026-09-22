@@ -167,3 +167,28 @@ data class MapData(
     val devices: List<DeviceTrail> = emptyList(),
     val cells: List<CellMarker> = emptyList()
 )
+
+// --- Phone health / surveillance indicators ---------------------------------
+
+data class PhoneHealthFinding(
+    val id: String,
+    val severity: Severity,
+    val category: String,
+    val title: String,
+    val detail: String
+)
+
+data class PhoneHealth(
+    val findings: List<PhoneHealthFinding> = emptyList(),
+    val activeMic: List<String> = emptyList(),
+    val activeCamera: List<String> = emptyList()
+) {
+    val level: Threat get() = when {
+        activeMic.isNotEmpty() || activeCamera.isNotEmpty() -> Threat.CRITICAL
+        findings.any { it.severity == Severity.CRITICAL } -> Threat.CRITICAL
+        findings.any { it.severity == Severity.HIGH } -> Threat.HIGH
+        findings.any { it.severity == Severity.MEDIUM } -> Threat.MEDIUM
+        findings.isNotEmpty() -> Threat.LOW
+        else -> Threat.NONE
+    }
+}

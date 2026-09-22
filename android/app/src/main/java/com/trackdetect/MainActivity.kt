@@ -41,27 +41,34 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import android.content.res.Resources
+import android.graphics.Bitmap
+import android.graphics.Paint as AndroidPaint
+import android.graphics.drawable.BitmapDrawable
+import androidx.compose.ui.viewinterop.AndroidView
 import com.trackdetect.CatcherFinding
 import com.trackdetect.analysis.NfcScanner
 import com.trackdetect.analysis.Report
 import kotlinx.coroutines.delay
+import org.osmdroid.config.Configuration as OsmConfig
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Polyline
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -402,13 +409,14 @@ private fun MainApp(
     hasPermissions: () -> Boolean
 ) {
     var tab by remember { mutableIntStateOf(0) }
-    val tabs = listOf("SCAN", "MAP", "LOG", "CELL", "NFC", "WIFI")
+    val tabs = listOf("SCAN", "MAP", "LOG", "CELL", "NFC", "WIFI", "DEVICE")
 
     val detections by Registry.detections.collectAsStateWithLifecycle()
     val trusted by Registry.trusted.collectAsStateWithLifecycle()
     val cell by Registry.cell.collectAsStateWithLifecycle()
     val nfc by Registry.nfc.collectAsStateWithLifecycle()
     val wifi by Registry.wifi.collectAsStateWithLifecycle()
+    val phoneHealth by Registry.phoneHealth.collectAsStateWithLifecycle()
 
     // Settings navigation and threat explainer state
     var showSettings by remember { mutableStateOf(false) }
@@ -428,7 +436,8 @@ private fun MainApp(
         false,
         cell.available && cell.level.ordinal >= Threat.HIGH.ordinal,
         nfc.any { it.suspicious },
-        wifi.isNotEmpty()
+        wifi.isNotEmpty(),
+        phoneHealth.level.ordinal >= Threat.HIGH.ordinal
     )
 
     Column(Modifier.fillMaxSize()) {
@@ -446,6 +455,7 @@ private fun MainApp(
                 )
                 4 -> NfcScreen()
                 5 -> WifiScreen()
+                6 -> DeviceScreen()
             }
         }
         NavigationBar(
@@ -561,7 +571,7 @@ private fun TabIcon(index: Int, selected: Boolean) {
                 }
                 drawCircle(color, radius = 2.5f, center = Offset(cx - size.minDimension * 0.35f, cy))
             }
-            else -> { // WIFI — wifi arcs
+            5 -> { // WIFI — wifi arcs
                 val arcSizes = listOf(0.9f, 0.6f, 0.3f)
                 arcSizes.forEachIndexed { i, scale ->
                     val r = size.minDimension * scale * 0.5f
@@ -575,6 +585,26 @@ private fun TabIcon(index: Int, selected: Boolean) {
                     )
                 }
                 drawCircle(color, radius = 2.5f, center = Offset(cx, size.height * 0.8f))
+            }
+            else -> { // DEVICE — shield
+                val sw = size.width * 0.76f
+                val sh = size.height * 0.88f
+                val ox = cx - sw / 2f
+                val oy = cy - sh / 2f + size.height * 0.04f
+                val shieldPath = Path().apply {
+                    moveTo(cx, oy)
+                    lineTo(ox + sw, oy + sh * 0.25f)
+                    lineTo(ox + sw, oy + sh * 0.6f)
+                    cubicTo(ox + sw, oy + sh * 0.85f, cx, oy + sh, cx, oy + sh)
+                    cubicTo(cx, oy + sh, ox, oy + sh * 0.85f, ox, oy + sh * 0.6f)
+                    lineTo(ox, oy + sh * 0.25f)
+                    close()
+                }
+                drawPath(shieldPath, color.copy(alpha = 0.2f))
+                drawPath(shieldPath, color, style = Stroke(1.5f))
+                // check mark inside
+                drawLine(color, Offset(cx - sw * 0.22f, cy + sh * 0.05f), Offset(cx - sw * 0.05f, cy + sh * 0.22f), strokeWidth = 1.8f)
+                drawLine(color, Offset(cx - sw * 0.05f, cy + sh * 0.22f), Offset(cx + sw * 0.25f, cy - sh * 0.1f), strokeWidth = 1.8f)
             }
         }
     }
@@ -994,242 +1024,169 @@ private fun DetectionDetail(d: Detection, trusted: Boolean, onShowExplainer: (()
 
 // ── Map screen ─────────────────────────────────────────────────────────
 
-private data class MapProj(val cLat: Double, val cLon: Double, val pxPerM: Float)
-
-private fun LatLon.toOffset(p: MapProj, size: Size): Offset {
-    val mPerDegLat = 111320.0
-    val mPerDegLon = 111320.0 * cos(Math.toRadians(p.cLat))
-    val dx = ((lon - p.cLon) * mPerDegLon * p.pxPerM).toFloat()
-    val dy = ((p.cLat - lat) * mPerDegLat * p.pxPerM).toFloat()
-    return Offset(size.width / 2 + dx, size.height / 2 + dy)
-}
-
-private fun buildProjection(mapData: MapData, status: ScanStatus, size: Size): MapProj? {
-    val pts = buildList {
-        addAll(mapData.track)
-        mapData.devices.forEach { addAll(it.points) }
-        mapData.cells.forEach { add(it.point) }
-        if (status.hasFix && status.lat != null && status.lon != null) add(LatLon(status.lat, status.lon))
+private fun markerBitmap(argbFill: Int, sizeDp: Int, outline: Boolean = false): BitmapDrawable {
+    val px = (sizeDp * Resources.getSystem().displayMetrics.density + 0.5f).toInt()
+    val bm = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(bm)
+    val paint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+        color = argbFill
+        style = AndroidPaint.Style.FILL
     }
-    if (pts.isEmpty()) return null
-    val cLat = pts.sumOf { it.lat } / pts.size
-    val cLon = pts.sumOf { it.lon } / pts.size
-    if (pts.size == 1) return MapProj(cLat, cLon, min(size.width, size.height) / 400f)
-    val mPerDegLat = 111320.0
-    val mPerDegLon = 111320.0 * cos(Math.toRadians(cLat))
-    val wM = (pts.maxOf { it.lon } - pts.minOf { it.lon }) * mPerDegLon
-    val hM = (pts.maxOf { it.lat } - pts.minOf { it.lat }) * mPerDegLat
-    if (wM < 1 && hM < 1) return MapProj(cLat, cLon, min(size.width, size.height) / 400f)
-    val sx = if (wM > 0) (size.width * 0.75f / wM).toFloat() else Float.MAX_VALUE
-    val sy = if (hM > 0) (size.height * 0.75f / hM).toFloat() else Float.MAX_VALUE
-    return MapProj(cLat, cLon, min(sx, sy))
+    canvas.drawCircle(px / 2f, px / 2f, px / 2f - 1f, paint)
+    if (outline) {
+        paint.color = android.graphics.Color.WHITE
+        paint.style = AndroidPaint.Style.STROKE
+        paint.strokeWidth = px * 0.18f
+        canvas.drawCircle(px / 2f, px / 2f, px / 2f - 2f, paint)
+    }
+    return BitmapDrawable(Resources.getSystem(), bm)
 }
 
-private enum class Mark { DOT, LINE, TRI, RING }
+private fun threatArgb(threat: Threat, following: Boolean): Int = when {
+    following -> 0xFFF2545B.toInt()
+    threat.ordinal >= Threat.HIGH.ordinal -> 0xFFFF7A3D.toInt()
+    threat.ordinal >= Threat.MEDIUM.ordinal -> 0xFFE8B33D.toInt()
+    else -> 0xFF4A8FD4.toInt()
+}
 
 @Composable
 private fun MapScreen() {
     val mapData by Registry.map.collectAsStateWithLifecycle()
     val status by Registry.status.collectAsStateWithLifecycle()
     val cell by Registry.cell.collectAsStateWithLifecycle()
-    val pulse = rememberPulse()
-    val textMeasurer = rememberTextMeasurer()
-    val bang = remember(textMeasurer) {
-        textMeasurer.measure(
-            AnnotatedString("!"),
-            TextStyle(color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-        )
-    }
+    val context = LocalContext.current
 
-    var canvasSize by remember { mutableStateOf(IntSize.Zero) }
-    val proj = remember(mapData, status.hasFix, status.lat, status.lon, canvasSize) {
-        if (canvasSize.width == 0 || canvasSize.height == 0) null
-        else buildProjection(mapData, status, Size(canvasSize.width.toFloat(), canvasSize.height.toFloat()))
-    }
-
-    val hasContent = status.hasFix || mapData.track.isNotEmpty() || mapData.devices.isNotEmpty()
     val cellHot = cell.available && cell.level.ordinal >= Threat.HIGH.ordinal
     val followingTrails = mapData.devices.count { it.following }
 
-    Box(Modifier.fillMaxSize().background(MapGround)) {
-        if (!hasContent) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No GPS fix.\nStart scanning and move around\nto build the map.",
-                    color = Muted, fontSize = 14.sp, textAlign = TextAlign.Center)
+    val mapView = remember {
+        OsmConfig.getInstance().load(
+            context,
+            context.getSharedPreferences("osmdroid", android.content.Context.MODE_PRIVATE)
+        )
+        OsmConfig.getInstance().userAgentValue = "TrackDetect/${BuildConfig.VERSION_NAME}"
+        MapView(context).apply {
+            setTileSource(TileSourceFactory.MAPNIK)
+            setMultiTouchControls(true)
+            controller.setZoom(17.0)
+            isFlingEnabled = true
+        }
+    }
+
+    // Only center the map on the very first GPS fix; after that the user controls it.
+    var hasCentered by remember { mutableStateOf(false) }
+
+    LaunchedEffect(status.lat, status.lon, mapData) {
+        val lat = status.lat ?: return@LaunchedEffect
+        val lon = status.lon ?: return@LaunchedEffect
+
+        // Rebuild all overlays except the tile layer.
+        mapView.overlays.removeAll { it !is org.osmdroid.views.overlay.TilesOverlay }
+
+        // GPS track
+        if (mapData.track.size > 1) {
+            val line = Polyline(mapView).apply {
+                outlinePaint.color = 0xFF4A8FD4.toInt()
+                outlinePaint.strokeWidth = 8f
+                outlinePaint.alpha = 180
+                setPoints(mapData.track.map { GeoPoint(it.lat, it.lon) })
             }
-        } else {
-            Canvas(Modifier.fillMaxSize().onSizeChanged { canvasSize = it }) {
-                val p = proj ?: return@Canvas
-
-                // GPS track
-                if (mapData.track.size > 1) {
-                    val path = Path()
-                    mapData.track.forEachIndexed { i, pt ->
-                        val o = pt.toOffset(p, size)
-                        if (i == 0) path.moveTo(o.x, o.y) else path.lineTo(o.x, o.y)
-                    }
-                    drawPath(path, Blue.copy(alpha = 0.7f), style = Stroke(3f, cap = StrokeCap.Round))
-                }
-
-                // Device trails
-                for (trail in mapData.devices) {
-                    val col = trailColor(trail.threat, trail.following)
-                    if (trail.points.size > 1) {
-                        val path = Path()
-                        trail.points.forEachIndexed { i, pt ->
-                            val o = pt.toOffset(p, size)
-                            if (i == 0) path.moveTo(o.x, o.y) else path.lineTo(o.x, o.y)
-                        }
-                        drawPath(path, col.copy(alpha = 0.5f), style = Stroke(2f))
-                    }
-                    trail.points.forEach { pt ->
-                        drawCircle(col, radius = 5f, center = pt.toOffset(p, size))
-                    }
-                }
-
-                // Threat overlay: a breathing red halo on the last known position of anything following.
-                val alpha = pulse.value
-                for (trail in mapData.devices) {
-                    if (!trail.following || trail.points.isEmpty()) continue
-                    val o = trail.points.last().toOffset(p, size)
-                    drawCircle(Critical.copy(alpha = alpha * 0.35f), radius = 34f + 14f * alpha, center = o)
-                    drawCircle(Critical.copy(alpha = alpha), radius = 18f + 6f * alpha, center = o)
-                    drawCircle(Critical, radius = 6f, center = o)
-                    drawCircle(Color.White, radius = 6f, center = o, style = Stroke(1.5f))
-                }
-
-                // Historical cell markers (triangles)
-                for (marker in mapData.cells) {
-                    val o = marker.point.toOffset(p, size)
-                    val col = trailColor(marker.level, false)
-                    val tri = Path().apply {
-                        moveTo(o.x, o.y - 14f); lineTo(o.x + 11f, o.y + 9f)
-                        lineTo(o.x - 11f, o.y + 9f); close()
-                    }
-                    drawPath(tri, col)
-                    drawPath(tri, Color.Black, style = Stroke(1.5f))
-                }
-
-                // Current position
-                val curLat = status.lat
-                val curLon = status.lon
-                if (status.hasFix && curLat != null && curLon != null) {
-                    val o = LatLon(curLat, curLon).toOffset(p, size)
-                    drawCircle(Color.White, 10f, o)
-                    drawCircle(Blue, 7f, o)
-
-                    // Live cell anomaly: yellow warning triangle sitting just above the position dot.
-                    if (cellHot) {
-                        val apexY = o.y - 46f
-                        val baseY = o.y - 14f
-                        val tri = Path().apply {
-                            moveTo(o.x, apexY); lineTo(o.x + 18f, baseY)
-                            lineTo(o.x - 18f, baseY); close()
-                        }
-                        drawPath(tri, Caution)
-                        drawPath(tri, Color.Black, style = Stroke(2f))
-                        drawText(
-                            bang,
-                            topLeft = Offset(
-                                o.x - bang.size.width / 2f,
-                                (apexY + baseY) / 2f - bang.size.height / 2f + 3f
-                            )
-                        )
-                    }
-                }
-            }
+            mapView.overlays.add(0, line)
         }
 
-        // Top strip: what the map currently knows.
-        Column(
-            Modifier.align(Alignment.TopStart).padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
+        // Device markers
+        for (trail in mapData.devices) {
+            val pt = trail.points.lastOrNull() ?: continue
+            val argb = threatArgb(trail.threat, trail.following)
+            val sizeDp = if (trail.following) 22 else 16
+            val marker = Marker(mapView).apply {
+                position = GeoPoint(pt.lat, pt.lon)
+                title = trail.name
+                snippet = "%.6f, %.6f".format(pt.lat, pt.lon)
+                icon = markerBitmap(argb, sizeDp)
+                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+            }
+            mapView.overlays.add(marker)
+        }
+
+        // Cell anomaly markers (larger with outline)
+        for (cm in mapData.cells) {
+            val argb = threatArgb(cm.level, false)
+            val marker = Marker(mapView).apply {
+                position = GeoPoint(cm.point.lat, cm.point.lon)
+                title = cm.label
+                snippet = "%.6f, %.6f".format(cm.point.lat, cm.point.lon)
+                icon = markerBitmap(argb, 20, outline = true)
+                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+            }
+            mapView.overlays.add(marker)
+        }
+
+        // Current position (blue dot with white ring)
+        val posMarker = Marker(mapView).apply {
+            position = GeoPoint(lat, lon)
+            title = "Your position"
+            snippet = "%.6f, %.6f".format(lat, lon)
+            icon = markerBitmap(0xFF4A8FD4.toInt(), 20, outline = true)
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+        }
+        mapView.overlays.add(posMarker)
+
+        if (!hasCentered) {
+            mapView.controller.setCenter(GeoPoint(lat, lon))
+            hasCentered = true
+        }
+        mapView.invalidate()
+    }
+
+    DisposableEffect(Unit) {
+        mapView.onResume()
+        onDispose { mapView.onPause() }
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        AndroidView(factory = { mapView }, modifier = Modifier.fillMaxSize())
+
+        // Top-left status chip
+        val chipColor = if (followingTrails > 0) Critical else Muted
+        Text(
+            buildString {
+                append(if (status.hasFix) "GPS fix" else "No fix")
+                if (status.lat != null) append("  %.5f, %.5f".format(status.lat, status.lon))
+                if (mapData.devices.isNotEmpty()) append("  ·  ${plural(mapData.devices.size, "device")}")
+                if (followingTrails > 0) append("  ·  $followingTrails FOLLOWING")
+            },
+            color = chipColor, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(8.dp)
+                .background(Panel.copy(alpha = 0.92f), CardShape)
+                .padding(horizontal = 8.dp, vertical = 5.dp)
+        )
+
+        if (cellHot) {
             Text(
-                buildString {
-                    append(if (status.hasFix) "GPS fix" else "No GPS fix")
-                    append(" · ${mapData.track.size} track pts")
-                    if (mapData.devices.isNotEmpty()) append(" · ${plural(mapData.devices.size, "device trail")}")
-                    if (followingTrails > 0) append(" · $followingTrails FOLLOWING")
-                },
-                color = if (followingTrails > 0) Critical else Muted, fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier.background(Panel.copy(alpha = 0.85f), CardShape).padding(horizontal = 8.dp, vertical = 5.dp)
+                "⚠ Cell anomaly — ${cell.level.name}",
+                color = Caution, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(8.dp)
+                    .background(Panel.copy(alpha = 0.92f), CardShape)
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
             )
-            if (cellHot) {
-                Text(
-                    "⚠ Cell anomaly at your position — ${cell.level.name} (score ${cell.score})",
-                    color = Caution, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.background(Panel.copy(alpha = 0.85f), CardShape).padding(horizontal = 8.dp, vertical = 5.dp)
-                )
-            }
         }
 
-        // Scale bar, bottom-left.
-        val pr = proj
-        if (pr != null && canvasSize.width > 0) {
-            ScaleBar(pr.pxPerM, canvasSize.width, Modifier.align(Alignment.BottomStart).padding(12.dp))
+        if (followingTrails > 0) {
+            Text(
+                "● ${plural(followingTrails, "device")} FOLLOWING YOU",
+                color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 14.dp)
+                    .background(Critical.copy(alpha = 0.92f), CardShape)
+                    .padding(horizontal = 14.dp, vertical = 8.dp)
+            )
         }
-
-        // Legend, bottom-right, always visible.
-        Column(
-            Modifier.align(Alignment.BottomEnd).padding(12.dp)
-                .background(Panel.copy(alpha = 0.85f), CardShape).padding(8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            LegendItem(Blue, "GPS track", Mark.LINE)
-            LegendItem(Blue, "Your position", Mark.RING)
-            LegendItem(Critical, "Following device", Mark.DOT)
-            LegendItem(Accent, "Known tracker", Mark.DOT)
-            LegendItem(Caution, "Persistent device", Mark.DOT)
-            LegendItem(Caution, "Cell anomaly", Mark.TRI)
-        }
-    }
-}
-
-@Composable
-private fun ScaleBar(pxPerM: Float, canvasWidthPx: Int, modifier: Modifier = Modifier) {
-    val density = LocalDensity.current
-    val maxPx = canvasWidthPx * 0.35f
-    val candidates = listOf(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000)
-    val metres = candidates.lastOrNull { it * pxPerM <= maxPx } ?: candidates.first()
-    val widthDp = with(density) { (metres * pxPerM).toDp() }
-    val label = if (metres >= 1000) "${metres / 1000} km" else "$metres m"
-    Column(
-        modifier.background(Panel.copy(alpha = 0.85f), CardShape).padding(8.dp),
-        verticalArrangement = Arrangement.spacedBy(3.dp)
-    ) {
-        Row(verticalAlignment = Alignment.Bottom) {
-            Box(Modifier.width(1.dp).height(7.dp).background(Ink))
-            Box(Modifier.width(widthDp).height(2.dp).background(Ink))
-            Box(Modifier.width(1.dp).height(7.dp).background(Ink))
-        }
-        Text(label, color = InkDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-    }
-}
-
-@Composable
-private fun LegendItem(color: Color, label: String, mark: Mark) {
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        Canvas(Modifier.size(10.dp)) {
-            when (mark) {
-                Mark.DOT -> drawCircle(color, radius = size.minDimension / 2f)
-                Mark.RING -> {
-                    drawCircle(Color.White, radius = size.minDimension / 2f)
-                    drawCircle(color, radius = size.minDimension / 2f - 1.5f)
-                }
-                Mark.LINE -> drawLine(
-                    color, Offset(0f, size.height / 2f), Offset(size.width, size.height / 2f), strokeWidth = 3f
-                )
-                Mark.TRI -> {
-                    val tri = Path().apply {
-                        moveTo(size.width / 2f, 0f); lineTo(size.width, size.height); lineTo(0f, size.height); close()
-                    }
-                    drawPath(tri, color)
-                }
-            }
-        }
-        Text(label, color = InkDim, fontSize = 11.sp)
     }
 }
 
@@ -1671,6 +1628,155 @@ private fun NfcTagRow(t: NfcTag) {
                     )
                 }
             }
+        }
+    }
+}
+
+// ── Device health screen ────────────────────────────────────────────────
+
+@Composable
+private fun DeviceScreen() {
+    val health by Registry.phoneHealth.collectAsStateWithLifecycle()
+
+    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+        Spacer(Modifier.height(20.dp))
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("DEVICE HEALTH", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                Text("Mic, camera, spyware access — what can see and hear you right now",
+                    color = Muted, fontSize = 12.sp)
+            }
+            val levelColor = when (health.level) {
+                Threat.CRITICAL -> Critical
+                Threat.HIGH -> Critical
+                Threat.MEDIUM -> Caution
+                Threat.LOW -> Caution
+                Threat.NONE -> Clear
+            }
+            Text(
+                health.level.name,
+                color = levelColor, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier.background(levelColor.copy(alpha = 0.12f), CardShape)
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+
+            // ── Active mic / camera — most urgent, always at top ──────────────
+            if (health.activeMic.isNotEmpty()) {
+                item(key = "mic_banner") {
+                    ActiveSensorBanner(
+                        label = "MICROPHONE ACTIVE",
+                        packages = health.activeMic,
+                        color = Critical,
+                        detail = "An app is recording audio right now."
+                    )
+                }
+            }
+            if (health.activeCamera.isNotEmpty()) {
+                item(key = "cam_banner") {
+                    ActiveSensorBanner(
+                        label = "CAMERA ACTIVE",
+                        packages = health.activeCamera,
+                        color = Critical,
+                        detail = "An app is using the camera right now."
+                    )
+                }
+            }
+
+            if (health.activeMic.isEmpty() && health.activeCamera.isEmpty()) {
+                item(key = "sensors_ok") {
+                    Row(
+                        Modifier.fillMaxWidth().clip(CardShape).background(Panel)
+                            .padding(12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Canvas(Modifier.size(8.dp)) { drawCircle(Clear) }
+                        Text("No app is currently using the microphone or camera",
+                            color = Clear, fontSize = 13.sp)
+                    }
+                }
+            }
+
+            // ── Divider ────────────────────────────────────────────────────────
+            item(key = "div") { Spacer(Modifier.height(4.dp)) }
+
+            // ── Static findings ────────────────────────────────────────────────
+            if (health.findings.isEmpty()) {
+                item(key = "all_clear") {
+                    Column(
+                        Modifier.fillMaxWidth().clip(CardShape).background(Panel).padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text("No issues found", color = Clear, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "No accessibility services, device admin apps, or debug interfaces that could be used for surveillance.",
+                            color = Muted, fontSize = 12.sp
+                        )
+                    }
+                }
+            } else {
+                items(health.findings, key = { it.id }) { f ->
+                    HealthFindingRow(f)
+                }
+            }
+
+            item(key = "§footer") { Spacer(Modifier.height(24.dp)) }
+        }
+    }
+}
+
+@Composable
+private fun ActiveSensorBanner(label: String, packages: List<String>, color: Color, detail: String) {
+    Row(
+        Modifier.fillMaxWidth().clip(CardShape).background(color.copy(alpha = 0.15f))
+            .border(1.dp, color.copy(alpha = 0.6f), CardShape).padding(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.Top
+    ) {
+        Canvas(Modifier.size(8.dp).padding(top = 3.dp)) { drawCircle(color) }
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(label, color = color, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
+            Text(detail, color = Ink, fontSize = 13.sp)
+            packages.forEach { pkg ->
+                Text("  • $pkg", color = InkDim, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+            }
+        }
+    }
+}
+
+@Composable
+private fun HealthFindingRow(f: PhoneHealthFinding) {
+    val stripe = when (f.severity) {
+        Severity.CRITICAL -> Critical
+        Severity.HIGH -> Critical
+        Severity.MEDIUM -> Caution
+        Severity.LOW -> Muted
+    }
+    Row(Modifier.fillMaxWidth().clip(CardShape).background(Panel).height(IntrinsicSize.Min)) {
+        Box(Modifier.width(3.dp).fillMaxHeight().background(stripe))
+        Column(Modifier.weight(1f).padding(12.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    f.title, color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f)
+                )
+                ThreatBadge(f.severity.name, stripe)
+            }
+            Text(f.category, color = Accent, fontSize = 11.sp, letterSpacing = 0.5.sp)
+            Text(f.detail, color = Muted, fontSize = 12.sp, lineHeight = 17.sp)
         }
     }
 }

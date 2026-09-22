@@ -39,6 +39,7 @@ import com.trackdetect.analysis.IMSICatcher
 import com.trackdetect.analysis.IdentityResolver
 import com.trackdetect.analysis.LocationTrack
 import com.trackdetect.analysis.Tracker
+import com.trackdetect.analysis.PhoneHealthMonitor
 import com.trackdetect.analysis.WifiScanner
 import com.trackdetect.analysis.toFix
 import com.trackdetect.detect.Signatures
@@ -66,6 +67,7 @@ class ScanService : LifecycleService() {
     private val alerted = HashSet<String>()
     private val gpsTrail = ArrayList<LatLon>(500)
     private var publishCycle = 0
+    private lateinit var phoneHealthMonitor: PhoneHealthMonitor
 
     /** Whether a scan is currently registered with the adapter. */
     private var scanActive = false
@@ -154,6 +156,8 @@ class ScanService : LifecycleService() {
         imsiCatcher = IMSICatcher(cellStore)
         eventLog = EventLog(timelineStore)
         Registry.publishTimeline(eventLog.snapshot())
+        phoneHealthMonitor = PhoneHealthMonitor(this)
+        phoneHealthMonitor.start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -377,8 +381,14 @@ class ScanService : LifecycleService() {
                 } else emptyList()
                 Registry.publishMap(MapData(trail, deviceTrails, cellMarkers))
 
-                // WiFi anomaly scan: immediately on first cycle, then every ~60s
+                // Phone health: immediately on first cycle, then every ~30s
                 publishCycle++
+                if (publishCycle == 1 || publishCycle % 20 == 0) {
+                    val health = phoneHealthMonitor.scan()
+                    Registry.publishPhoneHealth(health)
+                }
+
+                // WiFi anomaly scan: immediately on first cycle, then every ~60s
                 if (publishCycle == 1 || publishCycle % 40 == 0) {
                     val wifiAnomalies = WifiScanner.scan(this@ScanService)
                     Registry.publishWifi(wifiAnomalies)
@@ -644,6 +654,7 @@ class ScanService : LifecycleService() {
         Registry.update { it.copy(scanning = false) }
         cellStore.flush()
         timelineStore.flush()
+        phoneHealthMonitor.stop()
         super.onDestroy()
     }
 
