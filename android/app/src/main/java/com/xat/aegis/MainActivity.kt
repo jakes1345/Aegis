@@ -139,7 +139,7 @@ class MainActivity : AppCompatActivity() {
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
         cardVault = CardVault(this)
         Registry.publishVault(cardVault.load())
-        cardEmulation = CardEmulation.getInstance(nfcAdapter ?: NfcAdapter.getDefaultAdapter(this))
+        cardEmulation = nfcAdapter?.let { CardEmulation.getInstance(it) }
         val onboardingAlreadyDone = isOnboardingDone(this)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(background = Ground, surface = Panel)) {
