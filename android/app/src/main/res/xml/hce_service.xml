@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/hce_service"
+    android:requireDeviceUnlock="false">
+    <!--
+        AIDs are registered dynamically at runtime via CardEmulation.registerAidsForService()
+        when the user activates emulation for a stored card. This placeholder entry keeps the
+        service declaration valid; actual routing uses the dynamically registered AIDs.
+    -->
+    <aid-group
+        android:description="@string/hce_service"
+        android:category="other">
+        <aid-filter android:name="F000000000" />
+    </aid-group>
+</host-apdu-service>
