@@ -12,8 +12,8 @@ android {
         applicationId = "com.trackdetect"
         minSdk = 31
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.4"
+        versionCode = 6
+        versionName = "1.5"
     }
 
     buildTypes {
@@ -59,4 +59,8 @@ dependencies {
     // Live tile map — renders OpenStreetMap tiles. Network is used only for
     // anonymous tile downloads; no user data is transmitted.
     implementation("org.osmdroid:osmdroid-android:6.1.20")
+
+    // Card vault — BiometricPrompt and AppCompatActivity for vault unlock
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.biometric:biometric:1.1.0")
 }

@@ -77,6 +77,24 @@
             </intent-filter>
         </receiver>
 
+        <!--
+            Host Card Emulation service — replays recorded ISO 14443-4 APDU conversations so
+            the phone can act as a stored access card. Only activates when the user explicitly
+            enables emulation for a vault card; no data is sent until a reader initiates contact.
+        -->
+        <service
+            android:name=".CardEmulationService"
+            android:exported="true"
+            android:permission="android.permission.BIND_NFC_SERVICE">
+            <intent-filter>
+                <action android:name="android.nfc.cardemulation.action.HOST_APDU_SERVICE"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.nfc.cardemulation.host_apdu_service"
+                android:resource="@xml/hce_service"/>
+        </service>
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

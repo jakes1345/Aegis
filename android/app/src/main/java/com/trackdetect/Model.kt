@@ -125,6 +125,28 @@ data class TimelineEvent(
 
 // --- NFC / HF RFID ----------------------------------------------------------
 
+/**
+ * Precise card profile resolved from ATQA + SAK bytes.
+ * [hceCapable] = the phone can replay APDU conversations for this type via HCE.
+ * MIFARE Classic / Ultralight / FeliCa / ISO 15693 use different protocols that
+ * Android's HCE stack cannot emulate — the reader sees a different RF signal.
+ */
+enum class CardProfile(val label: String, val hceCapable: Boolean) {
+    MIFARE_CLASSIC_1K("MIFARE Classic 1K", false),
+    MIFARE_CLASSIC_4K("MIFARE Classic 4K", false),
+    MIFARE_ULTRALIGHT("MIFARE Ultralight", false),
+    MIFARE_DESFIRE("MIFARE DESFire", true),
+    MIFARE_PLUS("MIFARE Plus SL3", true),
+    ISO14443_4("ISO 14443-4", true),
+    FELICA("FeliCa (NFC-F)", false),
+    ISO15693("ISO 15693 (HF RFID)", false),
+    EMV_VISA("Visa contactless", false),
+    EMV_MASTERCARD("Mastercard contactless", false),
+    EMV_AMEX("Amex contactless", false),
+    EMV_OTHER("Payment card", false),
+    UNKNOWN("Unknown", false)
+}
+
 data class NfcTag(
     val uid: String,
     val techs: List<String>,
@@ -132,7 +154,29 @@ data class NfcTag(
     val payload: String?,
     val suspicious: Boolean,
     val note: String,
-    val ts: Long
+    val ts: Long,
+    val atqa: String? = null,
+    val sak: String? = null,
+    val profile: CardProfile = CardProfile.UNKNOWN,
+    val paymentNetwork: String? = null,
+    val skimmerFlags: List<String> = emptyList(),
+    val apduPairs: List<Pair<String, String>> = emptyList()
+)
+
+// --- Card vault -------------------------------------------------------------
+
+/**
+ * A credential stored in the encrypted vault.
+ * [apduPairs] holds the recorded ISO 14443-4 APDU conversation (hex cmd → hex resp)
+ * for cards whose [CardProfile.hceCapable] is true. Empty for MIFARE Classic etc.
+ */
+data class VaultCard(
+    val id: String,
+    val uid: String,
+    val label: String,
+    val profile: CardProfile,
+    val addedTs: Long,
+    val apduPairs: List<Pair<String, String>> = emptyList()
 )
 
 // --- WiFi anomaly -----------------------------------------------------------

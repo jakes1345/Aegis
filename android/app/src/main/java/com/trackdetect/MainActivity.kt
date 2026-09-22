@@ -5,8 +5,10 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.nfc.NfcAdapter
 import android.os.Bundle
-import androidx.activity.ComponentActivity
+import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.LinearEasing
@@ -60,8 +62,10 @@ import android.graphics.Paint as AndroidPaint
 import android.graphics.drawable.BitmapDrawable
 import androidx.compose.ui.viewinterop.AndroidView
 import com.trackdetect.CatcherFinding
+import com.trackdetect.analysis.CardVault
 import com.trackdetect.analysis.NfcScanner
 import com.trackdetect.analysis.Report
+import android.nfc.cardemulation.CardEmulation
 import kotlinx.coroutines.delay
 import org.osmdroid.config.Configuration as OsmConfig
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
@@ -69,10 +73,12 @@ import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
+import android.content.ComponentName
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
@@ -119,9 +125,11 @@ private val ESSENTIAL = arrayOf(
 
 // ── Activity ───────────────────────────────────────────────────────────
 
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
 
     private var nfcAdapter: NfcAdapter? = null
+    private lateinit var cardVault: CardVault
+    private var cardEmulation: CardEmulation? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -129,6 +137,9 @@ class MainActivity : ComponentActivity() {
         AppSettings.load(this)
         Registry.bindTrustStore(this)
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
+        cardVault = CardVault(this)
+        Registry.publishVault(cardVault.load())
+        cardEmulation = CardEmulation.getInstance(nfcAdapter ?: NfcAdapter.getDefaultAdapter(this))
         val onboardingAlreadyDone = isOnboardingDone(this)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(background = Ground, surface = Panel)) {
@@ -160,7 +171,50 @@ class MainActivity : ComponentActivity() {
                             onStart = { startScanning() },
                             onStop = { sendToService(ScanService.ACTION_STOP) },
                             onClearData = { sendToService(ScanService.ACTION_CLEAR) },
-                            hasPermissions = { ESSENTIAL.all { granted(it) } }
+                            hasPermissions = { ESSENTIAL.all { granted(it) } },
+                            onAddToVault = { tag, label ->
+                                val card = VaultCard(
+                                    id        = UUID.randomUUID().toString(),
+                                    uid       = tag.uid,
+                                    label     = label,
+                                    profile   = tag.profile,
+                                    addedTs   = System.currentTimeMillis(),
+                                    apduPairs = tag.apduPairs
+                                )
+                                cardVault.add(card)
+                                Registry.publishVault(cardVault.load())
+                            },
+                            onRemoveVault = { id ->
+                                cardVault.remove(id)
+                                Registry.publishVault(cardVault.load())
+                                if (Registry.emulating.value == id) {
+                                    CardEmulationService.activePairs = emptyList()
+                                    Registry.setEmulating(null)
+                                }
+                            },
+                            onEmulate = { card ->
+                                if (card == null) {
+                                    CardEmulationService.activePairs = emptyList()
+                                    Registry.setEmulating(null)
+                                } else {
+                                    CardEmulationService.loadPairs(card.apduPairs)
+                                    val aids = card.apduPairs.mapNotNull { (cmd, _) ->
+                                        val bytes = cmd.replace(" ", "")
+                                        if (bytes.length >= 10 && (
+                                            bytes.startsWith("00A40400", ignoreCase = true) ||
+                                            bytes.startsWith("00A40404", ignoreCase = true))) {
+                                            val len = bytes.substring(8, 10).toIntOrNull(16) ?: 0
+                                            bytes.substring(10, minOf(10 + len * 2, bytes.length))
+                                        } else null
+                                    }.distinct().ifEmpty { listOf("F000000000") }
+                                    cardEmulation?.registerAidsForService(
+                                        ComponentName(this@MainActivity, CardEmulationService::class.java),
+                                        CardEmulation.CATEGORY_OTHER,
+                                        aids
+                                    )
+                                    Registry.setEmulating(card.id)
+                                }
+                            }
                         )
                     }
                 }
@@ -406,7 +460,10 @@ private fun MainApp(
     onStart: () -> Unit,
     onStop: () -> Unit,
     onClearData: () -> Unit,
-    hasPermissions: () -> Boolean
+    hasPermissions: () -> Boolean,
+    onAddToVault: (NfcTag, String) -> Unit = { _, _ -> },
+    onRemoveVault: (String) -> Unit = {},
+    onEmulate: (VaultCard?) -> Unit = {}
 ) {
     var tab by remember { mutableIntStateOf(0) }
     val tabs = listOf("SCAN", "MAP", "LOG", "CELL", "NFC", "WIFI", "DEVICE")
@@ -453,7 +510,11 @@ private fun MainApp(
                 3 -> CellScreen(
                     onShowExplainer = { f -> explainerTarget = ExplainerTarget.CellIndicator(f) }
                 )
-                4 -> NfcScreen()
+                4 -> NfcScreen(
+                    onAddToVault = onAddToVault,
+                    onRemoveVault = onRemoveVault,
+                    onEmulate = onEmulate
+                )
                 5 -> WifiScreen()
                 6 -> DeviceScreen()
             }
@@ -1531,101 +1592,270 @@ private fun FindingRow(f: CatcherFinding, onShowExplainer: (() -> Unit)? = null)
 // ── NFC screen ─────────────────────────────────────────────────────────
 
 @Composable
-private fun NfcScreen() {
-    val tags by Registry.nfc.collectAsStateWithLifecycle()
+private fun NfcScreen(
+    onAddToVault: (NfcTag, String) -> Unit,
+    onRemoveVault: (String) -> Unit,
+    onEmulate: (VaultCard?) -> Unit
+) {
+    val tags      by Registry.nfc.collectAsStateWithLifecycle()
+    val vault     by Registry.vault.collectAsStateWithLifecycle()
+    val emulId    by Registry.emulating.collectAsStateWithLifecycle()
 
-    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        Spacer(Modifier.height(20.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("NFC SWEEP", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-                Text("HF RFID tag scanner — tap surfaces to read passive tags", color = Muted, fontSize = 12.sp)
+    LazyColumn(
+        Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        // Header
+        item(key = "hdr") {
+            Spacer(Modifier.height(20.dp))
+            Text("NFC & CARD VAULT", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+            Text("Identify cards · store credentials securely · emulate access cards",
+                color = Muted, fontSize = 12.sp)
+            Spacer(Modifier.height(12.dp))
+        }
+
+        // Active emulation banner
+        if (emulId != null) {
+            item(key = "emul_banner") {
+                val card = vault.firstOrNull { it.id == emulId }
+                Row(
+                    Modifier.fillMaxWidth().clip(CardShape).background(Blue.copy(alpha = 0.15f))
+                        .border(1.dp, Blue.copy(alpha = 0.4f), CardShape).padding(12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("EMULATING", color = Blue, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                        Text(card?.label ?: "Unknown card", color = Ink, fontSize = 14.sp)
+                        Text("Wave phone at reader — screen must stay on", color = Muted, fontSize = 12.sp)
+                    }
+                    TextButton(onClick = { onEmulate(null) }) {
+                        Text("STOP", color = Critical, fontSize = 11.sp, letterSpacing = 1.sp)
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
             }
-            if (tags.isNotEmpty()) {
-                TextButton(onClick = { Registry.clearNfc() }) {
-                    Text("CLEAR", color = Muted, fontSize = 11.sp, letterSpacing = 1.sp)
+        }
+
+        // Vault section
+        item(key = "vault_hdr") {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("VAULT", color = Muted, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
+                Text("AES-256-GCM · Android Keystore (hardware TEE)", color = Muted.copy(alpha = 0.6f), fontSize = 10.sp)
+            }
+        }
+        if (vault.isEmpty()) {
+            item(key = "vault_empty") {
+                Text("No cards stored. Scan a card below and tap + VAULT to save it.",
+                    color = InkDim, fontSize = 13.sp)
+                Spacer(Modifier.height(4.dp))
+            }
+        } else {
+            items(vault, key = { "v_${it.id}" }) { card ->
+                VaultCardRow(card = card, emulId = emulId, onEmulate = onEmulate, onRemove = { onRemoveVault(card.id) })
+            }
+        }
+
+        // Divider
+        item(key = "divider") {
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("SCANNED TAGS", color = Muted, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
+                if (tags.isNotEmpty()) {
+                    TextButton(
+                        onClick = { Registry.clearNfc() },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                    ) { Text("CLEAR", color = Muted, fontSize = 11.sp, letterSpacing = 1.sp) }
                 }
             }
         }
-        Spacer(Modifier.height(12.dp))
+
         if (tags.isEmpty()) {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("No tags scanned yet.", color = InkDim, fontSize = 14.sp)
-                Text("Hold the phone's NFC reader to surfaces while this tab is visible:\ndesk undersides, car seats, bag linings, laptop bases, door frames.",
-                    color = Muted, fontSize = 13.sp)
-                Text("Suspicious tags: MIFARE Classic chips appear in commercially sold covert tracking devices and access-card cloners. Payment cards show as safe.",
+            item(key = "scan_empty") {
+                Text("No tags scanned yet.", color = InkDim, fontSize = 13.sp)
+                Spacer(Modifier.height(4.dp))
+                Text("Hold phone's NFC area to surfaces: desk undersides, bag linings, door frames, car seats.",
                     color = Muted, fontSize = 12.sp)
             }
         } else {
             val suspicious = tags.count { it.suspicious }
-            Text(
-                "${plural(tags.size, "tag")} · $suspicious suspicious",
-                color = if (suspicious > 0) Critical else Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace
-            )
-            Spacer(Modifier.height(8.dp))
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(tags, key = { it.uid }) { NfcTagRow(it) }
-                item(key = "§footer") { Spacer(Modifier.height(24.dp)) }
+            item(key = "scan_count") {
+                Text(
+                    "${plural(tags.size, "tag")} · $suspicious suspicious",
+                    color = if (suspicious > 0) Critical else Muted,
+                    fontSize = 11.sp, fontFamily = FontFamily.Monospace
+                )
+            }
+            items(tags, key = { "t_${it.uid}" }) { tag ->
+                NfcTagRow(t = tag, inVault = vault.any { it.uid == tag.uid },
+                    onAddToVault = { label -> onAddToVault(tag, label) })
+            }
+        }
+
+        item(key = "footer") { Spacer(Modifier.height(32.dp)) }
+    }
+}
+
+@Composable
+private fun VaultCardRow(
+    card: VaultCard,
+    emulId: String?,
+    onEmulate: (VaultCard?) -> Unit,
+    onRemove: () -> Unit
+) {
+    val isEmulating = card.id == emulId
+    val stripe = if (isEmulating) Blue else Clear
+    Row(Modifier.fillMaxWidth().clip(CardShape).background(Panel).height(IntrinsicSize.Min)) {
+        Box(Modifier.width(3.dp).fillMaxHeight().background(stripe))
+        Column(Modifier.weight(1f).padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(card.label, color = Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (card.profile.hceCapable) {
+                    ThreatBadge(if (isEmulating) "ACTIVE" else "HCE OK", if (isEmulating) Blue else Clear)
+                } else {
+                    ThreatBadge("STORED", Muted)
+                }
+            }
+            Text("${card.profile.label} · UID ${card.uid}", color = Accent, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+            if (!card.profile.hceCapable) {
+                Text("This card type uses a proprietary RF protocol — HCE emulation is not possible. UID and type are stored for identification.",
+                    color = Muted, fontSize = 11.sp)
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(fmtTime(card.addedTs), color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (card.profile.hceCapable) {
+                        TextButton(
+                            onClick = { onEmulate(if (isEmulating) null else card) },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                        ) {
+                            Text(
+                                if (isEmulating) "STOP" else "EMULATE",
+                                color = if (isEmulating) Critical else Blue,
+                                fontSize = 11.sp, letterSpacing = 1.sp
+                            )
+                        }
+                    }
+                    TextButton(
+                        onClick = onRemove,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                    ) { Text("REMOVE", color = Muted, fontSize = 11.sp, letterSpacing = 1.sp) }
+                }
             }
         }
     }
 }
 
 @Composable
-private fun NfcTagRow(t: NfcTag) {
+private fun NfcTagRow(t: NfcTag, inVault: Boolean, onAddToVault: (String) -> Unit) {
     val clipboard = LocalClipboardManager.current
     var copied by remember(t.uid) { mutableStateOf(false) }
-    LaunchedEffect(copied) {
-        if (copied) {
-            delay(1500L)
-            copied = false
-        }
+    var addingLabel by remember(t.uid) { mutableStateOf(false) }
+    var labelText by remember(t.uid) { mutableStateOf("") }
+    LaunchedEffect(copied) { if (copied) { delay(1500L); copied = false } }
+
+    val isPayment = t.profile in setOf(CardProfile.EMV_VISA, CardProfile.EMV_MASTERCARD,
+        CardProfile.EMV_AMEX, CardProfile.EMV_OTHER)
+    val stripe = when {
+        t.suspicious -> Critical
+        isPayment    -> Caution
+        else         -> Clear
     }
-    // IsoDep tags are only ever marked clean when the PPSE handshake succeeded, i.e. EMV.
-    val isPayment = !t.suspicious && t.techs.contains("IsoDep")
-    val stripe = if (t.suspicious) Critical else Clear
 
     Row(Modifier.fillMaxWidth().clip(CardShape).background(Panel).height(IntrinsicSize.Min)) {
         Box(Modifier.width(3.dp).fillMaxHeight().background(stripe))
         Column(Modifier.weight(1f).padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    t.uid, color = Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis
-                )
-                ThreatBadge(if (t.suspicious) "SUSPICIOUS" else "CLEAN", stripe)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(t.uid, color = Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                    fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                ThreatBadge(when {
+                    t.suspicious -> "SUSPECT"
+                    isPayment    -> "PAYMENT"
+                    else         -> "CLEAN"
+                }, stripe)
             }
-            Text("${t.type} · ${t.techs.joinToString()}", color = Accent, fontSize = 12.sp)
+
+            // Profile + ATQA/SAK
+            val techLine = buildString {
+                append(t.type)
+                if (t.atqa != null && t.sak != null) append(" · ATQA ${t.atqa} SAK ${t.sak}")
+                if (t.paymentNetwork != null) append(" · ${t.paymentNetwork}")
+            }
+            Text(techLine, color = Accent, fontSize = 12.sp)
             Text(t.note, color = if (t.suspicious) Critical.copy(alpha = 0.9f) else Muted, fontSize = 12.sp)
-            if (t.suspicious) {
-                NoticeBanner(Critical, "WARNING", "This tag type is commonly found in covert tracking devices")
-            } else if (isPayment) {
-                NoticeBanner(Clear, "EMV", "Legitimate payment tag — likely not a tracker")
+
+            // Skimmer flags
+            t.skimmerFlags.forEach { flag ->
+                NoticeBanner(Critical, "ANOMALY", flag)
+            }
+            if (isPayment) {
+                NoticeBanner(Caution, "PAYMENT", "Public card metadata only — no secret data readable. Not a tracker.")
             }
             if (t.payload != null) {
                 Text("Data: ${t.payload.take(80)}", color = InkDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
             }
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(fmtTime(t.ts), color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                TextButton(
-                    onClick = {
-                        clipboard.setText(AnnotatedString(t.uid))
-                        copied = true
-                    },
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
-                ) {
-                    Text(
-                        if (copied) "COPIED ✓" else "COPY UID",
-                        color = if (copied) Clear else InkDim, fontSize = 11.sp, letterSpacing = 1.sp
+
+            // HCE capability hint
+            if (t.profile.hceCapable && !isPayment) {
+                Text("This card type can be emulated via HCE — add to vault to use phone as card.",
+                    color = Clear.copy(alpha = 0.8f), fontSize = 11.sp)
+            }
+
+            // Add-to-vault inline input
+            if (addingLabel) {
+                OutlinedTextField(
+                    value = labelText,
+                    onValueChange = { labelText = it },
+                    label = { Text("Card label", fontSize = 12.sp) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Accent,
+                        unfocusedBorderColor = Rule,
+                        focusedTextColor = Ink,
+                        unfocusedTextColor = Ink
                     )
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { addingLabel = false; labelText = "" },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                        Text("CANCEL", color = Muted, fontSize = 11.sp, letterSpacing = 1.sp)
+                    }
+                    TextButton(
+                        onClick = {
+                            if (labelText.isNotBlank()) {
+                                onAddToVault(labelText.trim())
+                                addingLabel = false; labelText = ""
+                            }
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        enabled = labelText.isNotBlank()
+                    ) { Text("SAVE", color = Clear, fontSize = 11.sp, letterSpacing = 1.sp) }
+                }
+            }
+
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(fmtTime(t.ts), color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (!inVault && !isPayment && !addingLabel) {
+                        TextButton(
+                            onClick = { addingLabel = true; labelText = t.profile.label },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                        ) { Text("+ VAULT", color = Clear, fontSize = 11.sp, letterSpacing = 1.sp) }
+                    } else if (inVault) {
+                        Text("IN VAULT", color = Clear.copy(alpha = 0.6f), fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.padding(horizontal = 8.dp))
+                    }
+                    TextButton(
+                        onClick = { clipboard.setText(AnnotatedString(t.uid)); copied = true },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                    ) {
+                        Text(if (copied) "COPIED ✓" else "COPY UID",
+                            color = if (copied) Clear else InkDim, fontSize = 11.sp, letterSpacing = 1.sp)
+                    }
                 }
             }
         }

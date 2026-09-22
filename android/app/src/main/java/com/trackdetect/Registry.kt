@@ -1,6 +1,7 @@
 package com.trackdetect
 
 import android.content.Context
+import com.trackdetect.VaultCard
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -96,6 +97,17 @@ object Registry {
     private val _phoneHealth = MutableStateFlow(PhoneHealth())
     val phoneHealth: StateFlow<PhoneHealth> = _phoneHealth.asStateFlow()
     fun publishPhoneHealth(h: PhoneHealth) { _phoneHealth.value = h }
+
+    // --- Card vault ----------------------------------------------------------
+
+    private val _vault = MutableStateFlow<List<VaultCard>>(emptyList())
+    val vault: StateFlow<List<VaultCard>> = _vault.asStateFlow()
+    fun publishVault(cards: List<VaultCard>) { _vault.value = cards }
+
+    /** ID of the vault card currently being emulated via HCE, or null. */
+    private val _emulating = MutableStateFlow<String?>(null)
+    val emulating: StateFlow<String?> = _emulating.asStateFlow()
+    fun setEmulating(id: String?) { _emulating.value = id }
 
     fun reset() {
         _detections.value = emptyList()
