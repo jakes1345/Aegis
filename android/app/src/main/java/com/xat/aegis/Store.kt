@@ -1,4 +1,4 @@
-package com.trackdetect
+package com.xat.aegis
 
 import android.content.Context
 import kotlinx.coroutines.CoroutineScope

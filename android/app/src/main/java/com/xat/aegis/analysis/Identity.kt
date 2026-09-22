@@ -1,4 +1,4 @@
-package com.trackdetect.analysis
+package com.xat.aegis.analysis
 
 import android.bluetooth.le.ScanRecord
 import java.security.MessageDigest

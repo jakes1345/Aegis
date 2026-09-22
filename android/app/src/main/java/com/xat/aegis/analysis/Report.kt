@@ -1,14 +1,14 @@
-package com.trackdetect.analysis
+package com.xat.aegis.analysis
 
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.core.content.FileProvider
-import com.trackdetect.CellStatus
-import com.trackdetect.Detection
-import com.trackdetect.NfcTag
-import com.trackdetect.ScanStatus
-import com.trackdetect.TimelineEvent
+import com.xat.aegis.CellStatus
+import com.xat.aegis.Detection
+import com.xat.aegis.NfcTag
+import com.xat.aegis.ScanStatus
+import com.xat.aegis.TimelineEvent
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -27,7 +27,7 @@ object Report {
         nfc: List<NfcTag>
     ): Intent {
         val text = buildReport(status, detections, timeline, cell, nfc)
-        val file = File(context.cacheDir, "trackdetect_${System.currentTimeMillis()}.txt")
+        val file = File(context.cacheDir, "aegis_${System.currentTimeMillis()}.txt")
         file.writeText(text)
         val uri: Uri = FileProvider.getUriForFile(
             context, "${context.packageName}.fileprovider", file

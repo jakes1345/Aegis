@@ -1,9 +1,9 @@
-package com.trackdetect.analysis
+package com.xat.aegis.analysis
 
-import com.trackdetect.Detection
-import com.trackdetect.FollowConfidence
-import com.trackdetect.Threat
-import com.trackdetect.TrackerType
+import com.xat.aegis.Detection
+import com.xat.aegis.FollowConfidence
+import com.xat.aegis.Threat
+import com.xat.aegis.TrackerType
 
 const val PERSIST_THRESHOLD_MS = 10 * 60 * 1000L
 const val PERSIST_MIN_SIGHTINGS = 5

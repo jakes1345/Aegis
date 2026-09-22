@@ -1,9 +1,9 @@
-package com.trackdetect.analysis
+package com.xat.aegis.analysis
 
-import com.trackdetect.EventKind
-import com.trackdetect.Severity
-import com.trackdetect.Store
-import com.trackdetect.TimelineEvent
+import com.xat.aegis.EventKind
+import com.xat.aegis.Severity
+import com.xat.aegis.Store
+import com.xat.aegis.TimelineEvent
 import org.json.JSONArray
 import org.json.JSONObject
 

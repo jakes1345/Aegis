@@ -1,11 +1,11 @@
-package com.trackdetect.analysis
+package com.xat.aegis.analysis
 
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
-import com.trackdetect.CardProfile
-import com.trackdetect.VaultCard
+import com.xat.aegis.CardProfile
+import com.xat.aegis.VaultCard
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.KeyStore
@@ -25,7 +25,7 @@ import javax.crypto.spec.GCMParameterSpec
 class CardVault(private val context: Context) {
 
     private companion object {
-        const val KEY_ALIAS  = "trackdetect_vault_v1"
+        const val KEY_ALIAS  = "aegis_vault_v1"
         const val PREFS_NAME = "card_vault"
         const val PREFS_KEY  = "cards_enc"
         const val GCM_TAG_LEN = 128

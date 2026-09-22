@@ -1,4 +1,4 @@
-package com.trackdetect
+package com.xat.aegis
 
 import android.Manifest
 import android.app.Notification
@@ -32,17 +32,17 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
-import com.trackdetect.analysis.CellMonitor
-import com.trackdetect.analysis.EventLog
-import com.trackdetect.analysis.Fingerprint
-import com.trackdetect.analysis.IMSICatcher
-import com.trackdetect.analysis.IdentityResolver
-import com.trackdetect.analysis.LocationTrack
-import com.trackdetect.analysis.Tracker
-import com.trackdetect.analysis.PhoneHealthMonitor
-import com.trackdetect.analysis.WifiScanner
-import com.trackdetect.analysis.toFix
-import com.trackdetect.detect.Signatures
+import com.xat.aegis.analysis.CellMonitor
+import com.xat.aegis.analysis.EventLog
+import com.xat.aegis.analysis.Fingerprint
+import com.xat.aegis.analysis.IMSICatcher
+import com.xat.aegis.analysis.IdentityResolver
+import com.xat.aegis.analysis.LocationTrack
+import com.xat.aegis.analysis.Tracker
+import com.xat.aegis.analysis.PhoneHealthMonitor
+import com.xat.aegis.analysis.WifiScanner
+import com.xat.aegis.analysis.toFix
+import com.xat.aegis.detect.Signatures
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -661,8 +661,8 @@ class ScanService : LifecycleService() {
     override fun onBind(intent: Intent): IBinder? { super.onBind(intent); return null }
 
     companion object {
-        const val ACTION_STOP = "com.trackdetect.STOP"
-        const val ACTION_CLEAR = "com.trackdetect.CLEAR"
+        const val ACTION_STOP = "com.xat.aegis.STOP"
+        const val ACTION_CLEAR = "com.xat.aegis.CLEAR"
         private const val CHANNEL_ONGOING = "scanning"
         private const val CHANNEL_ALERT = "alerts"
         private const val CHANNEL_CELL = "cell_alerts"

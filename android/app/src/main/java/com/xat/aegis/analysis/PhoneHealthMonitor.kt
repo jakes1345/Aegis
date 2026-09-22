@@ -1,4 +1,4 @@
-package com.trackdetect.analysis
+package com.xat.aegis.analysis
 
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.AppOpsManager
@@ -6,9 +6,9 @@ import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
-import com.trackdetect.PhoneHealth
-import com.trackdetect.PhoneHealthFinding
-import com.trackdetect.Severity
+import com.xat.aegis.PhoneHealth
+import com.xat.aegis.PhoneHealthFinding
+import com.xat.aegis.Severity
 import java.util.concurrent.ConcurrentHashMap
 
 class PhoneHealthMonitor(private val context: Context) {

@@ -1,4 +1,4 @@
-package com.trackdetect
+package com.xat.aegis
 
 import android.Manifest
 import android.content.BroadcastReceiver

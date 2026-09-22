@@ -1,4 +1,4 @@
-package com.trackdetect.analysis
+package com.xat.aegis.analysis
 
 import android.nfc.NdefMessage
 import android.nfc.NdefRecord
@@ -8,8 +8,8 @@ import android.nfc.tech.Ndef
 import android.nfc.tech.NfcA
 import android.nfc.tech.NfcB
 import android.nfc.tech.NfcF
-import com.trackdetect.CardProfile
-import com.trackdetect.NfcTag
+import com.xat.aegis.CardProfile
+import com.xat.aegis.NfcTag
 
 object NfcScanner {
 
