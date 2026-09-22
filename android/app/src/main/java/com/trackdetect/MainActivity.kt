@@ -209,6 +209,7 @@ class MainActivity : AppCompatActivity() {
                                     }.distinct().ifEmpty { listOf("F000000000") }
                                     cardEmulation?.registerAidsForService(
                                         ComponentName(this@MainActivity, CardEmulationService::class.java),
+                                        CardEmulation.CATEGORY_OTHER,
                                         aids
                                     )
                                     Registry.setEmulating(card.id)
