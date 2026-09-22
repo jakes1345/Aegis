@@ -1,8 +1,8 @@
-package com.trackdetect.detect
+package com.xat.aegis.detect
 
 import android.bluetooth.le.ScanRecord
-import com.trackdetect.Threat
-import com.trackdetect.TrackerType
+import com.xat.aegis.Threat
+import com.xat.aegis.TrackerType
 
 private const val APPLE = 0x004C
 private const val MICROSOFT = 0x0006

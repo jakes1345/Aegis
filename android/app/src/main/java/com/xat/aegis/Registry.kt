@@ -1,7 +1,7 @@
-package com.trackdetect
+package com.xat.aegis
 
 import android.content.Context
-import com.trackdetect.VaultCard
+import com.xat.aegis.VaultCard
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow

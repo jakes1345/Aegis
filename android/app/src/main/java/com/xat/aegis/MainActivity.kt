@@ -1,4 +1,4 @@
-package com.trackdetect
+package com.xat.aegis
 
 import android.Manifest
 import android.content.Intent
@@ -61,10 +61,10 @@ import android.graphics.Bitmap
 import android.graphics.Paint as AndroidPaint
 import android.graphics.drawable.BitmapDrawable
 import androidx.compose.ui.viewinterop.AndroidView
-import com.trackdetect.CatcherFinding
-import com.trackdetect.analysis.CardVault
-import com.trackdetect.analysis.NfcScanner
-import com.trackdetect.analysis.Report
+import com.xat.aegis.CatcherFinding
+import com.xat.aegis.analysis.CardVault
+import com.xat.aegis.analysis.NfcScanner
+import com.xat.aegis.analysis.Report
 import android.nfc.cardemulation.CardEmulation
 import kotlinx.coroutines.delay
 import org.osmdroid.config.Configuration as OsmConfig

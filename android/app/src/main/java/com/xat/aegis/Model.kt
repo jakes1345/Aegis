@@ -1,4 +1,4 @@
-package com.trackdetect
+package com.xat.aegis
 
 enum class Threat { NONE, LOW, MEDIUM, HIGH, CRITICAL }
 

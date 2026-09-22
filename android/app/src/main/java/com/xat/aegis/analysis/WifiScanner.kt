@@ -1,10 +1,10 @@
-package com.trackdetect.analysis
+package com.xat.aegis.analysis
 
 import android.content.Context
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiManager
-import com.trackdetect.Threat
-import com.trackdetect.WifiAnomaly
+import com.xat.aegis.Threat
+import com.xat.aegis.WifiAnomaly
 
 /**
  * Looks for access points that behave like bait rather than like infrastructure.

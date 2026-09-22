@@ -1,4 +1,4 @@
-package com.trackdetect.analysis
+package com.xat.aegis.analysis
 
 import android.Manifest
 import android.content.Context
@@ -13,8 +13,8 @@ import android.telephony.CellIdentityNr
 import android.telephony.CellSignalStrengthNr
 import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
-import com.trackdetect.Rat
-import com.trackdetect.ServingCell
+import com.xat.aegis.Rat
+import com.xat.aegis.ServingCell
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.Executors

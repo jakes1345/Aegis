@@ -1,4 +1,4 @@
-package com.trackdetect
+package com.xat.aegis
 
 import android.nfc.cardemulation.HostApduService
 import android.os.Bundle

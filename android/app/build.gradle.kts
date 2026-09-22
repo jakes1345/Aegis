@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.trackdetect"
+    namespace = "com.xat.aegis"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.trackdetect"
+        applicationId = "com.xat.aegis"
         minSdk = 31
         targetSdk = 35
         versionCode = 6

@@ -1,4 +1,4 @@
-package com.trackdetect
+package com.xat.aegis
 
 import android.bluetooth.le.ScanSettings
 import android.content.Context
@@ -19,7 +19,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.trackdetect.analysis.Report
+import com.xat.aegis.analysis.Report
 
 // ── AppSettings singleton ──────────────────────────────────────────────────────
 
@@ -48,7 +48,7 @@ object AppSettings {
     val followThresholdM: Float get() = _followThresholdM
     val persistenceThresholdMin: Float get() = _persistenceThresholdMin
 
-    /** The persistence threshold in the units [com.trackdetect.analysis.Tracker] works in. */
+    /** The persistence threshold in the units [com.xat.aegis.analysis.Tracker] works in. */
     val persistenceThresholdMs: Long get() = (_persistenceThresholdMin * 60_000f).toLong()
 
     /**

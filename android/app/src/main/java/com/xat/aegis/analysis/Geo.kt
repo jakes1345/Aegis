@@ -1,7 +1,7 @@
-package com.trackdetect.analysis
+package com.xat.aegis.analysis
 
 import android.location.Location
-import com.trackdetect.LatLon
+import com.xat.aegis.LatLon
 import kotlin.math.asin
 import kotlin.math.cos
 import kotlin.math.min

@@ -1,10 +1,10 @@
-package com.trackdetect.analysis
+package com.xat.aegis.analysis
 
-import com.trackdetect.CatcherFinding
-import com.trackdetect.Severity
-import com.trackdetect.ServingCell
-import com.trackdetect.Store
-import com.trackdetect.Threat
+import com.xat.aegis.CatcherFinding
+import com.xat.aegis.Severity
+import com.xat.aegis.ServingCell
+import com.xat.aegis.Store
+import com.xat.aegis.Threat
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -218,7 +218,7 @@ class IMSICatcher(private val store: Store) {
         // caveat as neighbours: a modem that always reports 0 is not reporting at all,
         // so this waits until a real non-zero advance has been seen on this device.
         val ta = cell.timingAdvance
-        if (ta != null && ta == 0 && cell.rat == com.trackdetect.Rat.LTE && tacMaturity >= 5 &&
+        if (ta != null && ta == 0 && cell.rat == com.xat.aegis.Rat.LTE && tacMaturity >= 5 &&
             data.optBoolean("taEverNonZero", false)
         ) {
             findings += CatcherFinding(
