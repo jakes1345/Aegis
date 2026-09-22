@@ -12,8 +12,8 @@ android {
         applicationId = "com.xat.aegis"
         minSdk = 31
         targetSdk = 35
-        versionCode = 7
-        versionName = "1.4.5"
+        versionCode = 8
+        versionName = "1.4.6"
     }
 
     buildTypes {
