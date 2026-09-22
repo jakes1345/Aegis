@@ -93,6 +93,10 @@ object Registry {
             ?.apply()
     }
 
+    private val _phoneHealth = MutableStateFlow(PhoneHealth())
+    val phoneHealth: StateFlow<PhoneHealth> = _phoneHealth.asStateFlow()
+    fun publishPhoneHealth(h: PhoneHealth) { _phoneHealth.value = h }
+
     fun reset() {
         _detections.value = emptyList()
         _status.value = ScanStatus()
