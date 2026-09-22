@@ -2,7 +2,7 @@
 <resources>
     <!-- Platform theme: Compose draws everything, so there is no need to pull
          in AppCompat or the Material Components library just for a theme. -->
-    <style name="Theme.Aegis" parent="android:Theme.Material.NoActionBar">
+    <style name="Theme.Aegis" parent="Theme.AppCompat.NoActionBar">
         <item name="android:statusBarColor">#0E1116</item>
         <item name="android:navigationBarColor">#0E1116</item>
     </style>
