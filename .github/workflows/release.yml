@@ -9,7 +9,7 @@ on:
       tag:
         description: 'Release tag (e.g. v1.3.0)'
         required: true
-        default: 'v1.3.0'
+        default: 'v2.0.0'
 
 permissions:
   contents: write
@@ -90,7 +90,7 @@ jobs:
         run: |
           BUILD_TOOLS=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
           APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner"
-          OUT="android/app/build/outputs/apk/release/track-detect-${TAG}.apk"
+          OUT="android/app/build/outputs/apk/release/aegis-${TAG}.apk"
           "$APKSIGNER" sign \
             --ks "$RUNNER_TEMP/signing/release.keystore" \
             --ks-pass env:KS_PASS \
@@ -110,17 +110,18 @@ jobs:
           STABLE: ${{ steps.signing.outputs.stable }}
         run: |
           {
-            echo "## Track Detect ${TAG}"
+            echo "## Aegis ${TAG}"
             echo
-            echo "Android tracker detector: BLE tags, Wi-Fi bait networks, IMSI-catcher"
-            echo "anomalies against a baseline it learns locally, and a passive NFC sweep."
-            echo "There is no network permission in the manifest — nothing leaves the phone."
+            echo "Aegis — defensive security monitor for Android. Detects BLE tracker tags,"
+            echo "Wi-Fi bait networks, IMSI-catcher anomalies, and sweeps NFC/RFID cards."
+            echo "Stores captured cards in an on-device AES-256 vault and can replay them"
+            echo "via Host Card Emulation. Nothing leaves the phone."
             echo
             echo "**Install**"
             echo
             if [ "$STABLE" = "true" ]; then
-              echo "1. Download \`track-detect-${TAG}.apk\` below and tap it."
-              echo "2. It installs straight over an earlier release and keeps your baseline, event log and trusted devices."
+              echo "1. Download \`aegis-${TAG}.apk\` below and tap it."
+              echo "2. It installs straight over an earlier Aegis release and keeps your baseline, event log and trusted devices."
               echo "3. First install only: Settings → Apps → Special app access → Install unknown apps → allow your file manager."
               echo "4. Grant Nearby devices and Location (precise). Notifications is optional — declining it costs the alert, not the detector."
             else
@@ -129,8 +130,8 @@ jobs:
               echo "> over an earlier release. You have to uninstall the old version first, which"
               echo "> clears the cell baseline, the event log and the trusted-device list."
               echo
-              echo "1. Uninstall any existing Track Detect."
-              echo "2. Download \`track-detect-${TAG}.apk\` below and tap it."
+              echo "1. Uninstall any existing Aegis."
+              echo "2. Download \`aegis-${TAG}.apk\` below and tap it."
               echo "3. Settings → Apps → Special app access → Install unknown apps → allow your file manager."
               echo "4. Grant Nearby devices and Location (precise). Notifications is optional — declining it costs the alert, not the detector."
             fi
@@ -142,9 +143,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          name: Track Detect ${{ steps.tag.outputs.name }}
+          name: Aegis ${{ steps.tag.outputs.name }}
           body_path: ${{ runner.temp }}/notes.md
           generate_release_notes: true
-          files: android/app/build/outputs/apk/release/track-detect-${{ steps.tag.outputs.name }}.apk
+          files: android/app/build/outputs/apk/release/aegis-${{ steps.tag.outputs.name }}.apk
           draft: false
           prerelease: false
