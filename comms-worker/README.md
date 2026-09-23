@@ -1,77 +1,67 @@
 # Aegis comms relay
 
-A Cloudflare Worker that gives the Aegis app a real phone number. Twilio owns the
-number; this Worker sits between Twilio and the phone: it receives SMS webhooks,
-sends outbound messages through the Twilio API, keeps the conversation in a D1
-database, and wakes paired phones through Firebase Cloud Messaging.
+A Cloudflare Worker that stores and forwards end-to-end encrypted envelopes
+between Aegis apps. It is the only server in the design, and it is built to
+know as little as possible.
 
-What is and is not encrypted: traffic between Aegis and this Worker, and between
-this Worker and Twilio, is TLS. Messages to and from ordinary phones travel the
-carrier network as normal SMS and are readable by the carriers and by Twilio.
-The push to the phone carries only a kind and a cursor, never message content.
+**Aegis numbers are not phone numbers.** Each Aegis identity gets a random
+nine-digit Aegis number from this relay at registration. It works only between
+Aegis apps paired with the same relay. It cannot call or text a phone, and a
+phone cannot reach it. What it buys is a handle you can give someone without
+giving them your real number or your identity key.
+
+## What the relay sees
+
+- The public keys of each registered identity (they are public by design).
+- For each envelope: the recipient's Aegis number, a size and a timestamp.
+  Not the sender, not the content. Envelopes are sealed to the recipient's
+  sealing key with an anonymous box, and inside that sits an Olm double-ratchet
+  message the relay could not read even if it opened the box.
+- The UnifiedPush endpoint an owner registers, if any, which it POSTs the word
+  "wake" to when a live socket is not connected.
+
+Authentication is by Ed25519 signature with the same identity key contacts
+verify. There are no passwords or tokens to leak.
 
 ## One-time setup
 
-1. Buy a number with SMS and voice capability in the Twilio console.
-2. Create a Firebase project, add an Android app with package `com.xat.aegis`,
-   put the downloaded `google-services.json` in `android/app/`, and create a
-   service-account key (Project settings → Service accounts).
-3. In this directory:
-
 ```sh
+cd comms-worker
 npm install
-npx wrangler login                      # or set CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID
-npx wrangler d1 create aegis-comms      # paste the database_id into wrangler.toml
-npm run migrate
-npx wrangler secret put TWILIO_ACCOUNT_SID
-npx wrangler secret put TWILIO_AUTH_TOKEN
-npx wrangler secret put TWILIO_NUMBER               # E.164, e.g. +15551234567
-npx wrangler secret put FIREBASE_SERVICE_ACCOUNT_JSON  # paste the whole key file
-npx wrangler secret put ENROLL_SECRET               # a long random string you will type into Aegis once
-npm run deploy                                      # prints the Worker URL
-WORKER_URL=https://aegis-comms.<account>.workers.dev \
-TWILIO_ACCOUNT_SID=… TWILIO_AUTH_TOKEN=… TWILIO_NUMBER=+1… \
-FIREBASE_SERVICE_ACCOUNT_JSON="$(cat service-account.json)" npm run setup:twilio
-# …then run the four `wrangler secret put` lines it prints (TwiML App, API key
-# SID and secret, push credential) and `npm run deploy` once more.
+npx wrangler login              # or set CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID
+npx wrangler secret put ENROLL_SECRET   # a long random string typed into Aegis once
+npm run deploy                  # prints the Worker URL
 ```
 
-4. In Aegis, open the COMMS tab, enter the Worker URL and the enrollment secret.
-   The phone receives a bearer token, registers its push token, and registers
-   with Twilio Voice so calls to the number ring it.
-
-Calls: the app connects to Twilio with a one-hour access token minted by
-`/api/voice/token`; the TwiML App's voice URL is `/twilio/voice`, which dials
-the requested number with the owner's number as caller ID. A call to the
-number reaches the same URL and rings every paired phone through the FCM push
-credential. Audio between the app and Twilio is SRTP; from Twilio onward it is
-ordinary telephony.
+In Aegis, open the COMMS tab, enter the Worker URL and the enrollment secret.
+The app generates its identity on the phone, registers it, and shows the Aegis
+number it was given. Two people pair by scanning each other's QR code in
+person, or by typing a listed Aegis number and then comparing safety numbers.
 
 ## API
 
-Twilio webhooks are verified with `X-Twilio-Signature`. Phone endpoints require
-`Authorization: Bearer <token>` from enrollment.
+Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
+`X-Aegis-Nonce` (single use) and `X-Aegis-Sig`, an Ed25519 signature over
+`number\nts\nnonce\nMETHOD\npath?query\nsha256hex(body)`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| POST | `/twilio/sms` | Inbound SMS/MMS |
-| POST | `/twilio/status` | Delivery status for outbound messages |
-| POST | `/api/enroll` | `{secret, name}` → `{deviceId, token, number}` |
-| GET | `/api/status` | Number, this device, paired devices |
-| PUT | `/api/device/fcm` | `{token}` registers the FCM token |
-| DELETE | `/api/device` | Unpairs this phone |
-| GET | `/api/messages?after=N` | Messages with `seq > N`, oldest first |
-| GET | `/api/messages/updates?since=T` | Status changes after epoch-millis `T` |
-| POST | `/api/messages` | `{to, body}` sends an SMS |
-| POST | `/api/messages/:sid/refresh` | Re-reads a message's status from Twilio |
-| POST | `/twilio/voice` | TwiML for app-placed and inbound calls |
-| POST | `/twilio/voice/dial-result` | After `<Dial>` finishes |
-| POST | `/twilio/voice/status` | Call progress → call log |
-| GET | `/api/voice/token` | `{token, identity, expiresAt, number}` |
-| GET | `/api/calls?since=T` | Call-log rows changed after epoch-millis `T` |
+| POST | `/v1/register` | Body signed by the new identity's key; allocates an Aegis number |
+| GET | `/v1/me` | Own profile and one-time-key count |
+| DELETE | `/v1/me` | Wipe the mailbox |
+| PUT | `/v1/keys` | Replenish one-time keys; rotate the fallback key |
+| PUT | `/v1/listed` | Whether the number can be looked up |
+| PUT | `/v1/push` | UnifiedPush endpoint to wake this device, or null |
+| GET | `/v1/bundle/:number` | A contact's keys and one session key (unlisted numbers need `?pin=<fingerprint>`) |
+| POST | `/v1/send` | `{to, envelope}`: queue a sealed envelope for a contact |
+| GET | `/v1/inbox` | Waiting envelopes |
+| POST | `/v1/ack` | Delete envelopes the app has stored |
+| GET | `/v1/ws` | Live delivery over a hibernatable WebSocket |
+
+Each Aegis number is a Durable Object holding the keys, the queue (up to 2000
+envelopes of 64 KiB, kept 30 days) and the live sockets.
 
 ## Development
 
-`npm run typecheck` runs the TypeScript compiler. `npm run dev` runs the Worker
-locally with a local D1 (`npm run migrate:local` first); Twilio webhooks need a
-public URL, so end-to-end testing is done against the deployed Worker.
+`npm run typecheck` runs the TypeScript compiler; `npx wrangler deploy --dry-run`
+bundles the Worker. `npm run dev` runs it locally with a local Durable Object.

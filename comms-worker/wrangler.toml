@@ -1,19 +1,10 @@
-# Aegis comms relay.
+# Aegis comms relay: store-and-forward for end-to-end encrypted envelopes
+# between Aegis apps, addressed by Aegis number (not a phone number).
 #
 # Secrets (set with `wrangler secret put <NAME>`, never in this file):
-#   TWILIO_ACCOUNT_SID            Twilio account SID (AC…)
-#   TWILIO_AUTH_TOKEN             Twilio auth token; also validates webhook signatures
-#   TWILIO_NUMBER                 The purchased number in E.164, e.g. +15551234567
-#   FIREBASE_SERVICE_ACCOUNT_JSON The Firebase service-account key file, verbatim
-#   ENROLL_SECRET                 One-time code typed into Aegis to pair a phone
-#   TWILIO_API_KEY_SID            Voice: API key (SK…) that signs access tokens
-#   TWILIO_API_KEY_SECRET         Voice: its secret
-#   TWILIO_TWIML_APP_SID          Voice: TwiML App (AP…) whose voice URL is /twilio/voice
-#   TWILIO_PUSH_CREDENTIAL_SID    Voice: FCM push credential (CR…) Twilio rings the app through
-#
-# `wrangler deploy` prints the Worker URL; scripts/setup-twilio.mjs points the
-# number's webhooks at it and creates the voice resources, printing the four
-# voice secrets to set.
+#   ENROLL_SECRET        One-time code typed into Aegis when it registers
+#   TURN_KEY_ID          Optional, for calls: Cloudflare Realtime TURN key id
+#   TURN_KEY_API_TOKEN   Optional, for calls: its API token
 
 name = "aegis-comms"
 main = "src/index.ts"
@@ -23,13 +14,10 @@ compatibility_flags = ["nodejs_compat"]
 [observability]
 enabled = true
 
-[[d1_databases]]
-binding = "DB"
-database_name = "aegis-comms"
-# Fill in after `wrangler d1 create aegis-comms`.
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
-migrations_dir = "migrations"
+[[durable_objects.bindings]]
+name = "MAILBOX"
+class_name = "Mailbox"
 
-[vars]
-# How many messages one sync call returns at most.
-SYNC_PAGE_SIZE = "200"
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Mailbox"]
