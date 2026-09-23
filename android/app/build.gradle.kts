@@ -88,8 +88,8 @@ android {
         applicationId = "com.xat.aegis"
         minSdk = 31
         targetSdk = 35
-        versionCode = 11
-        versionName = "2.1.0"
+        versionCode = 12
+        versionName = "2.2.0"
     }
 
     buildTypes {
@@ -164,4 +164,6 @@ dependencies {
     implementation("com.google.zxing:core:3.5.4")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("org.unifiedpush.android:connector:3.3.5")
+    // Calls: prebuilt libwebrtc (audio over DTLS-SRTP, signalled through the encrypted envelopes).
+    implementation("io.getstream:stream-webrtc-android:1.3.10")
 }

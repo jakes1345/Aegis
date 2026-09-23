@@ -149,6 +149,11 @@ async function route(request: Request, env: Env): Promise<Response> {
     return me.fetch(request);
   }
 
+  if (path === "/v1/turn" && request.method === "GET") {
+    if (!(await me.rateOk("turn", Mailbox.TURN_LIMIT))) throw new HttpError(429, "Too many requests; try again in a minute");
+    return json({ iceServers: await iceServers(env) });
+  }
+
   throw new HttpError(404, "Not found");
 }
 
@@ -225,6 +230,55 @@ function publicProfile(p: Profile) {
     listed: p.listed,
     createdAt: p.createdAt,
   };
+}
+
+/** An ICE server entry as WebRTC clients consume it. */
+interface IceServer {
+  urls: string[];
+  username?: string;
+  credential?: string;
+}
+
+const STUN_ONLY: IceServer[] = [{ urls: ["stun:stun.cloudflare.com:3478"] }];
+const TURN_TTL_S = 24 * 60 * 60;
+/** Credentials are minted for 24 h and handed out for at most 6 h, so a call never outlives them. */
+const TURN_CACHE_MS = 6 * 60 * 60_000;
+
+let turnCache: { servers: IceServer[]; expires: number } | null = null;
+
+/**
+ * ICE servers for a call. With a Cloudflare Realtime TURN key configured,
+ * short-lived TURN credentials are minted and cached in this isolate; without
+ * one, calls get STUN only and connect when both phones can reach each other
+ * directly. Media is DTLS-SRTP between the two phones either way: a TURN
+ * server forwards packets it cannot decrypt.
+ */
+async function iceServers(env: Env): Promise<IceServer[]> {
+  if (!env.TURN_KEY_ID || !env.TURN_KEY_API_TOKEN) return STUN_ONLY;
+  if (turnCache && turnCache.expires > Date.now()) return turnCache.servers;
+  const res = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${env.TURN_KEY_API_TOKEN}`, "content-type": "application/json" },
+    body: JSON.stringify({ ttl: TURN_TTL_S }),
+  });
+  if (!res.ok) {
+    console.error("TURN credential request failed", res.status, await res.text());
+    return turnCache?.servers ?? STUN_ONLY;
+  }
+  const body = (await res.json()) as { iceServers?: unknown };
+  const list = Array.isArray(body.iceServers) ? body.iceServers : body.iceServers ? [body.iceServers] : [];
+  const servers: IceServer[] = [];
+  for (const item of list as Array<Partial<IceServer> & { urls?: string | string[] }>) {
+    const urls = typeof item.urls === "string" ? [item.urls] : Array.isArray(item.urls) ? item.urls.filter((u): u is string => typeof u === "string") : [];
+    if (urls.length === 0) continue;
+    const entry: IceServer = { urls };
+    if (typeof item.username === "string") entry.username = item.username;
+    if (typeof item.credential === "string") entry.credential = item.credential;
+    servers.push(entry);
+  }
+  if (servers.length === 0) return STUN_ONLY;
+  turnCache = { servers, expires: Date.now() + TURN_CACHE_MS };
+  return servers;
 }
 
 /** Matches the app's `fingerprint()`: base64url of the first 12 bytes of SHA-256 over the key text. */

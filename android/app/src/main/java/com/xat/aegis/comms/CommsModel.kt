@@ -49,6 +49,28 @@ data class ChatMessage(
     val failed: Boolean get() = status == "failed"
 }
 
+/** Status value of a [ChatMessage] that records a call in the conversation. */
+const val STATUS_CALL = "call"
+
+enum class CallPhase { INCOMING, DIALING, CONNECTING, CONNECTED, RECONNECTING, ENDED }
+
+/** The one call this phone can be in, from ring to hang-up. */
+data class ActiveCall(
+    /** UUID chosen by the caller; both phones use it in every signal. */
+    val id: String,
+    val peer: Contact,
+    val direction: Direction,
+    val phase: CallPhase,
+    val startedAt: Long,
+    val connectedAt: Long = 0L,
+    val muted: Boolean = false,
+    val speaker: Boolean = false,
+    /** True once the media path is through a TURN relay rather than direct. */
+    val relayed: Boolean = false,
+    /** Why the call ended, once it has. */
+    val endReason: String? = null
+)
+
 data class ChatThread(
     val contact: Contact,
     val lastMessage: ChatMessage?,

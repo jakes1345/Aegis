@@ -19,6 +19,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- COMMS calls: the microphone for the call itself, audio routing for
+         speaker/earpiece, a microphone-type foreground service while a call is
+         up, and a full-screen ring for incoming calls when the screen is off. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
     <!-- Wi-Fi anomaly scan reads the system's cached scan results only -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
@@ -131,6 +139,21 @@
                 <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
             </intent-filter>
         </service>
+
+        <!--
+            An encrypted call in progress: holds the microphone and the WebRTC
+            connection while the owner talks. Started only from the app's own
+            screen (placing a call, or accepting one from its notification).
+        -->
+        <service
+            android:name=".comms.CallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+        <!-- Decline / hang-up buttons on call notifications. -->
+        <receiver
+            android:name=".comms.CallActionReceiver"
+            android:exported="false" />
 
         <!-- Portrait QR scanner for pairing; the library's default is landscape. -->
         <activity

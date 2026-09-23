@@ -138,6 +138,22 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
         signed("POST", "/v1/ack", JSONObject().put("ids", JSONArray(ids)))
     }
 
+    /** One STUN or TURN server for a call, as the relay hands it out. */
+    data class IceServer(val urls: List<String>, val username: String?, val credential: String?)
+
+    /** ICE servers for a call: STUN always, TURN with short-lived credentials when the relay has a key. */
+    fun turn(): List<IceServer> {
+        val json = signed("GET", "/v1/turn")
+        return parsed {
+            val arr = json.getJSONArray("iceServers")
+            (0 until arr.length()).mapNotNull { i ->
+                val o = arr.getJSONObject(i)
+                val urls = o.optJSONArray("urls")?.let { u -> (0 until u.length()).map { u.getString(it) } } ?: return@mapNotNull null
+                IceServer(urls, o.optString("username").takeIf { it.isNotEmpty() }, o.optString("credential").takeIf { it.isNotEmpty() })
+            }
+        }
+    }
+
     /** Opens the live-delivery socket. The caller owns the returned socket. */
     fun openSocket(listener: WebSocketListener): WebSocket {
         val request = signedRequest("GET", "/v1/ws", null).build()
