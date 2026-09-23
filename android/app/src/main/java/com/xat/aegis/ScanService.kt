@@ -1,6 +1,7 @@
 package com.xat.aegis
 
 import android.Manifest
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -187,11 +188,21 @@ class ScanService : LifecycleService() {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
             )
         } catch (e: Exception) {
-            // SecurityException when location access is missing, or
-            // ForegroundServiceStartNotAllowedException (an IllegalStateException)
-            // when the system refuses a start from the background.
+            // Each refusal has its own remedy, so each gets its own message. They all
+            // used to read "Location permission required", which sent someone whose
+            // permissions were fine off to the settings page after a background start
+            // was simply refused.
+            val message = when (e) {
+                // A location-typed foreground service is refused without location access.
+                is SecurityException -> "Location permission required to scan"
+                // Android 12+ refuses to start a foreground service from the background
+                // (boot, a stale notification tap); the user has to bring Aegis to the front.
+                is ForegroundServiceStartNotAllowedException ->
+                    "Android blocked starting the scanner in the background — open Aegis and tap Start"
+                else -> "The scanner could not start (${e.javaClass.simpleName})"
+            }
             running = false
-            Registry.update { it.copy(scanning = false, error = "Location permission required to scan") }
+            Registry.update { it.copy(scanning = false, error = message) }
             stopSelf()
             return START_NOT_STICKY
         }

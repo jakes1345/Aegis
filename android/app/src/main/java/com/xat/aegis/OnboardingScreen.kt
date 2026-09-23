@@ -77,9 +77,13 @@ fun OnboardingScreen(startScanService: () -> Unit, onComplete: () -> Unit) {
         if (pagerState.currentPage < TOTAL_PAGES - 1) {
             TextButton(
                 onClick = { scope.launch { pagerState.scrollToPage(TOTAL_PAGES - 1) } },
+                // The window is edge-to-edge, so the system bars are measured, not
+                // guessed: a fixed 48 dp put SKIP under a tall status bar and left a
+                // gap under a short one.
                 modifier = Modifier
                     .align(Alignment.TopEnd)
-                    .padding(top = 48.dp, end = 16.dp)
+                    .statusBarsPadding()
+                    .padding(top = 8.dp, end = 16.dp)
             ) {
                 Text("SKIP", color = OMutedClr, fontSize = 12.sp, letterSpacing = 1.sp)
             }
@@ -89,7 +93,8 @@ fun OnboardingScreen(startScanService: () -> Unit, onComplete: () -> Unit) {
         Column(
             Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = 52.dp),
+                .navigationBarsPadding()
+                .padding(bottom = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(20.dp)
         ) {
