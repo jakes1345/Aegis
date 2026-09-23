@@ -56,6 +56,9 @@ const ENVELOPE_TTL_MS = 30 * 24 * 60 * 60_000;
 const MAX_ONE_TIME_KEYS = 100;
 const NONCE_WINDOW_MS = 5 * 60_000;
 const LOOKUP_LIMIT_PER_MINUTE = 30;
+const SEND_LIMIT_PER_MINUTE = 120;
+/** Durable Object storage deletes at most this many keys per call. */
+const DELETE_BATCH = 128;
 
 interface NonceRecord {
   [nonce: string]: number;
@@ -161,6 +164,16 @@ export class Mailbox extends DurableObject<Env> {
   }
 
   static readonly LOOKUP_LIMIT = LOOKUP_LIMIT_PER_MINUTE;
+  static readonly SEND_LIMIT = SEND_LIMIT_PER_MINUTE;
+
+  /** storage.delete() takes at most 128 keys; larger sets go in batches. */
+  private async deleteKeys(keys: string[]): Promise<number> {
+    let removed = 0;
+    for (let i = 0; i < keys.length; i += DELETE_BATCH) {
+      removed += await this.ctx.storage.delete(keys.slice(i, i + DELETE_BATCH));
+    }
+    return removed;
+  }
 
   /** Deletes everything about this number. */
   async wipe(): Promise<void> {
@@ -216,7 +229,7 @@ export class Mailbox extends DurableObject<Env> {
   /** Deletes envelopes the owner has stored locally. */
   async ack(ids: string[]): Promise<number> {
     const keys = ids.map((id) => `q:${id}`);
-    const removed = await this.ctx.storage.delete(keys);
+    const removed = await this.deleteKeys(keys);
     const count = (await this.ctx.storage.get<number>("queueCount")) ?? 0;
     await this.ctx.storage.put("queueCount", Math.max(0, count - removed));
     return removed;
@@ -228,7 +241,7 @@ export class Mailbox extends DurableObject<Env> {
     const map = await this.ctx.storage.list<Envelope>({ prefix: "q:" });
     const stale = [...map.values()].filter((e) => e.ts < cutoff).map((e) => `q:${e.id}`);
     if (stale.length > 0) {
-      const removed = await this.ctx.storage.delete(stale);
+      const removed = await this.deleteKeys(stale);
       const count = (await this.ctx.storage.get<number>("queueCount")) ?? 0;
       await this.ctx.storage.put("queueCount", Math.max(0, count - removed));
     }

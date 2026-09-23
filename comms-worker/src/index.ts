@@ -106,16 +106,22 @@ async function route(request: Request, env: Env): Promise<Response> {
     const them = env.MAILBOX.get(env.MAILBOX.idFromName(target));
     // Unlisted numbers are only handed out to a caller who already holds the
     // owner's identity key (from a QR scan) and proves it with its fingerprint.
-    let bundle = await them.bundle(pin === null);
-    if (!bundle && pin !== null) {
+    // The pin is checked before any key is claimed, so a wrong pin neither
+    // reveals the bundle nor consumes a one-time key.
+    let bundle = null;
+    if (pin === null) {
+      bundle = await them.bundle(true);
+    } else {
       const p = await them.profile();
-      if (p && (await fingerprint(p.ed25519)) === pin) bundle = await them.bundle(false);
+      if (p && timingSafeEqual(await fingerprint(p.ed25519), pin)) bundle = await them.bundle(false);
     }
     if (!bundle) throw new HttpError(404, "No such Aegis number, or it is unlisted");
     return json({ bundle });
   }
 
   if (path === "/v1/send" && request.method === "POST") {
+    // Per-sender cap, so one registered identity cannot fill another's mailbox.
+    if (!(await me.rateOk("send", Mailbox.SEND_LIMIT))) throw new HttpError(429, "Too many messages; try again in a minute");
     const body = parseJson<{ to?: unknown; envelope?: unknown }>(bodyText);
     const to = typeof body.to === "string" ? normaliseNumber(body.to) : null;
     if (!to) throw new HttpError(400, "to must be an Aegis number");

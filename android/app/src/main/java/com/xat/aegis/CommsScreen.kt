@@ -4,9 +4,10 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
-import android.content.pm.PackageManager
+import android.content.Intent
 import android.graphics.Bitmap
 import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -40,7 +41,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
@@ -528,13 +531,39 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
     var sendError by remember(peer) { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
 
-    // While this conversation is on screen its messages are read on arrival and raise no notification.
-    DisposableEffect(peer) {
-        CommsRepository.openPeer = peer
-        CommsNotifications.cancel(context, peer)
-        onDispose { if (CommsRepository.openPeer == peer) CommsRepository.openPeer = null }
+    // While this conversation is on screen and the app is in the foreground, its
+    // messages are read on arrival and raise no notification. The composition
+    // survives Home and the screen turning off, so the lifecycle decides, not
+    // the composition: otherwise a message that arrived to a pocketed phone
+    // would be receipted as read.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var resumed by remember { mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) }
+    DisposableEffect(peer, lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    resumed = true
+                    CommsRepository.openPeer = peer
+                    CommsNotifications.cancel(context, peer)
+                }
+                Lifecycle.Event.ON_PAUSE -> {
+                    resumed = false
+                    if (CommsRepository.openPeer == peer) CommsRepository.openPeer = null
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        if (resumed) {
+            CommsRepository.openPeer = peer
+            CommsNotifications.cancel(context, peer)
+        }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            if (CommsRepository.openPeer == peer) CommsRepository.openPeer = null
+        }
     }
-    LaunchedEffect(peer, version) { CommsRepository.markRead(peer) }
+    LaunchedEffect(peer, version, resumed) { if (resumed) CommsRepository.markRead(peer) }
     LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1) }
 
     val c = contact
@@ -647,9 +676,13 @@ private fun VerifyScreen(peer: String, onBack: () -> Unit, onDeleted: () -> Unit
     val version by CommsRepository.version.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
-    val contact by produceState<Contact?>(initialValue = null, version, peer) {
-        value = withContext(Dispatchers.IO) { CommsRepository.contact(peer) }
+    // Loading and "no such contact" are different states: the first render has
+    // not looked the contact up yet and must not navigate away.
+    val lookup by produceState<Pair<Boolean, Contact?>>(initialValue = false to null, version, peer) {
+        value = true to withContext(Dispatchers.IO) { CommsRepository.contact(peer) }
     }
+    val (loaded, contact) = lookup
+    if (!loaded) return
     val c = contact ?: run {
         LaunchedEffect(Unit) { onDeleted() }
         return
@@ -801,13 +834,29 @@ private fun CommsSettingsScreen(onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     var name by rememberSaveable(state.displayName) { mutableStateOf(state.displayName) }
     var confirmUnpair by remember { mutableStateOf(false) }
-    var notificationsGranted by remember {
-        mutableStateOf(
-            Build.VERSION.SDK_INT < 33 ||
-                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-        )
-    }
+    var notificationsGranted by remember { mutableStateOf(CommsNotifications.canPost(context)) }
     val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { notificationsGranted = it }
+    // Re-check after coming back from the system notification settings.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) notificationsGranted = CommsNotifications.canPost(context)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val allowNotifications: () -> Unit = {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            // Before API 33 there is no runtime permission; the switch lives in system settings.
+            context.startActivity(
+                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
+    }
 
     if (confirmUnpair) {
         AlertDialog(
@@ -858,7 +907,7 @@ private fun CommsSettingsScreen(onBack: () -> Unit) {
             if (!notificationsGranted) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text("Notifications are off, so new messages will not show until you open Aegis.", color = CCaution, fontSize = 11.sp, modifier = Modifier.weight(1f))
-                    SmallButton("ALLOW", CAccent) { askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS) }
+                    SmallButton("ALLOW", CAccent, onClick = allowNotifications)
                 }
             }
             Text(

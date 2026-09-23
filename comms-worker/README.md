@@ -13,10 +13,14 @@ giving them your real number or your identity key.
 ## What the relay sees
 
 - The public keys of each registered identity (they are public by design).
-- For each envelope: the recipient's Aegis number, a size and a timestamp.
-  Not the sender, not the content. Envelopes are sealed to the recipient's
-  sealing key with an anonymous box, and inside that sits an Olm double-ratchet
-  message the relay could not read even if it opened the box.
+- For each envelope: the recipient's Aegis number, a size and a timestamp, and,
+  at the moment it is sent, the sender's Aegis number, because the send request
+  is signed by the sender. The relay does not store the sender with the
+  envelope, and a queued envelope names only its recipient, but a relay
+  operator who logs requests can see who sent to whom and when. Never the
+  content: envelopes are sealed to the recipient's sealing key with an
+  anonymous box, and inside that sits an Olm double-ratchet message the relay
+  could not read even if it opened the box.
 - The UnifiedPush endpoint an owner registers, if any, which it POSTs the word
   "wake" to when a live socket is not connected.
 

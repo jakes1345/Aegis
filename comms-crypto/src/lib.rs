@@ -427,6 +427,16 @@ impl Identity {
                 if prekey.identity_key() != sender_identity {
                     return Err(CryptoError::Decrypt { reason: "sender key does not match the pre-key message".into() });
                 }
+                // A pre-key message that already created one of our sessions is a
+                // replay: with a fallback key it would otherwise succeed again,
+                // duplicate the session and hand back stale plaintext.
+                let replayed = inner
+                    .sessions
+                    .get(&msg.s)
+                    .is_some_and(|list| list.iter().any(|s| s.session_id() == prekey.session_id()));
+                if replayed {
+                    return Err(CryptoError::Decrypt { reason: "replayed pre-key message".into() });
+                }
                 let created = inner
                     .account
                     .create_inbound_session(SessionConfig::version_2(), sender_identity, &prekey)
@@ -585,6 +595,25 @@ mod tests {
         alice.start_session(peer_keys(&bob), fallback).unwrap();
         let env = alice.encrypt(peer_keys(&bob), b"via fallback".to_vec()).unwrap();
         assert_eq!(bob.decrypt(env).unwrap().plaintext, b"via fallback");
+    }
+
+    #[test]
+    fn replayed_prekey_message_is_rejected() {
+        let alice = Identity::create();
+        let bob = Identity::create();
+        // The fallback key stays on the account after use, so without the
+        // replay check a second delivery would create a duplicate session.
+        let fallback = bob.public_bundle().fallback.expect("fallback key present");
+        alice.start_session(peer_keys(&bob), fallback).unwrap();
+        let env = alice.encrypt(peer_keys(&bob), b"first".to_vec()).unwrap();
+        let first = bob.decrypt(env.clone()).unwrap();
+        assert!(first.new_session);
+        let again = bob.decrypt(env);
+        assert!(matches!(again, Err(CryptoError::Decrypt { .. })), "replay accepted: {again:?}");
+        assert_eq!(bob.inner.lock().unwrap().sessions[&alice.curve25519()].len(), 1);
+        // The session itself keeps working after the rejected replay.
+        let env2 = alice.encrypt(peer_keys(&bob), b"second".to_vec()).unwrap();
+        assert_eq!(bob.decrypt(env2).unwrap().plaintext, b"second");
     }
 
     #[test]

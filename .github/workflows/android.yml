@@ -13,6 +13,10 @@ on:
       - '.github/workflows/android.yml'
   workflow_dispatch:
 
+# The job only reads the repository; third-party actions get no wider token.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest

@@ -42,6 +42,17 @@ class CommsConfig(context: Context) {
 
     fun clear() { prefs.edit().clear().apply() }
 
+    /**
+     * Removes what the Twilio-era module kept in this same preferences file:
+     * its worker URL, device token, sync cursors and voice token, and the phone
+     * number that went with them. Runs once; a file without the old keys is
+     * left alone.
+     */
+    fun purgeLegacy() {
+        if (LEGACY_KEYS.none { prefs.contains(it) }) return
+        prefs.edit().apply { LEGACY_KEYS.forEach { remove(it) }; remove(KEY_NUMBER) }.apply()
+    }
+
     private companion object {
         const val PREFS = "comms"
         const val KEY_RELAY = "relay_url"
@@ -50,5 +61,9 @@ class CommsConfig(context: Context) {
         const val KEY_LISTED = "listed"
         const val KEY_ONLINE = "online"
         const val KEY_PUSH = "push_endpoint"
+        val LEGACY_KEYS = listOf(
+            "worker_url", "device_id", "token_enc", "sync_seq", "sync_updated",
+            "push_token", "sync_calls", "voice_token", "voice_at"
+        )
     }
 }

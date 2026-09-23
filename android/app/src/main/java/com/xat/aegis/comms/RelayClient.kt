@@ -8,6 +8,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import uniffi.aegis_comms_crypto.Identity
 import uniffi.aegis_comms_crypto.PublicBundle
@@ -32,6 +33,10 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .pingInterval(45, TimeUnit.SECONDS)
+        // Signed requests carry identity headers and the registration body carries
+        // the enrollment secret; neither may be re-sent to wherever a redirect points.
+        .followRedirects(false)
+        .followSslRedirects(false)
         .build()
 
     data class Registered(val number: String)
@@ -68,7 +73,7 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
             .header("X-Aegis-Sig", identity.sign(body.toByteArray(Charsets.UTF_8)))
             .post(body.toRequestBody(JSON))
         val json = execute(request)
-        return Registered(json.getString("number"))
+        return parsed { Registered(json.getString("number")) }
     }
 
     // ── Own mailbox ───────────────────────────────────────────────────────
@@ -77,7 +82,7 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
 
     fun me(): Me {
         val json = signed("GET", "/v1/me")
-        return Me(json.getJSONObject("profile").optBoolean("listed", true), json.optInt("oneTimeKeys", 0))
+        return parsed { Me(json.getJSONObject("profile").optBoolean("listed", true), json.optInt("oneTimeKeys", 0)) }
     }
 
     fun putKeys(bundle: PublicBundle): Int {
@@ -98,27 +103,34 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
     /** A contact's keys plus one key to start a session; [pin] unlocks an unlisted number. */
     fun bundle(number: String, pin: String?): Bundle {
         val path = "/v1/bundle/$number" + (pin?.let { "?pin=$it" } ?: "")
-        val b = signed("GET", path).getJSONObject("bundle")
-        val key = b.optJSONObject("oneTimeKey") ?: b.optJSONObject("fallback")
-            ?: throw RelayException("The relay has no session key for that number")
-        return Bundle(
-            number = b.getString("number"),
-            ed25519 = b.getString("ed25519"),
-            curve25519 = b.getString("curve25519"),
-            sealing = b.getString("sealing"),
-            signature = b.getString("signature"),
-            sessionKey = SignedKey(key.getString("id"), key.getString("key"), key.getString("signature"))
-        )
+        val json = signed("GET", path)
+        return parsed {
+            val b = json.getJSONObject("bundle")
+            val key = b.optJSONObject("oneTimeKey") ?: b.optJSONObject("fallback")
+                ?: throw RelayException("The relay has no session key for that number", MALFORMED)
+            Bundle(
+                number = b.getString("number"),
+                ed25519 = b.getString("ed25519"),
+                curve25519 = b.getString("curve25519"),
+                sealing = b.getString("sealing"),
+                signature = b.getString("signature"),
+                sessionKey = SignedKey(key.getString("id"), key.getString("key"), key.getString("signature"))
+            )
+        }
     }
 
     fun send(to: String, envelope: ByteArray): String {
         val body = JSONObject().put("to", to).put("envelope", Base64.encodeToString(envelope, Base64.NO_WRAP))
-        return signed("POST", "/v1/send", body).getString("id")
+        val json = signed("POST", "/v1/send", body)
+        return parsed { json.getString("id") }
     }
 
     fun inbox(): List<Envelope> {
-        val arr = signed("GET", "/v1/inbox").getJSONArray("envelopes")
-        return (0 until arr.length()).map { parseEnvelope(arr.getJSONObject(it)) }
+        val json = signed("GET", "/v1/inbox")
+        return parsed {
+            val arr = json.getJSONArray("envelopes")
+            (0 until arr.length()).map { parseEnvelope(arr.getJSONObject(it)) }
+        }
     }
 
     fun ack(ids: List<String>) {
@@ -132,8 +144,22 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
         return http.newWebSocket(request, listener)
     }
 
-    fun parseEnvelope(o: JSONObject): Envelope =
+    fun parseEnvelope(o: JSONObject): Envelope = parsed {
         Envelope(o.getString("id"), o.getLong("ts"), Base64.decode(o.getString("data"), Base64.NO_WRAP))
+    }
+
+    /**
+     * Runs response parsing, turning a missing or malformed field into a
+     * [RelayException] with [MALFORMED] so a version mismatch or a hostile relay
+     * fails the one call instead of crashing the process.
+     */
+    private inline fun <T> parsed(block: () -> T): T = try {
+        block()
+    } catch (e: JSONException) {
+        throw RelayException("The relay returned an unexpected response: ${e.message}", MALFORMED)
+    } catch (e: IllegalArgumentException) {
+        throw RelayException("The relay returned an unexpected response: ${e.message}", MALFORMED)
+    }
 
     // ── Signing ───────────────────────────────────────────────────────────
 
@@ -187,7 +213,9 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
     private fun sha256Hex(text: String): String =
         MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 
-    private companion object {
-        val JSON = "application/json; charset=utf-8".toMediaType()
+    companion object {
+        /** [RelayException.code] for a response the client could not parse; not a network failure. */
+        const val MALFORMED = -1
+        private val JSON = "application/json; charset=utf-8".toMediaType()
     }
 }

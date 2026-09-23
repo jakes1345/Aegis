@@ -84,6 +84,10 @@ object CommsRepository {
         if (initialised) return
         appContext = context.applicationContext
         config = CommsConfig(appContext)
+        // The Twilio-era module left plaintext phone numbers and Keystore-readable
+        // SMS bodies in its own database, with no screen left to delete them from.
+        appContext.deleteDatabase("comms.db")
+        config.purgeLegacy()
         identities = IdentityStore(appContext)
         store = CommsStore(appContext)
         relay = RelayClient(identities, config)
@@ -305,6 +309,11 @@ object CommsRepository {
                 if (!verify(bundle.ed25519, "${bundle.curve25519}|${bundle.sealing}".toByteArray(Charsets.UTF_8), bundle.signature)) {
                     throw RelayException("The relay returned keys that are not signed by that number's identity key")
                 }
+                store.contactByCurve(bundle.curve25519)?.let { other ->
+                    // A relay answering with another contact's real keys would otherwise
+                    // let messages from that identity land under this number.
+                    throw RelayException("The relay returned keys that already belong to ${other.name.ifBlank { formatAegisNumber(other.number) }}")
+                }
                 val peer = PeerKeys(bundle.ed25519, bundle.curve25519, bundle.sealing, bundle.signature)
                 // The relay handed out one of their one-time keys; use it now rather than waste it.
                 identities.update { it.startSession(peer, bundle.sessionKey) }
@@ -410,13 +419,16 @@ object CommsRepository {
     /** Encrypts [payload] for [contact] (starting a session if needed) and hands it to the relay. Caller holds [lock]. */
     private fun deliver(contact: Contact, payload: JSONObject): Deliver {
         val identity = identities.get() ?: return Deliver.Failed("No identity on this device")
+        val label = contact.name.ifBlank { formatAegisNumber(contact.number) }
+        // Nothing goes to keys the owner has not looked at since they changed.
+        if (contact.keyChanged) return Deliver.Failed("$label's keys have changed. Scan their code or compare safety numbers before messaging them.")
         val peer = PeerKeys(contact.ed25519, contact.curve25519, contact.sealing, contact.signature)
         try {
             if (!identity.hasSession(contact.curve25519)) {
                 val bundle = relay.bundle(contact.number, fingerprint(contact.ed25519))
                 if (bundle.ed25519 != contact.ed25519 || bundle.curve25519 != contact.curve25519 || bundle.sealing != contact.sealing) {
                     store.upsertContact(contact.copy(keyChanged = true, verified = false))
-                    return Deliver.Failed("${contact.name.ifBlank { formatAegisNumber(contact.number) }}'s keys have changed. Scan their code again before messaging them.")
+                    return Deliver.Failed("$label's keys have changed. Scan their code again before messaging them.")
                 }
                 identities.update { it.startSession(peer, bundle.sessionKey) }
             }
@@ -425,6 +437,9 @@ object CommsRepository {
             return Deliver.Sent
         } catch (e: CryptoException) {
             return Deliver.Failed("Encryption failed: ${e.message}")
+        } catch (e: IllegalStateException) {
+            // The identity could not be persisted; nothing was sent, so nothing is lost.
+            return Deliver.Failed(e.message ?: "The identity could not be saved")
         } catch (e: RelayException) {
             return when (e.code) {
                 404 -> Deliver.Failed("No such Aegis number on this relay any more")
@@ -456,18 +471,27 @@ object CommsRepository {
 
     /**
      * Opens one envelope from the relay and acts on it. Returns true when the
-     * relay may delete it: it was stored, was a duplicate, or can never be read.
-     * False means "try again later" (the relay was needed and unreachable).
+     * relay may delete it: it was stored, was a duplicate, can never be read, or
+     * (when its sender still has to be confirmed with an unreachable relay) its
+     * decrypted payload is held locally and retried on the next sync. Once the
+     * ratchet has opened an envelope the relay's copy is useless, so the only
+     * case that keeps it on the relay is the ratchet step itself failing to be
+     * saved, which returns false.
      */
     suspend fun handleEnvelope(envelope: RelayClient.Envelope): Boolean = withContext(Dispatchers.IO) {
-        lock.withLock { handleLocked(envelope) }.also { bump() }
+        try {
+            lock.withLock { handleLocked(envelope) }
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "envelope ${envelope.id} left queued: ${e.message}")
+            false
+        }.also { bump() }
     }
 
     private fun handleLocked(envelope: RelayClient.Envelope): Boolean {
-        if (!store.markEnvelopeSeen(envelope.id, envelope.ts)) return true
         val decrypted = try {
             identities.update { it.decrypt(envelope.data) }
         } catch (e: CryptoException.NoSessionFor) {
+            store.markEnvelopeSeen(envelope.id, envelope.ts)
             store.contactByCurve(e.senderCurve25519)?.let { contact ->
                 Log.w(TAG, "no session for ${contact.number}; asking for a new one")
                 identities.update { it.dropSessions(contact.curve25519) }
@@ -475,19 +499,51 @@ object CommsRepository {
             }
             return true
         } catch (e: CryptoException) {
+            store.markEnvelopeSeen(envelope.id, envelope.ts)
             Log.w(TAG, "undecryptable envelope ${envelope.id}: ${e.message}")
             return true
+        } catch (e: IllegalStateException) {
+            // The ratchet step could not be saved; leave the envelope on the relay.
+            Log.w(TAG, "identity not persisted, envelope ${envelope.id} left queued: ${e.message}")
+            return false
         }
-        val json = runCatching { JSONObject(String(decrypted.plaintext, Charsets.UTF_8)) }.getOrNull() ?: return true
+        if (!store.markEnvelopeSeen(envelope.id, envelope.ts)) return true
+        val text = String(decrypted.plaintext, Charsets.UTF_8)
+        val json = runCatching { JSONObject(text) }.getOrNull() ?: return true
         if (json.optInt("v", 0) != 1) return true
 
-        val contact = resolveSender(decrypted.senderCurve25519, json) ?: return true
+        when (val resolved = resolveSender(decrypted.senderCurve25519, json)) {
+            is Resolution.Found -> processPayload(resolved.contact, envelope.ts, json)
+            Resolution.Rejected -> Unit
+            Resolution.Unreachable -> {
+                Log.w(TAG, "relay unreachable while confirming the sender of ${envelope.id}; holding it")
+                store.savePending(envelope.id, envelope.ts, decrypted.senderCurve25519, text)
+            }
+        }
+        return true
+    }
+
+    /** Retries payloads whose sender could not be confirmed earlier. Caller holds [lock]. */
+    private fun retryPendingLocked() {
+        for (p in store.pending()) {
+            val json = runCatching { JSONObject(p.payload) }.getOrNull()
+            if (json == null) { store.deletePending(p.id); continue }
+            when (val resolved = resolveSender(p.senderCurve25519, json)) {
+                is Resolution.Found -> { processPayload(resolved.contact, p.ts, json); store.deletePending(p.id) }
+                Resolution.Rejected -> store.deletePending(p.id)
+                Resolution.Unreachable -> return
+            }
+        }
+    }
+
+    /** Acts on a decrypted payload from a known contact. Caller holds [lock]. */
+    private fun processPayload(contact: Contact, envelopeTs: Long, json: JSONObject) {
         when (json.optString("t")) {
             "msg" -> {
-                val id = json.optString("id").takeIf { it.isNotBlank() } ?: return true
+                val id = json.optString("id").takeIf { it.isNotBlank() } ?: return
                 val body = json.optString("body").take(MAX_BODY)
-                if (store.hasMessage(id)) return true
-                val ts = json.optLong("ts", envelope.ts).coerceIn(envelope.ts - 7L * 24 * 3600_000L, System.currentTimeMillis() + 60_000L)
+                if (store.hasMessage(id)) return
+                val ts = json.optLong("ts", envelopeTs).coerceIn(envelopeTs - 7L * 24 * 3600_000L, System.currentTimeMillis() + 60_000L)
                 val onScreen = openPeer == contact.number
                 store.insertMessage(ChatMessage(id, contact.number, Direction.IN, body, ts, "received", read = onScreen))
                 sendControl(contact, JSONObject().put("v", 1).put("t", "receipt").put("status", if (onScreen) "read" else "delivered").put("ids", JSONArray(listOf(id))))
@@ -511,7 +567,14 @@ object CommsRepository {
                 Log.i(TAG, "resync from ${contact.number}")
             }
         }
-        return true
+    }
+
+    private sealed class Resolution {
+        class Found(val contact: Contact) : Resolution()
+        /** The payload claims a number its keys do not hold, or is malformed; drop it. */
+        object Rejected : Resolution()
+        /** The relay was needed to confirm the sender and could not be reached; retry later. */
+        object Unreachable : Resolution()
     }
 
     /**
@@ -520,17 +583,21 @@ object CommsRepository {
      * unverified contact once the relay confirms that number publishes exactly
      * those keys, so nobody can send as a number they do not hold.
      */
-    private fun resolveSender(senderCurve: String, json: JSONObject): Contact? {
-        store.contactByCurve(senderCurve)?.let { return it }
-        val from = parseAegisNumber(json.optString("from")) ?: return null
+    private fun resolveSender(senderCurve: String, json: JSONObject): Resolution {
+        store.contactByCurve(senderCurve)?.let { return Resolution.Found(it) }
+        val from = parseAegisNumber(json.optString("from")) ?: return Resolution.Rejected
         val ed = json.optString("k"); val curve = json.optString("c"); val sealing = json.optString("s"); val sig = json.optString("g")
-        if (curve != senderCurve || ed.isBlank() || sealing.isBlank() || sig.isBlank()) return null
-        if (!verify(ed, "$curve|$sealing".toByteArray(Charsets.UTF_8), sig)) return null
-        val relayView = runCatching { relay.bundle(from, fingerprint(ed)) }.getOrElse { e ->
+        if (curve != senderCurve || ed.isBlank() || sealing.isBlank() || sig.isBlank()) return Resolution.Rejected
+        if (!verify(ed, "$curve|$sealing".toByteArray(Charsets.UTF_8), sig)) return Resolution.Rejected
+        val relayView = try {
+            relay.bundle(from, fingerprint(ed))
+        } catch (e: RelayException) {
             Log.w(TAG, "could not confirm sender $from with the relay: ${e.message}")
-            return null
+            // 404 means the relay has no such number, or the pin (their identity key)
+            // does not match it: the claim is false. Anything else is the relay's problem.
+            return if (e.code == 404) Resolution.Rejected else Resolution.Unreachable
         }
-        if (relayView.ed25519 != ed || relayView.curve25519 != curve || relayView.sealing != sealing) return null
+        if (relayView.ed25519 != ed || relayView.curve25519 != curve || relayView.sealing != sealing) return Resolution.Rejected
         val existing = store.contact(from)
         val contact = if (existing != null) {
             // Same number, different keys: keep the pinned name, flag it, trust nothing.
@@ -544,7 +611,7 @@ object CommsRepository {
             )
         }
         store.upsertContact(contact)
-        return contact
+        return Resolution.Found(contact)
     }
 
     // ── Sync ──────────────────────────────────────────────────────────────
@@ -554,6 +621,7 @@ object CommsRepository {
         if (!config.isRegistered) return@withContext Result.success(Unit)
         setBusy(true)
         try {
+            lock.withLock { retryPendingLocked() }
             val envelopes = relay.inbox()
             val done = ArrayList<String>()
             for (env in envelopes) if (lock.withLock { handleLocked(env) }) done += env.id

@@ -40,23 +40,39 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             )"""
         )
         db.execSQL("CREATE INDEX messages_peer_ts ON messages (peer, ts)")
-        // Envelopes accepted from the relay but not yet processed, so nothing is
-        // acknowledged (and deleted on the relay) before it is safely stored.
+        // Envelope ids already opened, so a redelivery is never processed twice.
         db.execSQL(
             """CREATE TABLE seen_envelopes (
                 id TEXT PRIMARY KEY,
                 ts INTEGER NOT NULL
             )"""
         )
+        // Decrypted payloads whose sender could not be confirmed with the relay
+        // yet (it was unreachable). The ratchet has moved on, so the plaintext
+        // is kept here, encrypted, until the next sync resolves the sender.
+        db.execSQL(
+            """CREATE TABLE pending_inbound (
+                id TEXT PRIMARY KEY,
+                ts INTEGER NOT NULL,
+                sender TEXT NOT NULL,
+                payload_enc BLOB NOT NULL
+            )"""
+        )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Version 1 is the first schema for the end-to-end module; the Twilio-era
-        // tables lived in a database of a different name and are left untouched.
+        // Version 1 is the first schema for the end-to-end module. The Twilio-era
+        // database (comms.db) is deleted by CommsRepository.init on first run.
     }
 
     // ── Contacts ─────────────────────────────────────────────────────────
 
+    /**
+     * Inserts or updates the contact with this number. A different contact that
+     * already holds the same Curve25519 key makes this throw
+     * [android.database.sqlite.SQLiteConstraintException] rather than silently
+     * deleting that contact, which is what SQLite's REPLACE would do.
+     */
     fun upsertContact(c: Contact) {
         val values = ContentValues().apply {
             put("number", c.number)
@@ -69,7 +85,15 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             put("key_changed", if (c.keyChanged) 1 else 0)
             put("added_ts", c.addedTs)
         }
-        writableDatabase.insertWithOnConflict("contacts", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val updated = db.update("contacts", values, "number = ?", arrayOf(c.number))
+            if (updated == 0) db.insertOrThrow("contacts", null, values)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
     fun contact(number: String): Contact? =
@@ -205,11 +229,46 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         return row != -1L
     }
 
+    // ── Inbound payloads awaiting sender confirmation ────────────────────
+
+    data class PendingInbound(val id: String, val ts: Long, val senderCurve25519: String, val payload: String)
+
+    fun savePending(id: String, ts: Long, senderCurve25519: String, payload: String) {
+        val values = ContentValues().apply {
+            put("id", id)
+            put("ts", ts)
+            put("sender", senderCurve25519)
+            put("payload_enc", KeystoreBox.encryptString(payload))
+        }
+        writableDatabase.insertWithOnConflict("pending_inbound", null, values, SQLiteDatabase.CONFLICT_IGNORE)
+    }
+
+    fun pending(): List<PendingInbound> =
+        readableDatabase.query("pending_inbound", null, null, null, null, null, "ts ASC").use { c ->
+            val out = ArrayList<PendingInbound>()
+            while (c.moveToNext()) {
+                val payload = runCatching { KeystoreBox.decryptString(c.getBlob(c.getColumnIndexOrThrow("payload_enc"))) }
+                    .getOrNull() ?: continue
+                out += PendingInbound(
+                    c.getString(c.getColumnIndexOrThrow("id")),
+                    c.getLong(c.getColumnIndexOrThrow("ts")),
+                    c.getString(c.getColumnIndexOrThrow("sender")),
+                    payload
+                )
+            }
+            out
+        }
+
+    fun deletePending(id: String) {
+        writableDatabase.delete("pending_inbound", "id = ?", arrayOf(id))
+    }
+
     fun clearAll() {
         val db = writableDatabase
         db.delete("messages", null, null)
         db.delete("contacts", null, null)
         db.delete("seen_envelopes", null, null)
+        db.delete("pending_inbound", null, null)
     }
 
     private fun readContact(c: Cursor) = Contact(

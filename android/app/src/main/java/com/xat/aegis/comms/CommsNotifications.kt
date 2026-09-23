@@ -8,7 +8,9 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.xat.aegis.MainActivity
 
@@ -47,12 +49,23 @@ object CommsNotifications {
         )
     }
 
+    /**
+     * Whether a message notification would be shown. POST_NOTIFICATIONS is a
+     * runtime permission only from API 33; on 31 and 32 the permission check
+     * reports "denied" for a permission that does not exist there, so those
+     * versions ask the notification manager instead.
+     */
+    fun canPost(context: Context): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        } else {
+            NotificationManagerCompat.from(context).areNotificationsEnabled()
+        }
+
     /** Posts (or replaces) the notification for [contact] with the newest inbound messages. */
     fun notifyInbound(context: Context, contact: Contact, messages: List<ChatMessage>) {
         if (messages.isEmpty()) return
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
-        ) return
+        if (!canPost(context)) return
         ensureChannels(context)
 
         val open = Intent(context, MainActivity::class.java)

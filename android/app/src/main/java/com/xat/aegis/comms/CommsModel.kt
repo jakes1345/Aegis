@@ -98,10 +98,14 @@ data class PairingCode(
         fun decode(text: String): PairingCode? {
             val t = text.trim()
             if (!t.startsWith("aegis:v1?")) return null
-            val params = t.removePrefix("aegis:v1?").split("&").mapNotNull { part ->
-                val i = part.indexOf('=')
-                if (i <= 0) null else part.substring(0, i) to java.net.URLDecoder.decode(part.substring(i + 1), "UTF-8")
-            }.toMap()
+            // Any scanned QR code lands here; a malformed percent escape is
+            // "not an Aegis code", not a crash.
+            val params = runCatching {
+                t.removePrefix("aegis:v1?").split("&").mapNotNull { part ->
+                    val i = part.indexOf('=')
+                    if (i <= 0) null else part.substring(0, i) to java.net.URLDecoder.decode(part.substring(i + 1), "UTF-8")
+                }.toMap()
+            }.getOrNull() ?: return null
             val number = params["n"]?.let { parseAegisNumber(it) } ?: return null
             return PairingCode(
                 relayUrl = params["r"]?.trimEnd('/') ?: return null,

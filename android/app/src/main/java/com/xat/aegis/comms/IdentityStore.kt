@@ -13,8 +13,11 @@ import java.io.File
  * The identity is serialised by the crate under a random 32-byte key; that key
  * is itself wrapped by the Android Keystore ([KeystoreBox]) and stored in
  * preferences, so the pickle on disk is useless without this device's secure
- * hardware. Every mutation is followed by [persist], under one lock, so a
- * ratchet step is never lost between a message and a crash.
+ * hardware. Every mutation is followed by a write to disk, under one lock, so
+ * a ratchet step is never lost between a message and a crash. If the pickle
+ * cannot be written the mutation fails loudly rather than leaving the in-memory
+ * ratchet ahead of the one on disk: a rolled-back ratchet would reuse message
+ * keys after a restart.
  */
 class IdentityStore(context: Context) {
 
@@ -26,6 +29,9 @@ class IdentityStore(context: Context) {
     @Volatile
     private var identity: Identity? = null
 
+    /** The unwrapped pickle key, held once the Keystore has released it. */
+    private var pickleKey: ByteArray? = null
+
     /** True when an identity exists on disk (or in memory). */
     fun exists(): Boolean = identity != null || (file.exists() && prefs.contains(KEY_WRAPPED))
 
@@ -35,7 +41,7 @@ class IdentityStore(context: Context) {
         synchronized(lock) {
             identity?.let { return it }
             if (!file.exists()) return null
-            val key = unwrapKey() ?: return null
+            val key = keyLocked() ?: return null
             val restored = Identity.restore(file.readText(), key)
             identity = restored
             return restored
@@ -47,28 +53,33 @@ class IdentityStore(context: Context) {
         synchronized(lock) {
             val fresh = Identity.create()
             val key = randomKey()
-            prefs.edit().putString(KEY_WRAPPED, Base64.encodeToString(KeystoreBox.encrypt(key), Base64.NO_WRAP)).apply()
-            identity = fresh
+            prefs.edit().putString(KEY_WRAPPED, Base64.encodeToString(KeystoreBox.encrypt(key), Base64.NO_WRAP)).commit()
+            pickleKey = key
             persistLocked(fresh, key)
+            identity = fresh
             return fresh
         }
     }
 
-    /** Writes the current state to disk. Call after any session or key change. */
+    /** Writes the current state to disk. Throws when the pickle cannot be written. */
     fun persist() {
         synchronized(lock) {
             val current = identity ?: return
-            val key = unwrapKey() ?: return
-            persistLocked(current, key)
+            persistLocked(current, requireKeyLocked())
         }
     }
 
-    /** Runs [block] on the identity and persists afterwards. */
+    /**
+     * Runs [block] on the identity and persists afterwards. The block's result
+     * is returned only once the new state is on disk; a persistence failure
+     * surfaces as an exception, so no caller acts on an unsaved ratchet step.
+     */
     fun <T> update(block: (Identity) -> T): T {
         synchronized(lock) {
             val current = get() ?: throw IllegalStateException("No identity")
+            val key = requireKeyLocked()
             val result = block(current)
-            unwrapKey()?.let { persistLocked(current, it) }
+            persistLocked(current, key)
             return result
         }
     }
@@ -78,8 +89,10 @@ class IdentityStore(context: Context) {
         synchronized(lock) {
             identity?.destroy()
             identity = null
+            pickleKey?.fill(0)
+            pickleKey = null
             file.delete()
-            prefs.edit().clear().apply()
+            prefs.edit().clear().commit()
         }
     }
 
@@ -93,9 +106,16 @@ class IdentityStore(context: Context) {
         }
     }
 
-    private fun unwrapKey(): ByteArray? {
+    private fun requireKeyLocked(): ByteArray =
+        keyLocked() ?: throw IllegalStateException("The identity's pickle key is unavailable; the Keystore refused to unwrap it")
+
+    /** The pickle key, unwrapped through the Keystore once and then cached. */
+    private fun keyLocked(): ByteArray? {
+        pickleKey?.let { return it }
         val wrapped = prefs.getString(KEY_WRAPPED, null) ?: return null
-        return runCatching { KeystoreBox.decrypt(Base64.decode(wrapped, Base64.NO_WRAP)) }.getOrNull()
+        val key = runCatching { KeystoreBox.decrypt(Base64.decode(wrapped, Base64.NO_WRAP)) }.getOrNull() ?: return null
+        pickleKey = key
+        return key
     }
 
     private companion object {
