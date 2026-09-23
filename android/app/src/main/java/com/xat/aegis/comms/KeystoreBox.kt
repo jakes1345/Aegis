@@ -9,16 +9,16 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 /**
- * AES-256-GCM under an Android Keystore key for everything the comms module
- * keeps on disk: the relay bearer token and the bodies of cached messages.
+ * AES-256-GCM under an Android Keystore key, for the small secrets the comms
+ * module keeps on disk: the key that encrypts the identity pickle, and the
+ * bodies of cached messages.
  *
- * Unlike the card vault's key this one does not require user authentication:
- * the push service has to decrypt and display a message with the phone in a
- * pocket. What it buys is that the token and the conversation cannot be read
- * from a backup or by anything that copies the app's files off the device; the
- * key itself never leaves secure hardware.
+ * The Keystore key needs no user authentication: the relay connection and the
+ * push receiver have to decrypt and display a message with the phone in a
+ * pocket. What it buys is that nothing copied off the device (a backup, the
+ * app's files) is readable; the key itself never leaves secure hardware.
  */
-object CommsCrypto {
+object KeystoreBox {
 
     private const val KEY_ALIAS = "aegis_comms_v1"
     private const val IV_LEN = 12

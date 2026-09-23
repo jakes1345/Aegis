@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
@@ -11,12 +12,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- COMMS calls: the microphone during a call, a foreground service to keep
-         it alive, and a full-screen incoming-call notification. -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- COMMS: the camera scans a contact's pairing QR code; the relay connection
+         runs in a foreground service of the remote-messaging type while the
+         owner keeps comms online. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- Wi-Fi anomaly scan reads the system's cached scan results only -->
@@ -108,27 +108,35 @@
         </service>
 
         <!--
-            Firebase Cloud Messaging endpoint for the COMMS relay's wake-ups. Only
-            started by Firebase in builds that include google-services.json.
+            COMMS relay connection. Holds the WebSocket to the owner's relay while
+            comms are online, so encrypted envelopes arrive the moment they are
+            queued. When it is not running, a UnifiedPush wake-up (below) or opening
+            the app fetches the inbox instead.
         -->
         <service
-            android:name=".comms.CommsPushService"
+            android:name=".comms.CommsService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="remoteMessaging" />
+
+        <!--
+            UnifiedPush receiver: a distributor app the owner installs (ntfy, for
+            example) wakes Aegis here. The push carries nothing; the app then
+            fetches its inbox over the signed relay channel. No Google service.
+        -->
+        <service
+            android:name=".comms.CommsPushReceiver"
             android:exported="false">
             <intent-filter>
-                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
             </intent-filter>
         </service>
 
-        <!-- Holds the active call: rings for an incoming one, keeps the audio
-             session alive in the background, and shows the call notification.
-             Microphone type only: the phoneCall type needs a ConnectionService or
-             the dialer role, and a high-priority push is what lets this start from
-             the background for an incoming call. -->
-        <service
-            android:name=".comms.CallService"
-            android:exported="false"
-            android:stopWithTask="false"
-            android:foregroundServiceType="microphone" />
+        <!-- Portrait QR scanner for pairing; the library's default is landscape. -->
+        <activity
+            android:name="com.journeyapps.barcodescanner.CaptureActivity"
+            android:screenOrientation="portrait"
+            tools:replace="android:screenOrientation" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

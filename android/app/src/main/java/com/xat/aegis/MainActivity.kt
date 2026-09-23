@@ -74,9 +74,7 @@ import com.xat.aegis.analysis.CardVault
 import com.xat.aegis.analysis.NfcScanner
 import com.xat.aegis.analysis.PhoneHealthMonitor
 import com.xat.aegis.analysis.Report
-import com.xat.aegis.comms.CallPhase
 import com.xat.aegis.comms.CommsNotifications
-import com.xat.aegis.comms.CommsPushService
 import com.xat.aegis.comms.CommsRepository
 import android.nfc.cardemulation.CardEmulation
 import kotlinx.coroutines.Dispatchers
@@ -152,7 +150,7 @@ private val ESSENTIAL = arrayOf(
 /** The tab indices MainApp lays out, for code outside it that needs to name one. */
 private const val TAB_NFC = 4
 private const val TAB_DEVICE = 6
-private const val TAB_COMMS = CommsPushService.COMMS_TAB_INDEX
+private const val TAB_COMMS = CommsNotifications.COMMS_TAB_INDEX
 
 // ── Activity ───────────────────────────────────────────────────────────
 
@@ -215,7 +213,7 @@ class MainActivity : AppCompatActivity() {
         handleNfcIntent(intent)
 
         CommsRepository.init(applicationContext)
-        CommsNotifications.ensureChannel(this)
+        CommsNotifications.ensureChannels(this)
         handleOpenThreadIntent(intent)
 
         val onboardingAlreadyDone = isOnboardingDone(this)
@@ -290,8 +288,8 @@ class MainActivity : AppCompatActivity() {
         resumed = true
         applyNfcMode()
         refreshDeviceHealth()
-        // Texts that arrived while the push was off (or the app was killed) are
-        // pulled on every return to the foreground.
+        // Envelopes that arrived while the app was closed are pulled on every
+        // return to the foreground; the push endpoint is renewed if it was lost.
         CommsRepository.registerPushIfPossible()
         CommsRepository.syncInBackground()
     }
@@ -964,15 +962,7 @@ private fun MainApp(
     val nfc by Registry.nfc.collectAsStateWithLifecycle()
     val wifi by Registry.wifi.collectAsStateWithLifecycle()
     val phoneHealth by Registry.phoneHealth.collectAsStateWithLifecycle()
-    val unreadTexts by CommsRepository.unread.collectAsStateWithLifecycle()
-    val missedCalls by CommsRepository.missedCalls.collectAsStateWithLifecycle()
-    val activeCall by CommsRepository.activeCall.collectAsStateWithLifecycle()
-
-    // A call ringing or in progress takes the COMMS tab regardless of where the
-    // user was: the full-screen intent lands there, and so does the in-app case.
-    LaunchedEffect(activeCall?.id, activeCall?.phase) {
-        if (activeCall != null && activeCall?.phase != CallPhase.ENDED) tab = TAB_COMMS
-    }
+    val unreadMessages by CommsRepository.unread.collectAsStateWithLifecycle()
 
     // A tag delivered by a system NFC intent lands on the NFC tab; a message
     // notification lands on the COMMS tab.
@@ -1002,7 +992,7 @@ private fun MainApp(
         nfc.any { it.suspicious },
         wifi.isNotEmpty(),
         phoneHealth.level.ordinal >= Threat.HIGH.ordinal,
-        unreadTexts > 0 || missedCalls > 0
+        unreadMessages > 0
     )
 
     Column(Modifier.fillMaxSize()) {
