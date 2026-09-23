@@ -30,11 +30,22 @@ npx wrangler secret put FIREBASE_SERVICE_ACCOUNT_JSON  # paste the whole key fil
 npx wrangler secret put ENROLL_SECRET               # a long random string you will type into Aegis once
 npm run deploy                                      # prints the Worker URL
 WORKER_URL=https://aegis-comms.<account>.workers.dev \
-TWILIO_ACCOUNT_SID=… TWILIO_AUTH_TOKEN=… TWILIO_NUMBER=+1… npm run setup:twilio
+TWILIO_ACCOUNT_SID=… TWILIO_AUTH_TOKEN=… TWILIO_NUMBER=+1… \
+FIREBASE_SERVICE_ACCOUNT_JSON="$(cat service-account.json)" npm run setup:twilio
+# …then run the four `wrangler secret put` lines it prints (TwiML App, API key
+# SID and secret, push credential) and `npm run deploy` once more.
 ```
 
 4. In Aegis, open the COMMS tab, enter the Worker URL and the enrollment secret.
-   The phone receives a bearer token and registers its push token.
+   The phone receives a bearer token, registers its push token, and registers
+   with Twilio Voice so calls to the number ring it.
+
+Calls: the app connects to Twilio with a one-hour access token minted by
+`/api/voice/token`; the TwiML App's voice URL is `/twilio/voice`, which dials
+the requested number with the owner's number as caller ID. A call to the
+number reaches the same URL and rings every paired phone through the FCM push
+credential. Audio between the app and Twilio is SRTP; from Twilio onward it is
+ordinary telephony.
 
 ## API
 
@@ -53,6 +64,11 @@ Twilio webhooks are verified with `X-Twilio-Signature`. Phone endpoints require
 | GET | `/api/messages/updates?since=T` | Status changes after epoch-millis `T` |
 | POST | `/api/messages` | `{to, body}` sends an SMS |
 | POST | `/api/messages/:sid/refresh` | Re-reads a message's status from Twilio |
+| POST | `/twilio/voice` | TwiML for app-placed and inbound calls |
+| POST | `/twilio/voice/dial-result` | After `<Dial>` finishes |
+| POST | `/twilio/voice/status` | Call progress → call log |
+| GET | `/api/voice/token` | `{token, identity, expiresAt, number}` |
+| GET | `/api/calls?since=T` | Call-log rows changed after epoch-millis `T` |
 
 ## Development
 
