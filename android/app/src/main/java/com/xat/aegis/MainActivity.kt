@@ -74,6 +74,9 @@ import com.xat.aegis.analysis.CardVault
 import com.xat.aegis.analysis.NfcScanner
 import com.xat.aegis.analysis.PhoneHealthMonitor
 import com.xat.aegis.analysis.Report
+import com.xat.aegis.comms.CommsNotifications
+import com.xat.aegis.comms.CommsPushService
+import com.xat.aegis.comms.CommsRepository
 import android.nfc.cardemulation.CardEmulation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -148,6 +151,7 @@ private val ESSENTIAL = arrayOf(
 /** The tab indices MainApp lays out, for code outside it that needs to name one. */
 private const val TAB_NFC = 4
 private const val TAB_DEVICE = 6
+private const val TAB_COMMS = CommsPushService.COMMS_TAB_INDEX
 
 // ── Activity ───────────────────────────────────────────────────────────
 
@@ -208,6 +212,10 @@ class MainActivity : AppCompatActivity() {
         // A tag tapped while Aegis was not in reader mode (backgrounded, or picked
         // from the system's NFC chooser) arrives as the launching intent.
         handleNfcIntent(intent)
+
+        CommsRepository.init(applicationContext)
+        CommsNotifications.ensureChannel(this)
+        handleOpenThreadIntent(intent)
 
         val onboardingAlreadyDone = isOnboardingDone(this)
         setContent {
@@ -281,6 +289,10 @@ class MainActivity : AppCompatActivity() {
         resumed = true
         applyNfcMode()
         refreshDeviceHealth()
+        // Texts that arrived while the push was off (or the app was killed) are
+        // pulled on every return to the foreground.
+        CommsRepository.registerPushIfPossible()
+        CommsRepository.syncInBackground()
     }
 
     override fun onPause() {
@@ -298,6 +310,19 @@ class MainActivity : AppCompatActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleNfcIntent(intent)
+        handleOpenThreadIntent(intent)
+    }
+
+    /** A message notification asks for the COMMS tab and the conversation it is about. */
+    private fun handleOpenThreadIntent(intent: Intent?) {
+        if (intent == null || !intent.hasExtra(CommsNotifications.EXTRA_TAB)) return
+        val tab = intent.getIntExtra(CommsNotifications.EXTRA_TAB, -1)
+        val peer = intent.getStringExtra(CommsNotifications.EXTRA_PEER)
+        intent.removeExtra(CommsNotifications.EXTRA_TAB)
+        intent.removeExtra(CommsNotifications.EXTRA_PEER)
+        if (tab < 0) return
+        Registry.requestTab(tab)
+        if (peer != null) Registry.requestThread(peer)
     }
 
     /**
@@ -930,7 +955,7 @@ private fun MainApp(
     onRefreshDeviceHealth: () -> Unit
 ) {
     var tab by remember { mutableIntStateOf(0) }
-    val tabs = listOf("SCAN", "MAP", "LOG", "CELL", "NFC", "WIFI", "DEVICE")
+    val tabs = listOf("SCAN", "MAP", "LOG", "CELL", "NFC", "WIFI", "DEVICE", "COMMS")
 
     val detections by Registry.detections.collectAsStateWithLifecycle()
     val trusted by Registry.trusted.collectAsStateWithLifecycle()
@@ -938,12 +963,15 @@ private fun MainApp(
     val nfc by Registry.nfc.collectAsStateWithLifecycle()
     val wifi by Registry.wifi.collectAsStateWithLifecycle()
     val phoneHealth by Registry.phoneHealth.collectAsStateWithLifecycle()
+    val unreadTexts by CommsRepository.unread.collectAsStateWithLifecycle()
 
-    // A tag delivered by a system NFC intent lands on the NFC tab.
+    // A tag delivered by a system NFC intent lands on the NFC tab; a message
+    // notification lands on the COMMS tab.
     val tabRequest by Registry.tabRequest.collectAsStateWithLifecycle()
     LaunchedEffect(tabRequest) {
         if (tabRequest != null) Registry.takeTabRequest()?.let { tab = it.coerceIn(0, tabs.size - 1) }
     }
+    val threadRequest by Registry.threadRequest.collectAsStateWithLifecycle()
 
     // Settings navigation and threat explainer state
     var showSettings by remember { mutableStateOf(false) }
@@ -964,7 +992,8 @@ private fun MainApp(
         cell.available && cell.level.ordinal >= Threat.HIGH.ordinal,
         nfc.any { it.suspicious },
         wifi.isNotEmpty(),
-        phoneHealth.level.ordinal >= Threat.HIGH.ordinal
+        phoneHealth.level.ordinal >= Threat.HIGH.ordinal,
+        unreadTexts > 0
     )
 
     Column(Modifier.fillMaxSize()) {
@@ -990,6 +1019,10 @@ private fun MainApp(
                 )
                 5 -> WifiScreen()
                 TAB_DEVICE -> DeviceScreen(onShown = onRefreshDeviceHealth)
+                TAB_COMMS -> CommsScreen(
+                    openPeer = threadRequest,
+                    onPeerConsumed = { Registry.takeThreadRequest() }
+                )
             }
         }
         NavigationBar(
@@ -1119,6 +1152,29 @@ private fun TabIcon(index: Int, selected: Boolean) {
                     )
                 }
                 drawCircle(color, radius = 2.5f, center = Offset(cx, size.height * 0.8f))
+            }
+            7 -> { // COMMS — speech bubble
+                val w = size.width * 0.8f
+                val h = size.height * 0.6f
+                val left = cx - w / 2f
+                val top = cy - h / 2f - size.height * 0.05f
+                val path = Path().apply {
+                    addRoundRect(
+                        androidx.compose.ui.geometry.RoundRect(
+                            androidx.compose.ui.geometry.Rect(left, top, left + w, top + h),
+                            androidx.compose.ui.geometry.CornerRadius(h * 0.3f)
+                        )
+                    )
+                    moveTo(left + w * 0.25f, top + h)
+                    lineTo(left + w * 0.18f, top + h + size.height * 0.2f)
+                    lineTo(left + w * 0.45f, top + h)
+                    close()
+                }
+                drawPath(path, color.copy(alpha = 0.2f))
+                drawPath(path, color, style = Stroke(1.5f))
+                for (i in 0..2) {
+                    drawCircle(color, radius = 1.6f, center = Offset(left + w * (0.3f + i * 0.2f), top + h / 2f))
+                }
             }
             else -> { // DEVICE — shield
                 val sw = size.width * 0.76f

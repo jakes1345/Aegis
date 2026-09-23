@@ -99,6 +99,18 @@
                 android:resource="@xml/hce_service"/>
         </service>
 
+        <!--
+            Firebase Cloud Messaging endpoint for the COMMS relay's wake-ups. Only
+            started by Firebase in builds that include google-services.json.
+        -->
+        <service
+            android:name=".comms.CommsPushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
