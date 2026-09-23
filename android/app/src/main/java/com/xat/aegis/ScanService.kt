@@ -62,7 +62,6 @@ class ScanService : LifecycleService() {
     private lateinit var imsiCatcher: IMSICatcher
     private lateinit var eventLog: EventLog
     private lateinit var cellStore: Store
-    private lateinit var timelineStore: Store
 
     private val alerted = HashSet<String>()
     private val gpsTrail = ArrayList<LatLon>(500)
@@ -151,10 +150,10 @@ class ScanService : LifecycleService() {
         screenOn = getSystemService(PowerManager::class.java)?.isInteractive ?: true
 
         cellStore = Store(this, "imsi_baseline.json")
-        timelineStore = Store(this, "timeline.json")
         cellMonitor = CellMonitor(this)
         imsiCatcher = IMSICatcher(cellStore)
-        eventLog = EventLog(timelineStore)
+        // Shared with the activity, which records NFC scans into the same log.
+        eventLog = TimelineLog.get(this)
         Registry.publishTimeline(eventLog.snapshot())
         phoneHealthMonitor = PhoneHealthMonitor(this)
         phoneHealthMonitor.start()
@@ -657,7 +656,7 @@ class ScanService : LifecycleService() {
         }
         Registry.update { it.copy(scanning = false) }
         cellStore.flush()
-        timelineStore.flush()
+        TimelineLog.flush()
         phoneHealthMonitor.stop()
         super.onDestroy()
     }
