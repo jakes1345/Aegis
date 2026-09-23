@@ -39,6 +39,23 @@ object WifiScanner {
         "vodafone", "orange", "telefonica", "movistar", "o2", "ee", "three"
     )
 
+    // Declared before CARRIER_TOKENS: object properties initialise in order, and
+    // tokens() needs this to exist when that list is built.
+    private val NON_ALPHANUMERIC = Regex("[^\\p{L}\\p{N}]+")
+
+    /**
+     * Each carrier name as a sequence of whole tokens, split the same way as the SSID.
+     *
+     * Matching used to be a plain substring test, so "ee" hit "Free WiFi" and
+     * "Coffee", "att" hit "Hyatt Guest" and "Seattle Public Library", "o2" hit any
+     * SSID with those two characters in it — and every one of them was flagged HIGH
+     * as carrier bait. A brand now has to appear as consecutive whole words:
+     * "AT&T WiFi" is ["at", "t", "wifi"] and matches "at&t" = ["at", "t"];
+     * "Hyatt Guest" is ["hyatt", "guest"] and matches nothing.
+     */
+    private val CARRIER_TOKENS: List<List<String>> =
+        CARRIER_NAMES.map { tokens(it) }.filter { it.isNotEmpty() }.distinct()
+
     fun scan(context: Context): List<WifiAnomaly> {
         val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             ?: return emptyList()
@@ -48,15 +65,13 @@ object WifiScanner {
         val anomalies = ArrayList<WifiAnomaly>()
         val now = System.currentTimeMillis()
 
-        // Same SSID seen on the same frequency from several radios, and whether any
-        // access point on that SSID is encrypted — both needed for the twin rules.
-        val bssidsPerSsidFreq = HashMap<String, MutableSet<String>>()
+        // Whether any access point on each SSID is encrypted — needed for the
+        // evil-twin rule.
         val securedSsids = HashSet<String>()
 
         for (r in results) {
             val ssid = normalise(r.SSID) ?: continue
-            val bssid = r.BSSID ?: continue
-            bssidsPerSsidFreq.getOrPut("$ssid@${r.frequency}") { mutableSetOf() }.add(bssid)
+            if (r.BSSID == null) continue
             if (!isOpen(r)) securedSsids.add(ssid)
         }
 
@@ -74,7 +89,7 @@ object WifiScanner {
 
             // 2 — An operator's brand on an unencrypted network. Real carrier hotspots
             // use Passpoint or WPA2-Enterprise; an open one wearing the name is bait.
-            if (open && CARRIER_NAMES.any { ssid.contains(it) }) {
+            if (open && containsCarrier(tokens(ssid))) {
                 anomalies.add(WifiAnomaly(label, bssid, r.level, "carrier_open_network", Threat.HIGH, now))
                 continue
             }
@@ -87,18 +102,30 @@ object WifiScanner {
             }
         }
 
-        // 4 — Three or more radios broadcasting one SSID on the *same* frequency.
-        // A mesh kit or a dual-band router spreads itself across bands and channels
-        // precisely to avoid this; stacking up on one channel does not happen by design.
-        for ((key, bssids) in bssidsPerSsidFreq) {
-            if (bssids.size >= 3) {
-                val ssid = key.substringBeforeLast('@')
-                anomalies.add(WifiAnomaly(ssid, bssids.first(), -60, "duplicate_ssid", Threat.MEDIUM, now))
-            }
-        }
+        // There is deliberately no rule for several access points sharing one SSID on
+        // one channel. Enterprise, campus, hotel and ISP-mesh Wi-Fi does exactly that —
+        // 2.4 GHz only has channels 1, 6 and 11 to reuse — so it flagged ordinary
+        // infrastructure everywhere and said nothing about bait.
 
         return anomalies.distinctBy { "${it.bssid}|${it.reason}" }
     }
+
+    /**
+     * Splits lower-cased text into alphanumeric tokens. Everything else — spaces,
+     * "&", "-", "_", punctuation — is a separator, applied identically to SSIDs and
+     * to [CARRIER_NAMES], so "T-Mobile" and "t-mobile" both become ["t", "mobile"].
+     */
+    private fun tokens(text: String): List<String> =
+        text.lowercase().split(NON_ALPHANUMERIC).filter { it.isNotEmpty() }
+
+    /** True when some carrier's full token sequence appears as consecutive tokens. */
+    private fun containsCarrier(ssidTokens: List<String>): Boolean =
+        CARRIER_TOKENS.any { carrier ->
+            ssidTokens.size >= carrier.size &&
+                (0..ssidTokens.size - carrier.size).any { start ->
+                    carrier.indices.all { i -> ssidTokens[start + i] == carrier[i] }
+                }
+        }
 
     /** Lower-cased SSID with the quoting some Android versions add stripped off. */
     private fun normalise(raw: String?): String? =

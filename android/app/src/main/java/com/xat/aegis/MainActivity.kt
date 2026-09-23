@@ -2017,7 +2017,6 @@ private fun wifiReason(reason: String): String = when (reason) {
     "known_catcher_ssid" -> "Default SSID of known interception equipment"
     "carrier_open_network" -> "Carrier name on an unencrypted network — likely bait"
     "open_twin_of_secured" -> "Open copy of a network that is encrypted nearby — evil twin"
-    "duplicate_ssid" -> "Three or more access points sharing one SSID on one channel"
     "open_unsecured" -> "Open, unsecured network — traffic can be intercepted"
     else -> reason.replace('_', ' ').replaceFirstChar { it.uppercase(Locale.US) }
 }
