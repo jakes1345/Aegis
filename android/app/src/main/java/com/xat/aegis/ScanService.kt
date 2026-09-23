@@ -282,7 +282,11 @@ class ScanService : LifecycleService() {
             Registry.update { it.copy(hasFix = false) }
             return
         }
-        val request = LocationRequest.Builder(Priority.PRIORITY_BALANCED_POWER_ACCURACY, 15_000L)
+        // High accuracy, not balanced: balanced power returns Wi-Fi/cell fixes of
+        // ~100 m or worse, and ObservationArea discards anything over 50 m, so places
+        // never accumulated and nothing could ever be confirmed as following. This
+        // is already a location foreground service; GPS is what it is for.
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 15_000L)
             .setMinUpdateIntervalMillis(10_000L).setMinUpdateDistanceMeters(25f).build()
         try {
             location.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
