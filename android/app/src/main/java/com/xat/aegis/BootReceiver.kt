@@ -9,8 +9,13 @@ import androidx.core.content.ContextCompat
 
 /**
  * Brings scanning back after a reboot — but only for someone who actually had it
- * running, and only when the permissions a location foreground service needs are
- * still granted.
+ * running, who turned on "Resume scanning after reboot", and only when the
+ * permissions a location foreground service needs at boot are granted.
+ *
+ * Android only lets a location-typed foreground service start from BOOT_COMPLETED
+ * with ACCESS_BACKGROUND_LOCATION ("Allow all the time"). Without it the service's
+ * startForeground() is refused, the service stops without ever having called it,
+ * and the system kills the app for breaking the startForegroundService() contract.
  *
  * Previously this started the service unconditionally, so every reboot put the phone
  * back into a continuous BLE and GPS scan whether or not the user had ever asked for
@@ -22,11 +27,12 @@ class BootReceiver : BroadcastReceiver() {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
 
         AppSettings.load(context)
-        if (!AppSettings.scanEnabled) return
+        if (!AppSettings.scanEnabled || !AppSettings.resumeAfterReboot) return
 
         val required = listOf(
             Manifest.permission.BLUETOOTH_SCAN,
-            Manifest.permission.ACCESS_FINE_LOCATION
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_BACKGROUND_LOCATION
         )
         if (required.any {
                 ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED

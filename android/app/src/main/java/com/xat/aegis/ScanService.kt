@@ -186,7 +186,10 @@ class ScanService : LifecycleService() {
                 this, NOTIFICATION_ID, buildOngoing(0, 0),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
             )
-        } catch (e: SecurityException) {
+        } catch (e: Exception) {
+            // SecurityException when location access is missing, or
+            // ForegroundServiceStartNotAllowedException (an IllegalStateException)
+            // when the system refuses a start from the background.
             running = false
             Registry.update { it.copy(scanning = false, error = "Location permission required to scan") }
             stopSelf()

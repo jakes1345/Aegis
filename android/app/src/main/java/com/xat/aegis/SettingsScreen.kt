@@ -1,8 +1,14 @@
 package com.xat.aegis
 
+import android.Manifest
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -18,6 +24,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xat.aegis.analysis.Report
 
@@ -35,6 +44,7 @@ object AppSettings {
     private const val KEY_FOLLOW_THRESHOLD = "follow_threshold_m"
     private const val KEY_PERSISTENCE_THRESHOLD = "persistence_threshold_min"
     private const val KEY_SCAN_ENABLED = "scan_enabled"
+    private const val KEY_RESUME_AFTER_REBOOT = "resume_after_reboot"
 
     const val DEFAULT_FOLLOW_THRESHOLD_M = 300f
     const val DEFAULT_PERSISTENCE_THRESHOLD_MIN = 10f
@@ -43,6 +53,7 @@ object AppSettings {
     @Volatile private var _followThresholdM = DEFAULT_FOLLOW_THRESHOLD_M
     @Volatile private var _persistenceThresholdMin = DEFAULT_PERSISTENCE_THRESHOLD_MIN
     @Volatile private var _scanEnabled = false
+    @Volatile private var _resumeAfterReboot = false
 
     val aggressiveScan: Boolean get() = _aggressiveScan
     val followThresholdM: Float get() = _followThresholdM
@@ -57,6 +68,12 @@ object AppSettings {
      */
     val scanEnabled: Boolean get() = _scanEnabled
 
+    /**
+     * The user's choice to have scanning come back after a reboot. Only takes effect
+     * together with ACCESS_BACKGROUND_LOCATION — see [BootReceiver].
+     */
+    val resumeAfterReboot: Boolean get() = _resumeAfterReboot
+
     /** BLE scan mode that ScanService should use. */
     val scanMode: Int
         get() = if (_aggressiveScan) ScanSettings.SCAN_MODE_LOW_LATENCY
@@ -68,6 +85,13 @@ object AppSettings {
         _followThresholdM = p.getFloat(KEY_FOLLOW_THRESHOLD, DEFAULT_FOLLOW_THRESHOLD_M)
         _persistenceThresholdMin = p.getFloat(KEY_PERSISTENCE_THRESHOLD, DEFAULT_PERSISTENCE_THRESHOLD_MIN)
         _scanEnabled = p.getBoolean(KEY_SCAN_ENABLED, false)
+        _resumeAfterReboot = p.getBoolean(KEY_RESUME_AFTER_REBOOT, false)
+    }
+
+    fun setResumeAfterReboot(context: Context, value: Boolean) {
+        _resumeAfterReboot = value
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_RESUME_AFTER_REBOOT, value).apply()
     }
 
     fun setScanEnabled(context: Context, value: Boolean) {
@@ -123,6 +147,67 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
     var followThreshold by remember { mutableFloatStateOf(AppSettings.followThresholdM) }
     var persistenceThreshold by remember { mutableFloatStateOf(AppSettings.persistenceThresholdMin) }
     var showClearDialog by remember { mutableStateOf(false) }
+
+    // ── Resume after reboot ─────────────────────────────────────────────────
+    //
+    // Android only lets the scanner start at boot with background location ("Allow
+    // all the time"), which has to be requested on its own, after foreground
+    // location, and which Android grants only on its settings page — there is no
+    // dialog for it. The toggle is on only when the user chose it *and* the
+    // permission is actually there; it is re-read on every resume because the
+    // grant happens outside the app.
+    fun has(permission: String) =
+        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+    var resumeWanted by remember { mutableStateOf(AppSettings.resumeAfterReboot) }
+    var backgroundGranted by remember { mutableStateOf(has(Manifest.permission.ACCESS_BACKGROUND_LOCATION)) }
+    var showBackgroundDialog by remember { mutableStateOf(false) }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        backgroundGranted = has(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+    }
+    val backgroundLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> backgroundGranted = granted }
+    val foregroundLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        // Background location can only be asked for once foreground location is held.
+        if (granted) backgroundLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+    }
+
+    if (showBackgroundDialog) {
+        AlertDialog(
+            onDismissRequest = { showBackgroundDialog = false },
+            containerColor = SPanelClr,
+            title = {
+                Text("Allow location all the time", color = SInkClr, fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Text(
+                    "Android only lets Aegis restart scanning after a reboot if location access " +
+                    "is set to \"Allow all the time\". Android will open the location permission " +
+                    "page for Aegis — choose \"Allow all the time\" there, then come back.",
+                    color = SInkDimClr, fontSize = 13.sp, lineHeight = 18.sp
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showBackgroundDialog = false
+                    if (has(Manifest.permission.ACCESS_FINE_LOCATION)) {
+                        backgroundLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                    } else {
+                        foregroundLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+                    }
+                }) {
+                    Text("CONTINUE", color = SAccentClr, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBackgroundDialog = false }) {
+                    Text("CANCEL", color = SMutedClr, letterSpacing = 1.sp)
+                }
+            }
+        )
+    }
 
     if (showClearDialog) {
         AlertDialog(
@@ -229,6 +314,74 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                     else "SCAN_MODE_BALANCED — standard detection, recommended for field use",
                     color = SMutedClr, fontSize = 11.sp, fontFamily = FontFamily.Monospace
                 )
+            }
+        }
+
+        item(key = "§resume-reboot") {
+            val active = resumeWanted && backgroundGranted
+            Column(
+                Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                        Text(
+                            "Resume scanning after reboot", color = SInkClr,
+                            fontSize = 14.sp, fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            "Restarts the scanner when the phone boots, if it was running before",
+                            color = SMutedClr, fontSize = 12.sp
+                        )
+                    }
+                    Switch(
+                        checked = active,
+                        onCheckedChange = { v ->
+                            resumeWanted = v
+                            AppSettings.setResumeAfterReboot(context, v)
+                            if (v && !backgroundGranted) showBackgroundDialog = true
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = SAccentClr,
+                            checkedTrackColor = SAccentClr.copy(alpha = 0.4f)
+                        )
+                    )
+                }
+                if (!backgroundGranted) {
+                    Text(
+                        "Needs location access set to \"Allow all the time\". Android asks for this " +
+                        "separately: turning this on sends you to the location permission page for " +
+                        "Aegis, where you pick \"Allow all the time\".",
+                        color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
+                    )
+                    if (resumeWanted) {
+                        // After a refusal Android stops opening the page on request, so
+                        // offer the app's own settings page as the way there.
+                        TextButton(
+                            onClick = {
+                                context.startActivity(
+                                    Intent(
+                                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                        Uri.fromParts("package", context.packageName, null)
+                                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            },
+                            contentPadding = PaddingValues(0.dp)
+                        ) {
+                            Text("OPEN APP SETTINGS", color = SAccentClr, fontSize = 11.sp, letterSpacing = 1.sp)
+                        }
+                    }
+                } else if (!resumeWanted) {
+                    Text(
+                        "\"Allow all the time\" is granted but not used while this is off. You can " +
+                        "reduce it to \"Only while using the app\" in Android settings.",
+                        color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
+                    )
+                }
             }
         }
 
