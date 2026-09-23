@@ -115,7 +115,8 @@ jobs:
             echo "Aegis — defensive security monitor for Android. Detects BLE tracker tags,"
             echo "Wi-Fi bait networks, IMSI-catcher anomalies, and sweeps NFC/RFID cards."
             echo "Stores captured cards in an on-device AES-256 vault and can replay them"
-            echo "via Host Card Emulation. Nothing leaves the phone."
+            echo "via Host Card Emulation. Detection data stays on the phone; the Map tab"
+            echo "downloads OpenStreetMap tiles, which exposes your IP and the area viewed."
             echo
             echo "**Install**"
             echo
