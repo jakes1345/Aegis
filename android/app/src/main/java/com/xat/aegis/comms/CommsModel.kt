@@ -33,6 +33,38 @@ data class Thread(
     val count: Int
 )
 
+/** One call on the owner's number, from the relay's call log. */
+data class CallRecord(
+    val id: String,
+    val direction: Direction,
+    val peer: String,
+    /** ringing | in-progress | completed | missed | busy | failed | no-answer | canceled */
+    val status: String,
+    /** Seconds, once completed. */
+    val duration: Int,
+    val ts: Long,
+    val updated: Long
+) {
+    val missed: Boolean get() = status == "missed"
+}
+
+/** Where an active call is in its life. */
+enum class CallPhase { INCOMING, CONNECTING, RINGING, CONNECTED, RECONNECTING, ENDED }
+
+/** The call currently ringing or in progress on this phone, for the in-call UI. */
+data class ActiveCall(
+    val id: String,
+    val peer: String,
+    val direction: Direction,
+    val phase: CallPhase,
+    val muted: Boolean = false,
+    val speaker: Boolean = false,
+    /** Epoch millis the call connected, 0 until it does. */
+    val connectedAt: Long = 0L,
+    /** Why the call ended, when it ended abnormally. */
+    val error: String? = null
+)
+
 /** Pairing and sync state shown at the top of the COMMS tab. */
 data class CommsState(
     val paired: Boolean = false,
@@ -44,5 +76,7 @@ data class CommsState(
     /** Last relay error worth showing, or null. */
     val error: String? = null,
     /** Epoch millis of the last successful sync, 0 if never. */
-    val lastSync: Long = 0L
+    val lastSync: Long = 0L,
+    /** Whether Twilio Voice knows this phone, so calls to the number ring it. */
+    val voiceRegistered: Boolean = false
 )

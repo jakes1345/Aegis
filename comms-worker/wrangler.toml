@@ -6,9 +6,14 @@
 #   TWILIO_NUMBER                 The purchased number in E.164, e.g. +15551234567
 #   FIREBASE_SERVICE_ACCOUNT_JSON The Firebase service-account key file, verbatim
 #   ENROLL_SECRET                 One-time code typed into Aegis to pair a phone
+#   TWILIO_API_KEY_SID            Voice: API key (SK…) that signs access tokens
+#   TWILIO_API_KEY_SECRET         Voice: its secret
+#   TWILIO_TWIML_APP_SID          Voice: TwiML App (AP…) whose voice URL is /twilio/voice
+#   TWILIO_PUSH_CREDENTIAL_SID    Voice: FCM push credential (CR…) Twilio rings the app through
 #
 # `wrangler deploy` prints the Worker URL; scripts/setup-twilio.mjs points the
-# number's SMS and status webhooks at it.
+# number's webhooks at it and creates the voice resources, printing the four
+# voice secrets to set.
 
 name = "aegis-comms"
 main = "src/index.ts"

@@ -35,10 +35,85 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         )
         db.execSQL("CREATE INDEX messages_peer_ts ON messages (peer, ts)")
         db.execSQL("CREATE INDEX messages_seq ON messages (seq)")
+        createCalls(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Version 1 is the only schema so far; a future change migrates in place.
+        if (oldVersion < 2) createCalls(db)
+    }
+
+    private fun createCalls(db: SQLiteDatabase) {
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS calls (
+                id TEXT PRIMARY KEY,
+                direction TEXT NOT NULL,
+                peer TEXT NOT NULL,
+                status TEXT NOT NULL,
+                duration INTEGER NOT NULL DEFAULT 0,
+                ts INTEGER NOT NULL,
+                updated INTEGER NOT NULL,
+                seen INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS calls_ts ON calls (ts)")
+    }
+
+    /** Inserts or replaces call-log rows, keeping the seen flag. Returns newly missed calls. */
+    fun upsertCalls(calls: List<CallRecord>): List<CallRecord> {
+        if (calls.isEmpty()) return emptyList()
+        val newlyMissed = ArrayList<CallRecord>()
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            for (c in calls) {
+                val existing = db.rawQuery("SELECT status, seen FROM calls WHERE id = ?", arrayOf(c.id)).use { cur ->
+                    if (cur.moveToFirst()) cur.getString(0) to (cur.getInt(1) != 0) else null
+                }
+                if (c.missed && existing?.first != "missed") newlyMissed += c
+                val values = ContentValues().apply {
+                    put("id", c.id)
+                    put("direction", c.direction.name)
+                    put("peer", c.peer)
+                    put("status", c.status)
+                    put("duration", c.duration)
+                    put("ts", c.ts)
+                    put("updated", c.updated)
+                    put("seen", if (existing?.second == true) 1 else 0)
+                }
+                db.insertWithOnConflict("calls", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return newlyMissed
+    }
+
+    fun calls(limit: Int = 200): List<CallRecord> =
+        readableDatabase.query("calls", null, null, null, null, null, "ts DESC", limit.toString()).use { c ->
+            val out = ArrayList<CallRecord>()
+            while (c.moveToNext()) {
+                out += CallRecord(
+                    id = c.getString(c.getColumnIndexOrThrow("id")),
+                    direction = runCatching { Direction.valueOf(c.getString(c.getColumnIndexOrThrow("direction"))) }
+                        .getOrDefault(Direction.IN),
+                    peer = c.getString(c.getColumnIndexOrThrow("peer")),
+                    status = c.getString(c.getColumnIndexOrThrow("status")),
+                    duration = c.getInt(c.getColumnIndexOrThrow("duration")),
+                    ts = c.getLong(c.getColumnIndexOrThrow("ts")),
+                    updated = c.getLong(c.getColumnIndexOrThrow("updated"))
+                )
+            }
+            out
+        }
+
+    fun unseenMissedCalls(): Int =
+        readableDatabase.rawQuery("SELECT COUNT(*) FROM calls WHERE status = 'missed' AND seen = 0", null).use { c ->
+            if (c.moveToFirst()) c.getInt(0) else 0
+        }
+
+    fun markCallsSeen() {
+        writableDatabase.execSQL("UPDATE calls SET seen = 1 WHERE seen = 0")
     }
 
     /**
@@ -132,6 +207,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
 
     fun clear() {
         writableDatabase.delete("messages", null, null)
+        writableDatabase.delete("calls", null, null)
     }
 
     private fun readMessage(c: Cursor): SmsMessage? {
@@ -164,6 +240,6 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
 
     private companion object {
         const val DB_NAME = "comms.db"
-        const val DB_VERSION = 1
+        const val DB_VERSION = 2
     }
 }

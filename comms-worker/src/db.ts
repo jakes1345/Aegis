@@ -205,6 +205,76 @@ export async function fcmTokens(env: Env): Promise<{ id: string; fcm_token: stri
   return res.results;
 }
 
+// ── Calls ──────────────────────────────────────────────────────────────────
+
+export interface CallRow {
+  id: string;
+  seq: number;
+  direction: "in" | "out";
+  peer: string;
+  status: string;
+  duration: number;
+  ts: number;
+  updated: number;
+}
+
+/**
+ * Creates the call row on first sight, otherwise updates status and duration.
+ * Returns the row and whether anything changed (so the phones are only woken
+ * for real changes).
+ */
+export async function upsertCall(
+  env: Env,
+  c: { id: string; direction: "in" | "out"; peer: string; status: string; duration: number | null; now: number },
+): Promise<{ row: CallRow; changed: boolean }> {
+  const existing = await env.DB.prepare("SELECT * FROM calls WHERE id = ?").bind(c.id).first<CallRow>();
+  if (!existing) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await env.DB.prepare(
+          `INSERT INTO calls (id, seq, direction, peer, status, duration, ts, updated)
+           VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM calls), ?, ?, ?, ?, ?, ?)`,
+        )
+          .bind(c.id, c.direction, c.peer, c.status, c.duration ?? 0, c.now, c.now)
+          .run();
+        break;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        if (attempt === 2 || !/UNIQUE/i.test(message)) throw e;
+      }
+    }
+    const row = await env.DB.prepare("SELECT * FROM calls WHERE id = ?").bind(c.id).first<CallRow>();
+    if (!row) throw new Error("call vanished after insert");
+    return { row, changed: true };
+  }
+  // A terminal status is final; a late "ringing" callback must not reopen it.
+  const terminal = ["completed", "missed", "busy", "failed", "no-answer", "canceled"];
+  if (terminal.includes(existing.status) && !terminal.includes(c.status)) return { row: existing, changed: false };
+  // The first duration reported wins: for an app-placed call the dialled leg
+  // reports talk time and completes before the parent, whose duration includes
+  // the ringing.
+  const duration = existing.duration > 0 ? existing.duration : (c.duration ?? 0);
+  // The parent leg of an app-placed call does not name the dialled number; the
+  // child leg does, so a real number replaces a placeholder peer.
+  const peer = existing.peer.startsWith("+") ? existing.peer : c.peer;
+  if (existing.status === c.status && existing.duration === duration && existing.peer === peer) {
+    return { row: existing, changed: false };
+  }
+  await env.DB.prepare("UPDATE calls SET status = ?, duration = ?, peer = ?, updated = ? WHERE id = ?")
+    .bind(c.status, duration, peer, c.now, c.id)
+    .run();
+  const row = await env.DB.prepare("SELECT * FROM calls WHERE id = ?").bind(c.id).first<CallRow>();
+  return { row: row ?? existing, changed: true };
+}
+
+/** Calls whose status changed after [since] (epoch millis), oldest change first. */
+export async function callsUpdatedSince(env: Env, since: number, limit: number): Promise<CallRow[]> {
+  const res = await env.DB.prepare("SELECT * FROM calls WHERE updated > ? ORDER BY updated ASC LIMIT ?")
+    .bind(since, limit)
+    .all<CallRow>();
+  return res.results;
+}
+
 export async function listDevices(env: Env): Promise<Omit<DeviceRow, "token_hash">[]> {
   const res = await env.DB.prepare("SELECT id, name, fcm_token, created_at, last_seen FROM devices ORDER BY created_at").all<
     Omit<DeviceRow, "token_hash">

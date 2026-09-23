@@ -81,4 +81,9 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:34.19.0"))
     implementation("com.google.firebase:firebase-messaging")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
+
+    // COMMS calls — Twilio Voice over WebRTC to the owner's number, and audio
+    // routing (earpiece, speaker, Bluetooth) for the in-call screen.
+    implementation("com.twilio:voice-android:6.10.4")
+    implementation("com.twilio:audioswitch:1.2.5")
 }

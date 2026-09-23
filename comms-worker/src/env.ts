@@ -5,6 +5,13 @@ export interface Env {
   TWILIO_NUMBER: string;
   FIREBASE_SERVICE_ACCOUNT_JSON: string;
   ENROLL_SECRET: string;
+  /** Voice: API key pair that signs access tokens. */
+  TWILIO_API_KEY_SID: string;
+  TWILIO_API_KEY_SECRET: string;
+  /** Voice: the TwiML App whose voice URL is this Worker's /twilio/voice. */
+  TWILIO_TWIML_APP_SID: string;
+  /** Voice: the FCM push credential Twilio rings the app through. */
+  TWILIO_PUSH_CREDENTIAL_SID: string;
   SYNC_PAGE_SIZE?: string;
 }
 

@@ -1,6 +1,7 @@
 import { authenticate, enroll } from "./auth";
 import {
   applyStatus,
+  callsUpdatedSince,
   deleteDevice,
   fcmTokens,
   insertMessage,
@@ -9,11 +10,13 @@ import {
   messagesUpdatedSince,
   setFcmToken,
   toDto,
+  upsertCall,
   type MediaItem,
 } from "./db";
 import { HttpError, json, normalisePhone, type Env } from "./env";
 import { sendData } from "./fcm";
 import { emptyTwiml, fetchMessage, sendSms, verifyWebhook } from "./twilio";
+import { accessToken, callStatusFrom, dialResult, isTerminal, requireTwilioCallFields, voiceWebhook } from "./voice";
 
 /**
  * Aegis comms relay.
@@ -31,6 +34,14 @@ import { emptyTwiml, fetchMessage, sendSms, verifyWebhook } from "./twilio";
  *   GET  /api/messages/updates?since=T                      → status changes after epoch T
  *   POST /api/messages               {to, body}             → the stored outbound message
  *   POST /api/messages/:id/refresh                          → re-reads Twilio's status
+ *
+ * Voice (Twilio-facing, signature-verified):
+ *   POST /twilio/voice               TwiML for app-placed and inbound calls
+ *   POST /twilio/voice/dial-result   after <Dial> finishes
+ *   POST /twilio/voice/status        call progress → call log
+ * Voice (phone-facing):
+ *   GET  /api/voice/token                                   → {token, identity, expiresAt, number}
+ *   GET  /api/calls?since=T                                 → call log changes after epoch T
  */
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -54,12 +65,26 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
 
   // ── Twilio webhooks ──────────────────────────────────────────────────────
-  if (path === "/twilio/sms" || path === "/twilio/status") {
+  if (path.startsWith("/twilio/")) {
     if (request.method !== "POST") throw new HttpError(405, "POST only");
     const form = new URLSearchParams(await request.text());
     await verifyWebhook(env, request, form);
-    if (path === "/twilio/sms") return inboundSms(env, ctx, form, now);
-    return statusCallback(env, form, now);
+    switch (path) {
+      case "/twilio/sms":
+        return inboundSms(env, ctx, form, now);
+      case "/twilio/status":
+        return statusCallback(env, form, now);
+      case "/twilio/voice":
+        return voiceWebhook(env, form, url.origin);
+      case "/twilio/voice/dial-result":
+        await recordCall(env, ctx, form, now, form.get("DialCallStatus"));
+        return dialResult();
+      case "/twilio/voice/status":
+        await recordCall(env, ctx, form, now, null);
+        return emptyTwiml();
+      default:
+        throw new HttpError(404, "Not found");
+    }
   }
 
   // ── Enrollment ───────────────────────────────────────────────────────────
@@ -134,6 +159,18 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     return json({ message: toDto(row) }, 201);
   }
 
+  if (path === "/api/voice/token" && request.method === "GET") {
+    const issued = await accessToken(env, device.id);
+    return json({ ...issued, number: env.TWILIO_NUMBER ?? null });
+  }
+
+  if (path === "/api/calls" && request.method === "GET") {
+    const since = Number(url.searchParams.get("since") ?? "0");
+    if (!Number.isFinite(since) || since < 0) throw new HttpError(400, "since must be epoch millis");
+    const rows = await callsUpdatedSince(env, Math.floor(since), pageSize(env));
+    return json({ calls: rows, now });
+  }
+
   const refresh = /^\/api\/messages\/([A-Za-z0-9]+)\/refresh$/.exec(path);
   if (refresh && refresh[1] && request.method === "POST") {
     const remote = await fetchMessage(env, refresh[1]);
@@ -184,6 +221,37 @@ async function statusCallback(env: Env, form: URLSearchParams, now: number): Pro
   const error = code ? `${code}: ${form.get("ErrorMessage") ?? ""}`.trim() : null;
   await applyStatus(env, sid, status, error, now);
   return emptyTwiml();
+}
+
+/**
+ * Records a call's progress from a status callback or the <Dial> result. The
+ * parent call is what the callbacks describe: for an app-placed call its From
+ * is `client:<identity>`, for a call to the number its From is the caller.
+ * Child-leg callbacks (the <Number> inside <Dial>) carry ParentCallSid and are
+ * folded into the parent's row.
+ */
+async function recordCall(env: Env, ctx: ExecutionContext, form: URLSearchParams, now: number, dialStatus: string | null): Promise<void> {
+  const { sid, from, to } = requireTwilioCallFields(form);
+  const parentSid = form.get("ParentCallSid");
+  // Ignore the callbacks for the client legs of an inbound call: they are the
+  // phones being rung, not a call in their own right.
+  if (parentSid !== null && to.startsWith("client:")) return;
+  const fromClient = from.startsWith("client:");
+  const direction: "in" | "out" = fromClient || parentSid !== null ? "out" : "in";
+  // For an app-placed call the parent leg's To is not the dialled number (it is
+  // the TwiML App); the number arrives with the child leg and replaces the
+  // placeholder in upsertCall.
+  const peer =
+    direction === "out"
+      ? normalisePhone(to) ?? (parentSid !== null ? to : "unknown")
+      : normalisePhone(from) ?? from;
+  const status = callStatusFrom(form.get("CallStatus"), dialStatus, direction);
+  const durationRaw = form.get("CallDuration") ?? form.get("DialCallDuration");
+  const duration = durationRaw !== null && /^\d+$/.test(durationRaw) ? Number(durationRaw) : null;
+  const { row, changed } = await upsertCall(env, { id: parentSid ?? sid, direction, peer, status, duration, now });
+  if (changed && isTerminal(row.status)) {
+    ctx.waitUntil(pushAll(env, { kind: "call", updated: String(row.updated) }));
+  }
 }
 
 /** Wakes every paired phone except [exceptDeviceId], dropping dead tokens. */

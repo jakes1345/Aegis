@@ -3,6 +3,10 @@ package com.xat.aegis.comms
 import android.content.Context
 import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
+import com.twilio.voice.RegistrationException
+import com.twilio.voice.RegistrationListener
+import com.twilio.voice.UnregistrationListener
+import com.twilio.voice.Voice
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -45,6 +49,14 @@ object CommsRepository {
     private val _unread = MutableStateFlow(0)
     val unread: StateFlow<Int> = _unread.asStateFlow()
 
+    /** Unseen missed calls, for the tab dot. */
+    private val _missedCalls = MutableStateFlow(0)
+    val missedCalls: StateFlow<Int> = _missedCalls.asStateFlow()
+
+    /** The call ringing or in progress on this phone, published by [CallService]. */
+    private val _activeCall = MutableStateFlow<ActiveCall?>(null)
+    val activeCall: StateFlow<ActiveCall?> = _activeCall.asStateFlow()
+
     @Volatile
     private var initialised = false
 
@@ -61,7 +73,8 @@ object CommsRepository {
             paired = config.isPaired,
             workerUrl = config.workerUrl,
             number = config.number,
-            pushRegistered = config.registeredPushToken != null
+            pushRegistered = config.registeredPushToken != null,
+            voiceRegistered = config.voiceRegisteredToken != null
         )
         scope.launch { refreshUnread() }
     }
@@ -78,6 +91,76 @@ object CommsRepository {
         store.markRead(peer)
         refreshUnread()
         bump()
+    }
+
+    fun calls(): List<CallRecord> = store.calls()
+
+    fun markCallsSeen() {
+        store.markCallsSeen()
+        refreshUnread()
+    }
+
+    // ── Calls ─────────────────────────────────────────────────────────────
+
+    /** [CallService] publishes every change of the active call here. */
+    fun publishCall(state: ActiveCall?) { _activeCall.value = state }
+
+    fun placeCall(to: String) {
+        if (!isPaired) return
+        CallService.send(appContext, CallService.ACTION_OUTGOING) { putExtra(CallService.EXTRA_TO, to) }
+    }
+
+    fun acceptCall() = CallService.send(appContext, CallService.ACTION_ACCEPT)
+    fun rejectCall() = CallService.send(appContext, CallService.ACTION_REJECT)
+    fun hangUp() = CallService.send(appContext, CallService.ACTION_HANGUP)
+    fun toggleMute() = CallService.send(appContext, CallService.ACTION_TOGGLE_MUTE)
+    fun toggleSpeaker() = CallService.send(appContext, CallService.ACTION_TOGGLE_SPEAKER)
+
+    /** A fresh Twilio access token from the relay, or null with the error published. */
+    fun voiceToken(): String? = try {
+        api.voiceToken().token
+    } catch (e: CommsException) {
+        _state.update { it.copy(error = e.message) }
+        null
+    }
+
+    /**
+     * Tells Twilio Voice which FCM token rings this phone. Twilio keeps a
+     * registration for a year, but the token can rotate, so it is redone when
+     * the token changes or every day, whichever comes first.
+     */
+    private suspend fun registerVoice(fcmToken: String) {
+        val fresh = config.voiceRegisteredToken != fcmToken ||
+            System.currentTimeMillis() - config.voiceRegisteredAt > VOICE_REREGISTER_MS
+        if (!fresh) {
+            _state.update { it.copy(voiceRegistered = true) }
+            return
+        }
+        val accessToken = try {
+            api.voiceToken().token
+        } catch (e: CommsException) {
+            // The relay has no voice secrets yet; texting still works.
+            _state.update { it.copy(voiceRegistered = false) }
+            return
+        }
+        Voice.register(accessToken, Voice.RegistrationChannel.FCM, fcmToken, object : RegistrationListener {
+            override fun onRegistered(accessToken: String, fcmToken: String) {
+                config.setVoiceRegistered(fcmToken, System.currentTimeMillis())
+                _state.update { it.copy(voiceRegistered = true) }
+            }
+
+            override fun onError(error: RegistrationException, accessToken: String, fcmToken: String) {
+                config.setVoiceRegistered(null, 0L)
+                _state.update { it.copy(voiceRegistered = false, error = "Call registration failed: ${error.message}") }
+            }
+        })
+    }
+
+    private suspend fun syncCalls(): List<CallRecord> {
+        val updates = api.callsSince(config.callsCursor)
+        val missed = if (updates.calls.isNotEmpty()) store.upsertCalls(updates.calls) else emptyList()
+        config.setCallsCursor(updates.now)
+        return missed
     }
 
     // ── Pairing ───────────────────────────────────────────────────────────
@@ -111,6 +194,17 @@ object CommsRepository {
         busy(true)
         try {
             if (config.isPaired) runCatching { api.unpair() }
+            // Twilio must forget this phone too, or the number keeps ringing it.
+            val voiceToken = config.voiceRegisteredToken
+            if (voiceToken != null) {
+                runCatching {
+                    val access = api.voiceToken().token
+                    Voice.unregister(access, Voice.RegistrationChannel.FCM, voiceToken, object : UnregistrationListener {
+                        override fun onUnregistered(accessToken: String, fcmToken: String) = Unit
+                        override fun onError(error: RegistrationException, accessToken: String, fcmToken: String) = Unit
+                    })
+                }
+            }
             store.clear()
             config.clear()
             CommsCrypto.destroy()
@@ -151,17 +245,19 @@ object CommsRepository {
     }
 
     private suspend fun registerPush(token: String) {
-        if (config.registeredPushToken == token) {
+        if (config.registeredPushToken != token) {
+            try {
+                api.registerPush(token)
+                config.setRegisteredPushToken(token)
+                _state.update { it.copy(pushRegistered = true, error = null) }
+            } catch (e: CommsException) {
+                _state.update { it.copy(pushRegistered = false, error = "Push registration failed: ${e.message}") }
+                return
+            }
+        } else {
             _state.update { it.copy(pushRegistered = true) }
-            return
         }
-        try {
-            api.registerPush(token)
-            config.setRegisteredPushToken(token)
-            _state.update { it.copy(pushRegistered = true, error = null) }
-        } catch (e: CommsException) {
-            _state.update { it.copy(pushRegistered = false, error = "Push registration failed: ${e.message}") }
-        }
+        registerVoice(token)
     }
 
     // ── Sync ──────────────────────────────────────────────────────────────
@@ -173,12 +269,19 @@ object CommsRepository {
      */
     suspend fun sync(): List<SmsMessage> = withContext(Dispatchers.IO) {
         if (!initialised || !config.isPaired) return@withContext emptyList()
+        syncMutex.withLock { syncLocked().first }
+    }
+
+    /** Like [sync], also returning the calls newly recorded as missed. */
+    suspend fun syncAll(): Pair<List<SmsMessage>, List<CallRecord>> = withContext(Dispatchers.IO) {
+        if (!initialised || !config.isPaired) return@withContext emptyList<SmsMessage>() to emptyList()
         syncMutex.withLock { syncLocked() }
     }
 
-    private suspend fun syncLocked(): List<SmsMessage> {
+    private suspend fun syncLocked(): Pair<List<SmsMessage>, List<CallRecord>> {
         busy(true)
         val fresh = ArrayList<SmsMessage>()
+        val missed = ArrayList<CallRecord>()
         try {
             // New messages, page by page, until the relay says there are no more.
             var cursor = config.syncCursor
@@ -196,6 +299,9 @@ object CommsRepository {
             if (updates.messages.isNotEmpty()) store.upsert(updates.messages)
             config.setUpdatesCursor(updates.now)
 
+            // The call log; a relay without the voice secrets answers this too.
+            missed += syncCalls()
+
             _state.update { it.copy(error = null, lastSync = System.currentTimeMillis()) }
         } catch (e: CommsException) {
             _state.update { it.copy(error = e.message) }
@@ -206,7 +312,7 @@ object CommsRepository {
             refreshUnread()
             bump()
         }
-        return fresh
+        return fresh to missed
     }
 
     /** Sync in the background, from lifecycle hooks. */
@@ -254,7 +360,10 @@ object CommsRepository {
 
     private fun refreshUnread() {
         _unread.value = runCatching { store.unreadCount() }.getOrDefault(0)
+        _missedCalls.value = runCatching { store.unseenMissedCalls() }.getOrDefault(0)
     }
+
+    private const val VOICE_REREGISTER_MS = 24 * 60 * 60_000L
 
     private fun fail(message: String): Result<Unit> {
         _state.update { it.copy(error = message) }

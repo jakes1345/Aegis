@@ -1,5 +1,9 @@
 package com.xat.aegis
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -24,7 +28,11 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.xat.aegis.comms.ActiveCall
+import com.xat.aegis.comms.CallPhase
+import com.xat.aegis.comms.CallRecord
 import com.xat.aegis.comms.CommsNotifications
 import com.xat.aegis.comms.CommsRepository
 import com.xat.aegis.comms.Direction
@@ -66,6 +74,7 @@ private val dateTimeFmt = SimpleDateFormat("MMM d HH:mm", Locale.US)
 @Composable
 fun CommsScreen(openPeer: String?, onPeerConsumed: () -> Unit) {
     val state by CommsRepository.state.collectAsStateWithLifecycle()
+    val activeCall by CommsRepository.activeCall.collectAsStateWithLifecycle()
     var peer by rememberSaveable { mutableStateOf<String?>(null) }
 
     LaunchedEffect(openPeer) {
@@ -76,11 +85,162 @@ fun CommsScreen(openPeer: String?, onPeerConsumed: () -> Unit) {
     }
 
     val current = peer
+    val call = activeCall
     when {
+        call != null -> InCallScreen(call)
         !state.paired -> PairingScreen()
         current != null -> ThreadScreen(peer = current, onBack = { peer = null })
         else -> ThreadListScreen(onOpen = { peer = it })
     }
+}
+
+// ── Calls ────────────────────────────────────────────────────────────────────
+
+/** Asks for the microphone if needed, then runs [onGranted]. */
+@Composable
+private fun rememberMicrophoneGate(onGranted: () -> Unit): () -> Unit {
+    val context = LocalContext.current
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) onGranted()
+    }
+    return {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            onGranted()
+        } else {
+            launcher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+}
+
+@Composable
+private fun InCallScreen(call: ActiveCall) {
+    val now = rememberTick(1_000L)
+    val accept = rememberMicrophoneGate { CommsRepository.acceptCall() }
+    val (title, colour) = when (call.phase) {
+        CallPhase.INCOMING -> "INCOMING CALL" to CClear
+        CallPhase.CONNECTING -> "CONNECTING" to CMuted
+        CallPhase.RINGING -> "RINGING" to CMuted
+        CallPhase.CONNECTED -> "IN CALL" to CClear
+        CallPhase.RECONNECTING -> "RECONNECTING" to CCaution
+        CallPhase.ENDED -> "CALL ENDED" to CMuted
+    }
+    Column(
+        Modifier.fillMaxSize().padding(horizontal = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(title, color = colour, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+        Spacer(Modifier.height(12.dp))
+        Text(call.peer, color = CInk, fontSize = 26.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+        Spacer(Modifier.height(6.dp))
+        Text(
+            when {
+                call.phase == CallPhase.CONNECTED && call.connectedAt > 0L -> durationText(now - call.connectedAt)
+                call.phase == CallPhase.ENDED -> call.error ?: "Ended"
+                call.direction == Direction.IN -> "to your Aegis number"
+                else -> "from your Aegis number"
+            },
+            color = if (call.error != null) CCritical else CInkDim, fontSize = 14.sp, fontFamily = FontFamily.Monospace
+        )
+        Spacer(Modifier.height(48.dp))
+        when (call.phase) {
+            CallPhase.INCOMING -> Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                CallButton("DECLINE", CCritical) { CommsRepository.rejectCall() }
+                CallButton("ACCEPT", CClear) { accept() }
+            }
+            CallPhase.ENDED -> Unit
+            else -> Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    ToggleChip(if (call.muted) "UNMUTE" else "MUTE", call.muted) { CommsRepository.toggleMute() }
+                    ToggleChip("SPEAKER", call.speaker) { CommsRepository.toggleSpeaker() }
+                }
+                CallButton("HANG UP", CCritical) { CommsRepository.hangUp() }
+            }
+        }
+        Spacer(Modifier.height(40.dp))
+        Text("Audio to Twilio is encrypted; from there it is an ordinary phone call.", color = CMuted, fontSize = 11.sp)
+    }
+}
+
+@Composable
+private fun CallButton(label: String, colour: Color, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        colors = ButtonDefaults.buttonColors(containerColor = colour, contentColor = Color(0xFF12161D)),
+        shape = RoundedCornerShape(28.dp),
+        modifier = Modifier.height(56.dp).widthIn(min = 140.dp)
+    ) { Text(label, fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
+}
+
+@Composable
+private fun ToggleChip(label: String, on: Boolean, onClick: () -> Unit) {
+    TextButton(
+        onClick = onClick,
+        shape = RoundedCornerShape(20.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, if (on) CAccent else CRule),
+        colors = ButtonDefaults.textButtonColors(containerColor = if (on) CAccent.copy(alpha = 0.15f) else CPanel)
+    ) { Text(label, color = if (on) CAccent else CInkDim, fontSize = 12.sp, letterSpacing = 1.sp) }
+}
+
+@Composable
+private fun CallLogList(calls: List<CallRecord>, onCall: (String) -> Unit, onMessage: (String) -> Unit) {
+    if (calls.isEmpty()) {
+        Column(Modifier.fillMaxWidth().background(CPanel, CShape).padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("No calls yet", color = CInkDim, fontSize = 14.sp)
+            Text("Calls to and from your number appear here.", color = CMuted, fontSize = 12.sp)
+        }
+        return
+    }
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        items(calls, key = { it.id }) { c ->
+            val colour = when {
+                c.missed -> CCritical
+                c.status == "completed" -> CClear
+                c.status == "ringing" || c.status == "in-progress" -> CBlue
+                else -> CMuted
+            }
+            Row(Modifier.fillMaxWidth().clip(CShape).background(CPanel).height(IntrinsicSize.Min)) {
+                Box(Modifier.width(3.dp).fillMaxHeight().background(colour))
+                Column(Modifier.weight(1f).padding(12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(c.peer, color = CInk, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
+                        Text(dateTimeFmt.format(Date(c.ts)), color = CMuted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                    }
+                    Text(
+                        buildString {
+                            append(if (c.direction == Direction.OUT) "Outgoing" else "Incoming")
+                            append(" · ")
+                            append(
+                                when (c.status) {
+                                    "completed" -> if (c.duration > 0) durationText(c.duration * 1000L) else "completed"
+                                    "missed" -> "missed"
+                                    "no-answer" -> "no answer"
+                                    "in-progress" -> "in progress"
+                                    else -> c.status
+                                }
+                            )
+                        },
+                        color = colour, fontSize = 12.sp
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        TextButton(onClick = { onCall(c.peer) }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                            Text("CALL", color = CClear, fontSize = 11.sp, letterSpacing = 1.sp)
+                        }
+                        TextButton(onClick = { onMessage(c.peer) }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                            Text("MESSAGE", color = CInkDim, fontSize = 11.sp, letterSpacing = 1.sp)
+                        }
+                    }
+                }
+            }
+        }
+        item(key = "§footer") { Spacer(Modifier.height(8.dp)) }
+    }
+}
+
+private fun durationText(ms: Long): String {
+    val s = (ms / 1000L).coerceAtLeast(0L)
+    return if (s >= 3600) "%d:%02d:%02d".format(Locale.US, s / 3600, (s % 3600) / 60, s % 60)
+    else "%d:%02d".format(Locale.US, s / 60, s % 60)
 }
 
 // ── Pairing ──────────────────────────────────────────────────────────────────
@@ -160,12 +320,29 @@ private fun ThreadListScreen(onOpen: (String) -> Unit) {
     val threads by produceState(initialValue = emptyList<Thread>(), version) {
         value = withContext(Dispatchers.IO) { CommsRepository.threads() }
     }
+    val calls by produceState(initialValue = emptyList<CallRecord>(), version) {
+        value = withContext(Dispatchers.IO) { CommsRepository.calls() }
+    }
+    val missed by CommsRepository.missedCalls.collectAsStateWithLifecycle()
+    var showCalls by rememberSaveable { mutableStateOf(false) }
     var newMessage by remember { mutableStateOf(false) }
     var confirmUnpair by remember { mutableStateOf(false) }
     val now = rememberTick()
+    var pendingCall by remember { mutableStateOf<String?>(null) }
+    val placeCall = rememberMicrophoneGate { pendingCall?.let { CommsRepository.placeCall(it) }; pendingCall = null }
+    val startCall: (String) -> Unit = { number -> pendingCall = number; placeCall() }
+
+    // Opening the call log marks the missed calls as seen.
+    LaunchedEffect(showCalls, version) {
+        if (showCalls) withContext(Dispatchers.IO) { CommsRepository.markCallsSeen() }
+    }
 
     if (newMessage) {
-        NewMessageDialog(onDismiss = { newMessage = false }, onOpen = { newMessage = false; onOpen(it) })
+        NewMessageDialog(
+            onDismiss = { newMessage = false },
+            onOpen = { newMessage = false; onOpen(it) },
+            onCall = { newMessage = false; startCall(it) }
+        )
     }
     if (confirmUnpair) {
         AlertDialog(
@@ -207,13 +384,24 @@ private fun ThreadListScreen(onOpen: (String) -> Unit) {
         Spacer(Modifier.height(6.dp))
         val statusLine = buildString {
             append(if (state.pushRegistered) "Push on" else "Push off — texts arrive on sync")
+            append(if (state.voiceRegistered) " · calls ring here" else " · calls not registered")
             if (state.lastSync > 0L) append(" · synced ${agoText(now, state.lastSync)}")
         }
-        Text(statusLine, color = if (state.pushRegistered) CMuted else CCaution, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+        Text(statusLine, color = if (state.pushRegistered && state.voiceRegistered) CMuted else CCaution, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
         state.error?.let { Text(it, color = CCritical, fontSize = 12.sp) }
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(8.dp))
 
-        if (threads.isEmpty()) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ToggleChip("MESSAGES", !showCalls) { showCalls = false }
+            ToggleChip(if (missed > 0) "CALLS · $missed missed" else "CALLS", showCalls) { showCalls = true }
+        }
+        Spacer(Modifier.height(8.dp))
+
+        if (showCalls) {
+            Box(Modifier.weight(1f)) {
+                CallLogList(calls, onCall = startCall, onMessage = onOpen)
+            }
+        } else if (threads.isEmpty()) {
             Column(Modifier.fillMaxWidth().background(CPanel, CShape).padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("No conversations yet", color = CInkDim, fontSize = 14.sp)
                 Text("Texts to your number appear here. Tap + NEW to start one.", color = CMuted, fontSize = 12.sp)
@@ -280,6 +468,7 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit) {
     var draft by rememberSaveable(peer) { mutableStateOf("") }
     var sendError by remember(peer) { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
+    val placeCall = rememberMicrophoneGate { CommsRepository.placeCall(peer) }
 
     // Opening the thread reads it; the notification for it goes away too.
     LaunchedEffect(peer, version) {
@@ -298,6 +487,9 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit) {
             }
             Spacer(Modifier.width(12.dp))
             Text(peer, color = CInk, fontSize = 16.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
+            TextButton(onClick = placeCall, enabled = state.voiceRegistered || state.paired) {
+                Text("CALL", color = CClear, fontSize = 11.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold)
+            }
         }
         Text("SMS via ${state.number ?: "your number"} · carrier-visible, not end-to-end encrypted", color = CMuted, fontSize = 10.sp)
         Spacer(Modifier.height(8.dp))
@@ -372,13 +564,13 @@ private fun MessageBubble(m: SmsMessage, onRetryStatus: () -> Unit) {
 // ── New message ──────────────────────────────────────────────────────────────
 
 @Composable
-private fun NewMessageDialog(onDismiss: () -> Unit, onOpen: (String) -> Unit) {
+private fun NewMessageDialog(onDismiss: () -> Unit, onOpen: (String) -> Unit, onCall: (String) -> Unit) {
     var number by remember { mutableStateOf("") }
     val normalised = normalisePhone(number)
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = CPanel,
-        title = { Text("New message", color = CInk, fontWeight = FontWeight.Bold) },
+        title = { Text("New message or call", color = CInk, fontWeight = FontWeight.Bold) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
@@ -395,8 +587,13 @@ private fun NewMessageDialog(onDismiss: () -> Unit, onOpen: (String) -> Unit) {
             }
         },
         confirmButton = {
-            TextButton(onClick = { normalised?.let(onOpen) }, enabled = normalised != null) {
-                Text("OPEN", color = CAccent, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick = { normalised?.let(onCall) }, enabled = normalised != null) {
+                    Text("CALL", color = CClear, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                }
+                TextButton(onClick = { normalised?.let(onOpen) }, enabled = normalised != null) {
+                    Text("MESSAGE", color = CAccent, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                }
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("CANCEL", color = CMuted, letterSpacing = 1.sp) } }
@@ -437,11 +634,11 @@ private fun agoText(now: Long, ts: Long): String {
 }
 
 @Composable
-private fun rememberTick(): Long {
+private fun rememberTick(periodMs: Long = 30_000L): Long {
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
+    LaunchedEffect(periodMs) {
         while (true) {
-            kotlinx.coroutines.delay(30_000L)
+            kotlinx.coroutines.delay(periodMs)
             now = System.currentTimeMillis()
         }
     }
