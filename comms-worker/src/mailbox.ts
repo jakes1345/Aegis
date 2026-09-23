@@ -237,13 +237,28 @@ export class Mailbox extends DurableObject<Env> {
 
   /** Drops envelopes older than the TTL; runs daily. */
   override async alarm(): Promise<void> {
-    const cutoff = Date.now() - ENVELOPE_TTL_MS;
-    const map = await this.ctx.storage.list<Envelope>({ prefix: "q:" });
-    const stale = [...map.values()].filter((e) => e.ts < cutoff).map((e) => `q:${e.id}`);
-    if (stale.length > 0) {
-      const removed = await this.deleteKeys(stale);
-      const count = (await this.ctx.storage.get<number>("queueCount")) ?? 0;
-      await this.ctx.storage.put("queueCount", Math.max(0, count - removed));
+    // A full mailbox is up to 2,000 envelopes of ~87 KiB, more than the
+    // object's memory allows in one list; the scan is paged. Cleanup errors
+    // are swallowed so the alarm is always re-armed: the platform stops
+    // retrying a throwing alarm after six attempts.
+    try {
+      const cutoff = Date.now() - ENVELOPE_TTL_MS;
+      let startAfter: string | undefined;
+      let removed = 0;
+      for (;;) {
+        const page = await this.ctx.storage.list<Envelope>({ prefix: "q:", startAfter, limit: DELETE_BATCH });
+        if (page.size === 0) break;
+        const keys = [...page.keys()];
+        const stale = [...page].filter(([, e]) => e.ts < cutoff).map(([key]) => key);
+        if (stale.length > 0) removed += await this.deleteKeys(stale);
+        startAfter = keys[keys.length - 1];
+      }
+      if (removed > 0) {
+        const count = (await this.ctx.storage.get<number>("queueCount")) ?? 0;
+        await this.ctx.storage.put("queueCount", Math.max(0, count - removed));
+      }
+    } catch (e) {
+      console.error("envelope cleanup failed", e);
     }
     if (await this.ctx.storage.get("profile")) await this.ctx.storage.setAlarm(Date.now() + 24 * 60 * 60_000);
   }
