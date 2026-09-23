@@ -401,10 +401,7 @@ class ScanService : LifecycleService() {
                 // Phone health: immediately on first cycle, then every ~30s
                 publishCycle++
                 if (publishCycle == 1 || publishCycle % 20 == 0) {
-                    // Only the findings: mic and camera state is pushed by the
-                    // monitor's callbacks and must not be overwritten here.
-                    val findings = phoneHealthMonitor.scan()
-                    Registry.updatePhoneHealth { it.copy(findings = findings) }
+                    phoneHealthMonitor.scanAndPublish()
                 }
 
                 // WiFi anomaly scan: immediately on first cycle, then every ~60s

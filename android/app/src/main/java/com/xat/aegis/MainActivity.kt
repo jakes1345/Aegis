@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.nfc.NfcAdapter
+import android.nfc.Tag
 import android.os.Bundle
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -56,9 +57,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import android.content.res.Resources
 import android.graphics.Bitmap
 import android.graphics.Paint as AndroidPaint
@@ -67,6 +72,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.xat.aegis.CatcherFinding
 import com.xat.aegis.analysis.CardVault
 import com.xat.aegis.analysis.NfcScanner
+import com.xat.aegis.analysis.PhoneHealthMonitor
 import com.xat.aegis.analysis.Report
 import android.nfc.cardemulation.CardEmulation
 import kotlinx.coroutines.Dispatchers
@@ -109,25 +115,39 @@ private val Blue       = Color(0xFF4A8FD4)
 
 private val CardShape = RoundedCornerShape(4.dp)
 
-/** Everything the app asks for up front. */
+/**
+ * Everything the app asks for up front.
+ *
+ * Fine and coarse location are always requested together: from Android 12 a
+ * request naming ACCESS_FINE_LOCATION without ACCESS_COARSE_LOCATION is ignored
+ * outright, so the location prompt never appeared and the scanner could not start.
+ */
 private val REQUIRED = arrayOf(
     Manifest.permission.BLUETOOTH_SCAN,
     Manifest.permission.BLUETOOTH_CONNECT,
     Manifest.permission.ACCESS_FINE_LOCATION,
+    Manifest.permission.ACCESS_COARSE_LOCATION,
     Manifest.permission.POST_NOTIFICATIONS
 )
 
 /**
  * The subset without which scanning cannot run at all: the scan itself, and the
  * location permission that a location-typed foreground service is refused without.
+ * Coarse location rides along because Android requires it in the same request;
+ * a grant of fine location always includes it, so checking both is checking fine.
  *
  * Notifications are separate on purpose. Requiring them meant declining the
  * notification prompt silently blocked the whole detector.
  */
 private val ESSENTIAL = arrayOf(
     Manifest.permission.BLUETOOTH_SCAN,
-    Manifest.permission.ACCESS_FINE_LOCATION
+    Manifest.permission.ACCESS_FINE_LOCATION,
+    Manifest.permission.ACCESS_COARSE_LOCATION
 )
+
+/** The tab indices MainApp lays out, for code outside it that needs to name one. */
+private const val TAB_NFC = 4
+private const val TAB_DEVICE = 6
 
 // ── Activity ───────────────────────────────────────────────────────────
 
@@ -141,8 +161,23 @@ class MainActivity : AppCompatActivity() {
     private val cardVault by lazy { CardVault(applicationContext) }
     private val hceComponent by lazy { ComponentName(this, CardEmulationService::class.java) }
 
+    /**
+     * The static device-health scan (accessibility services, device admins, debug
+     * settings) needs no service, so the Activity runs it too — otherwise the Device
+     * tab read "no issues" with the scanner off and nothing having looked.
+     */
+    private val phoneHealthMonitor by lazy { PhoneHealthMonitor(applicationContext) }
+
     /** Whether reader mode is currently enabled on the adapter by this activity. */
     private var readerModeOn = false
+
+    /**
+     * True between onResume and onPause. The lifecycle's own state cannot be used
+     * for this from inside onResume: androidx only marks the Activity RESUMED after
+     * onResume returns, so a guard on it there always failed and reader mode was
+     * never switched on.
+     */
+    private var resumed = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -159,6 +194,20 @@ class MainActivity : AppCompatActivity() {
 
         // Show the stored timeline even before the scanner has run this session.
         lifecycleScope.launch(Dispatchers.IO) { runCatching { TimelineLog.publish(applicationContext) } }
+
+        // Results of BiometricPrompt arrive through the Registry, so that whichever
+        // Activity instance is on screen when they land carries the operation out.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                Registry.vaultAuth.collect { pending ->
+                    if (pending != null) Registry.takeVaultAuth()?.let { handleAuthResult(it) }
+                }
+            }
+        }
+
+        // A tag tapped while Aegis was not in reader mode (backgrounded, or picked
+        // from the system's NFC chooser) arrives as the launching intent.
+        handleNfcIntent(intent)
 
         val onboardingAlreadyDone = isOnboardingDone(this)
         setContent {
@@ -192,12 +241,13 @@ class MainActivity : AppCompatActivity() {
                             onStop = { sendToService(ScanService.ACTION_STOP) },
                             onClearData = { sendToService(ScanService.ACTION_CLEAR) },
                             hasPermissions = { ESSENTIAL.all { granted(it) } },
-                            onAddToVault = { tag, label -> addToVault(tag, label) },
+                            onAddToVault = { tag, label, replace -> addToVault(tag, label, replace) },
                             onRemoveVault = { id -> removeFromVault(id) },
                             onEmulate = { card -> if (card == null) stopEmulation() else armEmulation(card) },
                             onUnlockVault = { unlockVault() },
                             onLockVault = { Registry.lockVault() },
-                            onEraseVault = { eraseVault() }
+                            onEraseVault = { eraseVault() },
+                            onRefreshDeviceHealth = { refreshDeviceHealth() }
                         )
                     }
                 }
@@ -228,16 +278,54 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        resumed = true
         applyNfcMode()
+        refreshDeviceHealth()
     }
 
     override fun onPause() {
+        resumed = false
         super.onPause()
         nfcAdapter?.let { adapter ->
             if (readerModeOn) runCatching { adapter.disableReaderMode(this) }
         }
         readerModeOn = false
         runCatching { cardEmulation?.unsetPreferredService(this) }
+    }
+
+    /** The activity is singleTop, so a tag delivered while it is up lands here. */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNfcIntent(intent)
+    }
+
+    /**
+     * The manifest registers for NDEF, TECH and TAG discovery, which puts Aegis in
+     * the system's NFC chooser and delivers tags tapped while it is backgrounded.
+     * Those intents were never read, so choosing Aegis dropped the tag on the floor.
+     */
+    private fun handleNfcIntent(intent: Intent?) {
+        val action = intent?.action ?: return
+        if (action != NfcAdapter.ACTION_NDEF_DISCOVERED &&
+            action != NfcAdapter.ACTION_TECH_DISCOVERED &&
+            action != NfcAdapter.ACTION_TAG_DISCOVERED
+        ) return
+        val tag = IntentCompat.getParcelableExtra(intent, NfcAdapter.EXTRA_TAG, Tag::class.java) ?: return
+        // Consumed: a later onCreate (recreation) must not scan the same tag again.
+        intent.action = null
+        Registry.requestTab(TAB_NFC)
+        // Parsing talks to the tag over the air and must not block the main thread.
+        lifecycleScope.launch(Dispatchers.IO) {
+            val parsed = try { NfcScanner.parse(tag) } catch (_: Exception) { return@launch }
+            Registry.addNfc(parsed)
+            runCatching { recordNfc(parsed) }
+        }
+    }
+
+    /** Runs the static findings scan off the main thread and publishes the result. */
+    private fun refreshDeviceHealth() {
+        lifecycleScope.launch(Dispatchers.IO) { runCatching { phoneHealthMonitor.scanAndPublish() } }
     }
 
     override fun onStop() {
@@ -258,7 +346,9 @@ class MainActivity : AppCompatActivity() {
      * and Aegis is made the preferred HCE service for as long as it is in front.
      */
     private fun applyNfcMode() {
-        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
+        // Reader mode is only valid on a resumed, live activity; the flag is kept by
+        // hand because the lifecycle is still STARTED while onResume runs.
+        if (!resumed || isFinishing) return
         val adapter = nfcAdapter ?: return
         if (Registry.emulating.value != null) {
             if (readerModeOn) runCatching { adapter.disableReaderMode(this) }
@@ -341,6 +431,11 @@ class MainActivity : AppCompatActivity() {
         if (!registered) {
             CardEmulationService.activePairs = emptyList()
             clearHceAids()
+            // The pairs and AIDs are gone, so whatever was armed before — switching
+            // from card A to card B that then failed — is gone with them. Say so,
+            // or the banner keeps announcing A with nothing behind it.
+            Registry.setEmulating(null)
+            applyNfcMode()
             toast("Android refused this card's application IDs — it cannot be emulated")
             return
         }
@@ -362,34 +457,45 @@ class MainActivity : AppCompatActivity() {
 
     // ── Vault ────────────────────────────────────────────────────────────────
 
+    /**
+     * Decrypted cards are only ever shown to an Activity that is on screen. onStop
+     * re-locks the vault, and a decryption or save still in flight at that moment
+     * used to publish Unlocked(cards) straight after it, leaving the cards readable
+     * from the background. Anything that would publish Unlocked goes through here.
+     */
+    private fun publishUnlocked(cards: List<VaultCard>) {
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            Registry.publishVault(VaultState.Unlocked(cards))
+        }
+        // Otherwise onStop has locked it; the cards are discarded with the coroutine.
+    }
+
     /** Authenticates, then decrypts and publishes the vault. */
     private fun unlockVault(attempt: Int = 0) {
         Registry.publishVault(VaultState.Unlocking)
-        authenticate(
-            onUnavailable = { message ->
-                Registry.publishVault(
-                    if (message == null) VaultState.Locked
-                    else VaultState.Failed(message, retryable = true, erasable = false)
-                )
-            }
-        ) {
-            lifecycleScope.launch {
-                val result = withContext(Dispatchers.IO) { cardVault.load() }
-                when (result) {
-                    is CardVault.LoadResult.Loaded ->
-                        Registry.publishVault(VaultState.Unlocked(result.cards))
-                    is CardVault.LoadResult.Failed ->
-                        if (result.failure is CardVault.Failure.AuthRequired && attempt == 0) {
-                            unlockVault(attempt + 1)
-                        } else {
-                            Registry.publishVault(failedState(result.failure))
-                        }
-                }
+        authenticate(VaultAuthPurpose.Unlock(attempt))
+    }
+
+    private fun loadVault(attempt: Int) {
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) { cardVault.load() }
+            when (result) {
+                is CardVault.LoadResult.Loaded -> publishUnlocked(result.cards)
+                is CardVault.LoadResult.Failed ->
+                    if (result.failure is CardVault.Failure.AuthRequired && attempt == 0) {
+                        // The auth did not reach the key (it can lapse between the prompt
+                        // and the decrypt). One re-prompt — but only while the Activity
+                        // is in front to show it; otherwise "Unlocking" would sit there
+                        // forever with no prompt behind it.
+                        if (resumed) unlockVault(attempt + 1) else Registry.publishVault(VaultState.Locked)
+                    } else {
+                        Registry.publishVault(failedState(result.failure))
+                    }
             }
         }
     }
 
-    private fun addToVault(tag: NfcTag, label: String) {
+    private fun addToVault(tag: NfcTag, label: String, replace: Boolean) {
         val card = VaultCard(
             id        = UUID.randomUUID().toString(),
             uid       = tag.uid,
@@ -398,49 +504,61 @@ class MainActivity : AppCompatActivity() {
             addedTs   = System.currentTimeMillis(),
             apduPairs = tag.apduPairs
         )
-        writeVault({ it.add(card) }) { toast("Saved \"$label\" to the vault") }
+        Registry.setReplacePrompt(null)
+        writeVault(VaultOp.Add(card, replace))
     }
 
     private fun removeFromVault(id: String) {
-        writeVault({ it.remove(id) }) {
-            if (Registry.emulating.value?.id == id) stopEmulation()
-        }
+        writeVault(VaultOp.Remove(id))
     }
 
     /**
      * Runs a vault write. The key's authentication lasts 30 seconds, so a write some
      * time after unlocking needs the user again: on AuthRequired this prompts and
      * retries once. Any other failure leaves the stored vault untouched and says why.
+     *
+     * The operation is data ([VaultOp]) rather than a closure so the retry can be
+     * carried out by whichever Activity instance receives the prompt's result.
      */
-    private fun writeVault(
-        op: (CardVault) -> CardVault.WriteResult,
-        attempt: Int = 0,
-        onSaved: () -> Unit
-    ) {
+    private fun writeVault(op: VaultOp, attempt: Int = 0) {
         lifecycleScope.launch {
-            when (val result = withContext(Dispatchers.IO) { op(cardVault) }) {
+            val result = withContext(Dispatchers.IO) {
+                when (op) {
+                    is VaultOp.Add -> cardVault.add(op.card, op.replace)
+                    is VaultOp.Remove -> cardVault.remove(op.id)
+                }
+            }
+            when (result) {
                 is CardVault.WriteResult.Saved -> {
-                    // If the vault was already open, keep it open with the fresh list.
-                    // If the save went through explicit BiometricPrompt (attempt > 0),
-                    // the user just proved their identity — open the vault so they can
-                    // see the card they just saved. Do NOT open it when the auth window
-                    // was silently still warm (attempt == 0) and the vault was locked —
-                    // that would reveal all cards without the user asking to see them.
-                    if (Registry.vault.value is VaultState.Unlocked || attempt > 0) {
-                        Registry.publishVault(VaultState.Unlocked(result.cards))
+                    // Always publish the fresh list: + VAULT is only offered while the
+                    // vault is open, and a save that went through the prompt has just
+                    // proved the user's identity. Either way the tag row's IN VAULT
+                    // state comes from this list, so it has to be current.
+                    publishUnlocked(result.cards)
+                    when (op) {
+                        is VaultOp.Add -> toast("Saved \"${op.card.label}\" to the vault")
+                        is VaultOp.Remove -> if (Registry.emulating.value?.id == op.id) stopEmulation()
                     }
-                    onSaved()
                 }
                 is CardVault.WriteResult.Failed -> when (val f = result.failure) {
                     CardVault.Failure.AuthRequired ->
-                        if (attempt == 0) {
-                            authenticate(onUnavailable = { message ->
-                                toast(message ?: "Vault not changed — authentication cancelled")
-                            }) { writeVault(op, attempt + 1, onSaved) }
+                        if (attempt == 0 && resumed) {
+                            authenticate(VaultAuthPurpose.Write(op, attempt + 1))
                         } else {
                             toast("Vault not changed — authentication did not take effect")
                         }
                     CardVault.Failure.NoLockScreen -> toast(NO_LOCK_SCREEN)
+                    is CardVault.Failure.Duplicate -> {
+                        // Only an Add can be refused this way; the UI asks before
+                        // overwriting, and the answer comes back with replace = true.
+                        val add = op as? VaultOp.Add ?: return@launch
+                        val tag = Registry.nfc.value.firstOrNull { it.uid == add.card.uid }
+                        if (tag != null) {
+                            Registry.setReplacePrompt(ReplacePrompt(tag, add.card.label, f.existing))
+                        } else {
+                            toast("\"${f.existing.label}\" is already in the vault with this UID")
+                        }
+                    }
                     else -> {
                         toast("Vault not changed — it could not be read")
                         Registry.publishVault(failedState(f))
@@ -456,25 +574,46 @@ class MainActivity : AppCompatActivity() {
      * phone cannot be used to wipe it.
      */
     private fun eraseVault() {
-        val doErase = {
-            lifecycleScope.launch {
-                val erased = withContext(Dispatchers.IO) { cardVault.erase() }
-                if (erased) {
-                    if (Registry.emulating.value != null) stopEmulation()
-                    Registry.publishVault(VaultState.Unlocked(emptyList()))
-                    toast("Vault erased")
-                } else {
-                    toast("The vault could not be erased")
-                }
-            }
-            Unit
-        }
         if (BiometricManager.from(this).canAuthenticate(VAULT_AUTHENTICATORS) ==
             BiometricManager.BIOMETRIC_SUCCESS
         ) {
-            authenticate(onUnavailable = { message -> message?.let { toast(it) } }) { doErase() }
+            authenticate(VaultAuthPurpose.Erase)
         } else {
             doErase()
+        }
+    }
+
+    private fun doErase() {
+        lifecycleScope.launch {
+            val erased = withContext(Dispatchers.IO) { cardVault.erase() }
+            if (erased) {
+                if (Registry.emulating.value != null) stopEmulation()
+                publishUnlocked(emptyList())
+                toast("Vault erased")
+            } else {
+                toast("The vault could not be erased")
+            }
+        }
+    }
+
+    /** Carries out the operation a completed BiometricPrompt was shown for. */
+    private fun handleAuthResult(result: VaultAuthResult) {
+        val purpose = result.purpose
+        when (val outcome = result.outcome) {
+            VaultAuthOutcome.Succeeded -> when (purpose) {
+                is VaultAuthPurpose.Unlock -> loadVault(purpose.attempt)
+                is VaultAuthPurpose.Write -> writeVault(purpose.op, purpose.attempt)
+                VaultAuthPurpose.Erase -> doErase()
+            }
+            is VaultAuthOutcome.Failed -> when (purpose) {
+                is VaultAuthPurpose.Unlock -> Registry.publishVault(
+                    if (outcome.message == null) VaultState.Locked
+                    else VaultState.Failed(outcome.message, retryable = true, erasable = false)
+                )
+                is VaultAuthPurpose.Write ->
+                    toast(outcome.message ?: "Vault not changed — authentication cancelled")
+                VaultAuthPurpose.Erase -> outcome.message?.let { toast(it) }
+            }
         }
     }
 
@@ -492,6 +631,12 @@ class MainActivity : AppCompatActivity() {
         CardVault.Failure.NoLockScreen -> VaultState.Failed(
             NO_LOCK_SCREEN, retryable = true, erasable = false
         )
+        // A refused overwrite is answered with a prompt, never a failed vault; this
+        // only exists to keep the mapping total.
+        is CardVault.Failure.Duplicate -> VaultState.Failed(
+            "\"${f.existing.label}\" is already stored with this UID.",
+            retryable = true, erasable = false
+        )
         is CardVault.Failure.Error -> VaultState.Failed(
             "The vault could not be decrypted (${f.cause.javaClass.simpleName}). " +
                 "Nothing has been changed or overwritten.",
@@ -501,15 +646,21 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Shows BiometricPrompt allowing a strong biometric or the device PIN, pattern or
-     * password — the same set the vault key accepts. [onUnavailable] gets a message
-     * to show, or null when the user simply cancelled.
+     * password — the same set the vault key accepts. The result is published to the
+     * Registry as a [VaultAuthResult] for [purpose], not handed to a closure: the
+     * callback then holds nothing of this Activity instance, and the instance alive
+     * when the result lands (this one, or its replacement after a recreation) acts
+     * on it.
      */
-    private fun authenticate(onUnavailable: (String?) -> Unit, onSuccess: () -> Unit) {
+    private fun authenticate(purpose: VaultAuthPurpose) {
+        fun fail(message: String?) =
+            Registry.publishVaultAuth(VaultAuthResult(purpose, VaultAuthOutcome.Failed(message)))
+
         when (val can = BiometricManager.from(this).canAuthenticate(VAULT_AUTHENTICATORS)) {
             BiometricManager.BIOMETRIC_SUCCESS -> Unit
-            BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> { onUnavailable(NO_LOCK_SCREEN); return }
+            BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> { fail(NO_LOCK_SCREEN); return }
             else -> {
-                onUnavailable("This phone cannot confirm your identity right now (code $can).")
+                fail("This phone cannot confirm your identity right now (code $can).")
                 return
             }
         }
@@ -517,28 +668,40 @@ class MainActivity : AppCompatActivity() {
             this, ContextCompat.getMainExecutor(this),
             object : BiometricPrompt.AuthenticationCallback() {
                 override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    onSuccess()
+                    Registry.publishVaultAuth(VaultAuthResult(purpose, VaultAuthOutcome.Succeeded))
                 }
 
                 override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
                     val cancelled = errorCode == BiometricPrompt.ERROR_USER_CANCELED ||
                         errorCode == BiometricPrompt.ERROR_CANCELED ||
                         errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON
-                    onUnavailable(if (cancelled) null else errString.toString())
+                    Registry.publishVaultAuth(
+                        VaultAuthResult(purpose, VaultAuthOutcome.Failed(if (cancelled) null else errString.toString()))
+                    )
                 }
                 // onAuthenticationFailed is a single rejected attempt; the prompt
                 // stays up for another try, so there is nothing to do.
             }
         )
+        // Each operation says what it is: the erase and save prompts used to wear
+        // the unlock's "view and use stored cards" copy.
+        val (title, subtitle) = when (purpose) {
+            is VaultAuthPurpose.Unlock -> "Unlock card vault" to "Confirm it's you to view and use stored cards"
+            VaultAuthPurpose.Erase -> "Erase card vault" to "This permanently deletes every stored card"
+            is VaultAuthPurpose.Write -> when (purpose.op) {
+                is VaultOp.Add -> "Save card to vault" to "Confirm it's you to store this card"
+                is VaultOp.Remove -> "Remove card from vault" to "Confirm it's you to change stored cards"
+            }
+        }
         // No negative button: with DEVICE_CREDENTIAL allowed the prompt supplies its
         // own "use PIN" path, and BiometricPrompt rejects a negative button then.
         val info = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("Unlock card vault")
-            .setSubtitle("Confirm it's you to view and use stored cards")
+            .setTitle(title)
+            .setSubtitle(subtitle)
             .setAllowedAuthenticators(VAULT_AUTHENTICATORS)
             .build()
         runCatching { prompt.authenticate(info) }
-            .onFailure { onUnavailable("Could not show the unlock prompt: ${it.message}") }
+            .onFailure { fail("Could not show the ${title.lowercase(Locale.US)} prompt: ${it.message}") }
     }
 
     private fun toast(message: String) {
@@ -758,12 +921,13 @@ private fun MainApp(
     onStop: () -> Unit,
     onClearData: () -> Unit,
     hasPermissions: () -> Boolean,
-    onAddToVault: (NfcTag, String) -> Unit,
+    onAddToVault: (NfcTag, String, Boolean) -> Unit,
     onRemoveVault: (String) -> Unit,
     onEmulate: (VaultCard?) -> Unit,
     onUnlockVault: () -> Unit,
     onLockVault: () -> Unit,
-    onEraseVault: () -> Unit
+    onEraseVault: () -> Unit,
+    onRefreshDeviceHealth: () -> Unit
 ) {
     var tab by remember { mutableIntStateOf(0) }
     val tabs = listOf("SCAN", "MAP", "LOG", "CELL", "NFC", "WIFI", "DEVICE")
@@ -774,6 +938,12 @@ private fun MainApp(
     val nfc by Registry.nfc.collectAsStateWithLifecycle()
     val wifi by Registry.wifi.collectAsStateWithLifecycle()
     val phoneHealth by Registry.phoneHealth.collectAsStateWithLifecycle()
+
+    // A tag delivered by a system NFC intent lands on the NFC tab.
+    val tabRequest by Registry.tabRequest.collectAsStateWithLifecycle()
+    LaunchedEffect(tabRequest) {
+        if (tabRequest != null) Registry.takeTabRequest()?.let { tab = it.coerceIn(0, tabs.size - 1) }
+    }
 
     // Settings navigation and threat explainer state
     var showSettings by remember { mutableStateOf(false) }
@@ -819,7 +989,7 @@ private fun MainApp(
                     onEraseVault = onEraseVault
                 )
                 5 -> WifiScreen()
-                6 -> DeviceScreen()
+                TAB_DEVICE -> DeviceScreen(onShown = onRefreshDeviceHealth)
             }
         }
         NavigationBar(
@@ -1519,9 +1689,23 @@ private fun MapScreen() {
         mapView.invalidate()
     }
 
-    DisposableEffect(Unit) {
-        mapView.onResume()
+    // The MapView follows the Activity's lifecycle, not just composition: it used to
+    // be resumed once when the tab appeared and paused only when the tab was left,
+    // so backgrounding Aegis on the Map tab left its tile threads and animations
+    // running. Registering the observer on an already-resumed lifecycle replays
+    // ON_RESUME, which is what brings the view up on first composition.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, mapView) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> mapView.onResume()
+                Lifecycle.Event.ON_PAUSE -> mapView.onPause()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
             mapView.onPause()
             // Leaving the tab discards this MapView (it lives in remember{}), so it has
             // to release its tile provider threads and caches, or every visit to the
@@ -1920,9 +2104,20 @@ private fun FindingRow(f: CatcherFinding, onShowExplainer: (() -> Unit)? = null)
 
 // ── NFC screen ─────────────────────────────────────────────────────────
 
+/**
+ * DESFire and MIFARE Plus are ISO 14443-4 and so technically emulable, but they
+ * authenticate with a challenge the phone cannot answer; only the static exchanges
+ * a reader happens not to challenge can be replayed. Plain ISO 14443-4 is the case
+ * HCE actually covers.
+ */
+private val CardProfile.hceLimited: Boolean
+    get() = this == CardProfile.MIFARE_DESFIRE || this == CardProfile.MIFARE_PLUS
+
+private const val HCE_LIMITED_CAVEAT = "Static replay only — readers that challenge the card will reject it"
+
 @Composable
 private fun NfcScreen(
-    onAddToVault: (NfcTag, String) -> Unit,
+    onAddToVault: (NfcTag, String, Boolean) -> Unit,
     onRemoveVault: (String) -> Unit,
     onEmulate: (VaultCard?) -> Unit,
     onUnlockVault: () -> Unit,
@@ -1932,10 +2127,40 @@ private fun NfcScreen(
     val tags       by Registry.nfc.collectAsStateWithLifecycle()
     val vaultState by Registry.vault.collectAsStateWithLifecycle()
     val armed      by Registry.emulating.collectAsStateWithLifecycle()
+    val replace    by Registry.replacePrompt.collectAsStateWithLifecycle()
     val emulId = armed?.id
     // Cards exist here only while the vault is unlocked.
     val vault = (vaultState as? VaultState.Unlocked)?.cards.orEmpty()
+    val vaultOpen = vaultState is VaultState.Unlocked
     var confirmErase by remember { mutableStateOf(false) }
+
+    // The vault refused to overwrite a stored card with this UID; ask.
+    val pendingReplace = replace
+    if (pendingReplace != null) {
+        AlertDialog(
+            onDismissRequest = { Registry.setReplacePrompt(null) },
+            containerColor = Panel,
+            title = { Text("Replace existing card?", color = Ink, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "\"${pendingReplace.existing.label}\" is already in the vault with UID " +
+                        "${pendingReplace.existing.uid}. Replace it with this scan, saved as " +
+                        "\"${pendingReplace.label}\"? The stored copy is overwritten.",
+                    color = InkDim, fontSize = 13.sp, lineHeight = 18.sp
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { onAddToVault(pendingReplace.tag, pendingReplace.label, true) }) {
+                    Text("REPLACE", color = Caution, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { Registry.setReplacePrompt(null) }) {
+                    Text("KEEP EXISTING", color = Muted, letterSpacing = 1.sp)
+                }
+            }
+        )
+    }
 
     if (confirmErase) {
         AlertDialog(
@@ -2102,8 +2327,13 @@ private fun NfcScreen(
                 )
             }
             items(tags, key = { "t_${it.uid}" }) { tag ->
-                NfcTagRow(t = tag, inVault = vault.any { it.uid == tag.uid },
-                    onAddToVault = { label -> onAddToVault(tag, label) })
+                NfcTagRow(
+                    t = tag,
+                    inVault = vault.any { it.uid == tag.uid },
+                    vaultOpen = vaultOpen,
+                    onAddToVault = { label -> onAddToVault(tag, label, false) },
+                    onUnlockVault = onUnlockVault
+                )
             }
         }
 
@@ -2126,16 +2356,19 @@ private fun VaultCardRow(
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(card.label, color = Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (card.profile.hceCapable) {
-                    ThreatBadge(if (isEmulating) "ACTIVE" else "HCE OK", if (isEmulating) Blue else Clear)
-                } else {
-                    ThreatBadge("STORED", Muted)
+                when {
+                    isEmulating -> ThreatBadge("ACTIVE", Blue)
+                    card.profile.hceLimited -> ThreatBadge("HCE LIMITED", Caution)
+                    card.profile.hceCapable -> ThreatBadge("HCE OK", Clear)
+                    else -> ThreatBadge("STORED", Muted)
                 }
             }
             Text("${card.profile.label} · UID ${card.uid}", color = Accent, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
             if (!card.profile.hceCapable) {
                 Text("This card type uses a proprietary RF protocol — HCE emulation is not possible. UID and type are stored for identification.",
                     color = Muted, fontSize = 11.sp)
+            } else if (card.profile.hceLimited) {
+                Text(HCE_LIMITED_CAVEAT, color = Caution.copy(alpha = 0.9f), fontSize = 11.sp)
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(fmtTime(card.addedTs), color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
@@ -2163,7 +2396,13 @@ private fun VaultCardRow(
 }
 
 @Composable
-private fun NfcTagRow(t: NfcTag, inVault: Boolean, onAddToVault: (String) -> Unit) {
+private fun NfcTagRow(
+    t: NfcTag,
+    inVault: Boolean,
+    vaultOpen: Boolean,
+    onAddToVault: (String) -> Unit,
+    onUnlockVault: () -> Unit
+) {
     val clipboard = LocalClipboardManager.current
     var copied by remember(t.uid) { mutableStateOf(false) }
     var addingLabel by remember(t.uid) { mutableStateOf(false) }
@@ -2213,7 +2452,10 @@ private fun NfcTagRow(t: NfcTag, inVault: Boolean, onAddToVault: (String) -> Uni
             }
 
             // HCE capability hint
-            if (t.profile.hceCapable && !isPayment) {
+            if (t.profile.hceLimited && !isPayment) {
+                Text("HCE limited — $HCE_LIMITED_CAVEAT. Add to vault to try it.",
+                    color = Caution.copy(alpha = 0.9f), fontSize = 11.sp)
+            } else if (t.profile.hceCapable && !isPayment) {
                 Text("This card type can be emulated via HCE — add to vault to use phone as card.",
                     color = Clear.copy(alpha = 0.8f), fontSize = 11.sp)
             }
@@ -2254,7 +2496,16 @@ private fun NfcTagRow(t: NfcTag, inVault: Boolean, onAddToVault: (String) -> Uni
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(fmtTime(t.ts), color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    if (!inVault && !isPayment && !addingLabel) {
+                    // Whether the tag is already stored is only known while the vault
+                    // is open, so a locked vault offers the unlock, not the save: with
+                    // the key's auth window still warm, a save from here used to go
+                    // through without a prompt and replace the stored card unseen.
+                    if (!vaultOpen && !isPayment) {
+                        TextButton(
+                            onClick = onUnlockVault,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                        ) { Text("UNLOCK TO SAVE", color = Accent, fontSize = 11.sp, letterSpacing = 1.sp) }
+                    } else if (!inVault && !isPayment && !addingLabel) {
                         TextButton(
                             onClick = { addingLabel = true; labelText = t.profile.label },
                             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
@@ -2280,8 +2531,13 @@ private fun NfcTagRow(t: NfcTag, inVault: Boolean, onAddToVault: (String) -> Uni
 // ── Device health screen ────────────────────────────────────────────────
 
 @Composable
-private fun DeviceScreen() {
+private fun DeviceScreen(onShown: () -> Unit) {
     val health by Registry.phoneHealth.collectAsStateWithLifecycle()
+    val status by Registry.status.collectAsStateWithLifecycle()
+    // Live microphone and camera monitoring only runs inside the scanner service;
+    // the static findings are re-checked by the Activity whenever this tab appears.
+    val liveMonitoring = status.scanning
+    LaunchedEffect(Unit) { onShown() }
 
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Spacer(Modifier.height(20.dp))
@@ -2297,7 +2553,7 @@ private fun DeviceScreen() {
             }
             val levelColor = when (health.level) {
                 Threat.CRITICAL -> Critical
-                Threat.HIGH -> Critical
+                Threat.HIGH -> Accent
                 Threat.MEDIUM -> Caution
                 Threat.LOW -> Caution
                 Threat.NONE -> Clear
@@ -2318,11 +2574,13 @@ private fun DeviceScreen() {
             // Android tells a third-party app that a recording or a camera is in use,
             // but not which app — so nothing here names one. The status-bar privacy
             // indicator and Settings → Privacy dashboard show the app itself.
+            // A live sensor is HIGH, not CRITICAL: it is also what every video call
+            // looks like. The banner says what is known and where to find the rest.
             if (health.activeRecordings > 0) {
                 item(key = "mic_banner") {
                     ActiveSensorBanner(
                         label = "MICROPHONE ACTIVE",
-                        color = Critical,
+                        color = Accent,
                         detail = if (health.activeRecordings == 1) "An app is recording audio."
                             else "Apps are recording audio (${health.activeRecordings} active recordings).",
                         lines = listOf(
@@ -2332,21 +2590,21 @@ private fun DeviceScreen() {
                     )
                 }
             }
-            if (health.camerasInUse.isNotEmpty()) {
+            if (health.cameraInUse) {
                 item(key = "cam_banner") {
                     ActiveSensorBanner(
                         label = "CAMERA ACTIVE",
-                        color = Critical,
-                        detail = if (health.camerasInUse.size == 1) "A camera is in use by another app."
-                            else "${health.camerasInUse.size} cameras are in use by another app.",
-                        lines = health.camerasInUse.map { cam ->
-                            "Camera ${cam.id}${cam.facing?.let { " ($it)" } ?: ""} in use by another app"
-                        }
+                        color = Accent,
+                        detail = "Camera in use by another app",
+                        lines = listOf(
+                            "Android does not tell Aegis which app. Tap the green privacy dot in the " +
+                                "status bar, or open Settings → Security & privacy → Privacy dashboard."
+                        )
                     )
                 }
             }
 
-            if (health.activeRecordings == 0 && health.camerasInUse.isEmpty()) {
+            if (!health.sensorActive) {
                 item(key = "sensors_ok") {
                     Row(
                         Modifier.fillMaxWidth().clip(CardShape).background(Panel)
@@ -2354,9 +2612,14 @@ private fun DeviceScreen() {
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Canvas(Modifier.size(8.dp)) { drawCircle(Clear) }
-                        Text("No app is currently using the microphone or camera",
-                            color = Clear, fontSize = 13.sp)
+                        // With the scanner off nobody is watching the sensors, so
+                        // nothing can be asserted about them.
+                        Canvas(Modifier.size(8.dp)) { drawCircle(if (liveMonitoring) Clear else Muted) }
+                        Text(
+                            if (liveMonitoring) "No app is currently using the microphone or camera"
+                            else "Live mic/camera monitoring runs while scanning is on",
+                            color = if (liveMonitoring) Clear else Muted, fontSize = 13.sp
+                        )
                     }
                 }
             }
@@ -2365,7 +2628,20 @@ private fun DeviceScreen() {
             item(key = "div") { Spacer(Modifier.height(4.dp)) }
 
             // ── Static findings ────────────────────────────────────────────────
-            if (health.findings.isEmpty()) {
+            if (health.findingsScannedTs == 0L) {
+                item(key = "checking") {
+                    Column(
+                        Modifier.fillMaxWidth().clip(CardShape).background(Panel).padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text("Checking…", color = InkDim, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Looking for accessibility services, device admin apps and debug interfaces.",
+                            color = Muted, fontSize = 12.sp
+                        )
+                    }
+                }
+            } else if (health.findings.isEmpty()) {
                 item(key = "all_clear") {
                     Column(
                         Modifier.fillMaxWidth().clip(CardShape).background(Panel).padding(14.dp),
@@ -2373,7 +2649,8 @@ private fun DeviceScreen() {
                     ) {
                         Text("No issues found", color = Clear, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         Text(
-                            "No accessibility services, device admin apps, or debug interfaces that could be used for surveillance.",
+                            "No accessibility services, device admin apps, or debug interfaces that could be used " +
+                                "for surveillance. Checked ${fmtClock(health.findingsScannedTs)}.",
                             color = Muted, fontSize = 12.sp
                         )
                     }

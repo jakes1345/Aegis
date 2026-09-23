@@ -203,6 +203,39 @@ sealed interface VaultState {
 /** The card currently armed for Host Card Emulation. */
 data class ArmedCard(val id: String, val label: String)
 
+/**
+ * A change to the stored vault, as data rather than a closure, so that a pending
+ * write survives the Activity that started it being recreated: the authentication
+ * result names the operation and whichever Activity instance is alive carries it out.
+ */
+sealed interface VaultOp {
+    /** Store [card]; refused when a card with the same UID exists unless [replace]. */
+    data class Add(val card: VaultCard, val replace: Boolean) : VaultOp
+    data class Remove(val id: String) : VaultOp
+}
+
+/** What the user is being asked to confirm their identity for. */
+sealed interface VaultAuthPurpose {
+    data class Unlock(val attempt: Int) : VaultAuthPurpose
+    data class Write(val op: VaultOp, val attempt: Int) : VaultAuthPurpose
+    data object Erase : VaultAuthPurpose
+}
+
+/** The outcome of a BiometricPrompt, published for the live Activity to act on. */
+sealed interface VaultAuthOutcome {
+    data object Succeeded : VaultAuthOutcome
+    /** [message] is null when the user simply cancelled. */
+    data class Failed(val message: String?) : VaultAuthOutcome
+}
+
+data class VaultAuthResult(val purpose: VaultAuthPurpose, val outcome: VaultAuthOutcome)
+
+/**
+ * A save that would overwrite a card already in the vault with the same UID. The
+ * NFC tab asks before it goes ahead.
+ */
+data class ReplacePrompt(val tag: NfcTag, val label: String, val existing: VaultCard)
+
 // --- WiFi anomaly -----------------------------------------------------------
 
 data class WifiAnomaly(
@@ -246,27 +279,39 @@ data class PhoneHealthFinding(
     val detail: String
 )
 
-/** A camera another app currently holds open. */
-data class CameraInUse(
-    val id: String,
-    /** "front", "back", "external", or null when the camera does not say. */
-    val facing: String?
-)
-
 data class PhoneHealth(
     val findings: List<PhoneHealthFinding> = emptyList(),
     /**
-     * Number of audio recordings active on the device. Android does not reveal which
-     * app owns a recording to a third-party app, so this is a count, not a list.
+     * When [findings] were last produced by an actual scan, or 0 when nothing has
+     * checked yet. The Device tab must not claim "no issues" on the strength of a
+     * default empty list.
+     */
+    val findingsScannedTs: Long = 0L,
+    /**
+     * Number of audio recordings active on the device that are actually receiving
+     * audio. Android does not reveal which app owns a recording to a third-party app,
+     * so this is a count, not a list. Recordings the system has silenced (an app
+     * recording from the background, or while another app holds the mic) are left
+     * out: nothing reaches them.
      */
     val activeRecordings: Int = 0,
-    /** Cameras currently open by another app — Aegis never opens the camera itself. */
-    val camerasInUse: List<CameraInUse> = emptyList()
+    /**
+     * Whether another app holds a camera open. A boolean, not a count: opening one
+     * physical camera makes its logical and multi-camera siblings unavailable too, so
+     * counting ids reported "3 cameras in use" for one app taking a photo.
+     */
+    val cameraInUse: Boolean = false
 ) {
+    val sensorActive: Boolean get() = activeRecordings > 0 || cameraInUse
+
+    /**
+     * A live microphone or camera is worth a HIGH, not a CRITICAL: it is what every
+     * video call and voice memo looks like. CRITICAL is reserved for findings that
+     * are themselves CRITICAL.
+     */
     val level: Threat get() = when {
-        activeRecordings > 0 || camerasInUse.isNotEmpty() -> Threat.CRITICAL
         findings.any { it.severity == Severity.CRITICAL } -> Threat.CRITICAL
-        findings.any { it.severity == Severity.HIGH } -> Threat.HIGH
+        sensorActive || findings.any { it.severity == Severity.HIGH } -> Threat.HIGH
         findings.any { it.severity == Severity.MEDIUM } -> Threat.MEDIUM
         findings.isNotEmpty() -> Threat.LOW
         else -> Threat.NONE
