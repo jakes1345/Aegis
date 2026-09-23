@@ -30,21 +30,63 @@ object WifiScanner {
         "pineapple", "wifipineapple", "hak5", "evil_twin", "eviltwin"
     )
 
-    /** Operator brands. An open network wearing one of these is the classic bait. */
-    private val CARRIER_NAMES = setOf(
-        "at&t", "att", "verizon", "t-mobile", "tmobile", "sprint", "boost", "cricket",
-        "metro", "metropcs", "straight talk", "tracfone", "consumer cellular",
-        "us cellular", "uscellular", "c spire", "spectrum", "charter", "comcast",
-        "xfinity", "cox", "optimum", "altice", "frontier", "centurylink", "lumen",
-        "vodafone", "orange", "telefonica", "movistar", "o2", "ee", "three"
+    /**
+     * Operator brands distinctive enough to match as whole tokens anywhere in an
+     * SSID: none of them is an ordinary word, so an open "Verizon Guest" is bait and
+     * nothing innocent looks like it. Brands that *are* ordinary words — Orange,
+     * Metro, Boost, Cox, Charter, Frontier, Spectrum, Sprint, Cricket, Optimum,
+     * Lumen, EE, O2, Three — are deliberately absent: as tokens they flagged
+     * "Orange County Library" and "Metro Transit WiFi" as HIGH. They appear only in
+     * [KNOWN_HOTSPOT_SSIDS], as the exact names their hotspots broadcast.
+     */
+    private val CARRIER_BRANDS = setOf(
+        "at&t", "xfinity", "verizon", "t-mobile", "tmobile", "comcast", "vodafone",
+        "telefonica", "movistar", "centurylink", "metropcs", "tracfone",
+        "straighttalk", "straight talk", "uscellular", "us cellular", "cspire", "c spire",
+        "altice", "boingo"
     )
 
-    // Declared before CARRIER_TOKENS: object properties initialise in order, and
-    // tokens() needs this to exist when that list is built.
+    /**
+     * The exact SSIDs carrier and cable-operator hotspots broadcast, matched against
+     * the whole SSID. This is where the single-token names live — "xfinitywifi" and
+     * "attwifi" are one token each and could never match a brand-plus-word rule —
+     * and where the common-word brands are allowed, because "Cox WiFi" as the entire
+     * name is a hotspot's name and "Cox" inside a longer name is somebody's surname.
+     */
+    private val KNOWN_HOTSPOT_SSIDS = setOf(
+        "xfinitywifi", "xfinity wifi", "xfinity", "xfinity mobile",
+        "attwifi", "att wifi", "at&t wifi", "att-wifi", "at&t",
+        "verizon wifi", "verizonwifi", "verizon", "verizon hotspot",
+        "tmobile wifi", "t-mobile wifi", "tmobilewifi", "t-mobile", "t-mobile hotspot",
+        "spectrum wifi", "spectrumwifi", "spectrum mobile", "spectrum",
+        "cox wifi", "coxwifi", "cox hotspot",
+        "optimum wifi", "optimumwifi", "optimum",
+        "boingo hotspot", "boingo wifi", "boingo",
+        "cablewifi", "cable wifi", "twcwifi", "twc wifi", "twcwifi-passpoint",
+        "boost wifi", "boost mobile", "boost hotspot",
+        "cricket wifi", "cricket wireless",
+        "metro wifi", "metropcs wifi", "metro by t-mobile",
+        "sprint wifi", "sprint hotspot",
+        "charter wifi", "charter spectrum",
+        "frontier wifi", "frontier hotspot",
+        "lumen wifi", "centurylink wifi",
+        "orange wifi", "orange hotspot",
+        "ee wifi", "eewifi", "ee hotspot",
+        "o2 wifi", "o2wifi", "o2 hotspot",
+        "three wifi", "3 wifi", "three hotspot",
+        "vodafone wifi", "vodafonewifi", "vodafone hotspot",
+        "btwifi", "bt wifi", "btwifi-with-fon", "bt openzone", "btopenzone",
+        "consumer cellular", "us cellular wifi", "uscellular wifi",
+        "altice wifi", "alticewifi", "c spire wifi", "cspire wifi",
+        "tracfone wifi", "straight talk wifi", "telefonica wifi", "movistar wifi"
+    )
+
+    // Declared before the derived lists: object properties initialise in order, and
+    // tokens() needs this to exist when they are built.
     private val NON_ALPHANUMERIC = Regex("[^\\p{L}\\p{N}]+")
 
     /**
-     * Each carrier name as a sequence of whole tokens, split the same way as the SSID.
+     * Each brand as a sequence of whole tokens, split the same way as the SSID.
      *
      * Matching used to be a plain substring test, so "ee" hit "Free WiFi" and
      * "Coffee", "att" hit "Hyatt Guest" and "Seattle Public Library", "o2" hit any
@@ -54,7 +96,15 @@ object WifiScanner {
      * "Hyatt Guest" is ["hyatt", "guest"] and matches nothing.
      */
     private val CARRIER_TOKENS: List<List<String>> =
-        CARRIER_NAMES.map { tokens(it) }.filter { it.isNotEmpty() }.distinct()
+        CARRIER_BRANDS.map { tokens(it) }.filter { it.isNotEmpty() }.distinct()
+
+    /**
+     * The hotspot names in canonical token form, so "Xfinity-WiFi", "xfinity_wifi"
+     * and "XFINITY WIFI" all compare equal to "xfinity wifi" while "xfinitywifi"
+     * stays the single token it is.
+     */
+    private val KNOWN_HOTSPOT_KEYS: Set<String> =
+        KNOWN_HOTSPOT_SSIDS.map { canonical(it) }.filter { it.isNotEmpty() }.toSet()
 
     fun scan(context: Context): List<WifiAnomaly> {
         val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
@@ -89,7 +139,8 @@ object WifiScanner {
 
             // 2 — An operator's brand on an unencrypted network. Real carrier hotspots
             // use Passpoint or WPA2-Enterprise; an open one wearing the name is bait.
-            if (open && containsCarrier(tokens(ssid))) {
+            // The exact hotspot names are tried first, then the distinctive brands.
+            if (open && (isKnownHotspotName(ssid) || containsCarrier(tokens(ssid)))) {
                 anomalies.add(WifiAnomaly(label, bssid, r.level, "carrier_open_network", Threat.HIGH, now))
                 continue
             }
@@ -117,6 +168,13 @@ object WifiScanner {
      */
     private fun tokens(text: String): List<String> =
         text.lowercase().split(NON_ALPHANUMERIC).filter { it.isNotEmpty() }
+
+    /** The token sequence joined back up, for whole-name comparison. */
+    private fun canonical(text: String): String = tokens(text).joinToString(" ")
+
+    /** True when the entire SSID is one of the names a carrier hotspot broadcasts. */
+    private fun isKnownHotspotName(ssid: String): Boolean =
+        KNOWN_HOTSPOT_KEYS.contains(canonical(ssid))
 
     /** True when some carrier's full token sequence appears as consecutive tokens. */
     private fun containsCarrier(ssidTokens: List<String>): Boolean =
