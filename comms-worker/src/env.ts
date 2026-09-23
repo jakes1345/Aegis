@@ -1,25 +1,19 @@
+import type { Mailbox } from "./mailbox";
+
 export interface Env {
-  DB: D1Database;
-  TWILIO_ACCOUNT_SID: string;
-  TWILIO_AUTH_TOKEN: string;
-  TWILIO_NUMBER: string;
-  FIREBASE_SERVICE_ACCOUNT_JSON: string;
+  MAILBOX: DurableObjectNamespace<Mailbox>;
+  /** One-time code typed into Aegis when it registers, so the relay is not open to everyone. */
   ENROLL_SECRET: string;
-  /** Voice: API key pair that signs access tokens. */
-  TWILIO_API_KEY_SID: string;
-  TWILIO_API_KEY_SECRET: string;
-  /** Voice: the TwiML App whose voice URL is this Worker's /twilio/voice. */
-  TWILIO_TWIML_APP_SID: string;
-  /** Voice: the FCM push credential Twilio rings the app through. */
-  TWILIO_PUSH_CREDENTIAL_SID: string;
-  SYNC_PAGE_SIZE?: string;
+  /** Optional: Cloudflare Realtime TURN key id + API token, for calls. */
+  TURN_KEY_ID?: string;
+  TURN_KEY_API_TOKEN?: string;
 }
 
 /** A JSON response with the headers every API reply carries. */
-export function json(body: unknown, status = 200, extra: Record<string, string> = {}): Response {
+export function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...extra },
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
   });
 }
 
@@ -29,15 +23,14 @@ export class HttpError extends Error {
   }
 }
 
-export function requireSecret(env: Env, name: keyof Env): string {
+export function requireSecret(env: Env, name: "ENROLL_SECRET"): string {
   const value = env[name];
   if (typeof value !== "string" || value.length === 0) {
-    throw new HttpError(503, `Worker secret ${name} is not configured`);
+    throw new HttpError(503, `Relay secret ${name} is not configured`);
   }
   return value;
 }
 
-/** Lower-case hex of a byte array. */
 export function hex(bytes: ArrayBuffer | Uint8Array): string {
   const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   let out = "";
@@ -45,8 +38,16 @@ export function hex(bytes: ArrayBuffer | Uint8Array): string {
   return out;
 }
 
-export async function sha256Hex(text: string): Promise<string> {
-  return hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+export async function sha256Hex(data: ArrayBuffer | Uint8Array | string): Promise<string> {
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+  return hex(await crypto.subtle.digest("SHA-256", bytes as BufferSource));
+}
+
+export function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64.replace(/-/g, "+").replace(/_/g, "/"));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
 }
 
 /** Constant-time comparison of two strings of equal length. */
@@ -57,20 +58,22 @@ export function timingSafeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-/**
- * Normalises a phone number to E.164 as far as can be done without a region
- * table: strips formatting, keeps a leading +, and treats a bare 10-digit or
- * 1-prefixed 11-digit number as North American. Anything else must already
- * carry its country code.
- */
-export function normalisePhone(raw: string): string | null {
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) return null;
-  const plus = trimmed.startsWith("+");
-  const digits = trimmed.replace(/\D/g, "");
-  if (digits.length < 7 || digits.length > 15) return null;
-  if (plus) return `+${digits}`;
-  if (digits.length === 10) return `+1${digits}`;
-  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
-  return `+${digits}`;
+/** Aegis numbers are nine digits, never starting with 0, e.g. "482 913 605". */
+export const NUMBER_RE = /^[1-9][0-9]{8}$/;
+
+export function normaliseNumber(raw: string): string | null {
+  const digits = raw.replace(/\D/g, "");
+  return NUMBER_RE.test(digits) ? digits : null;
+}
+
+export function randomNumber(): string {
+  const bytes = new Uint32Array(3);
+  crypto.getRandomValues(bytes);
+  const first = 1 + ((bytes[0] ?? 0) % 9);
+  let rest = "";
+  for (let i = 0; i < 8; i++) {
+    const word = bytes[1 + (i >> 2)] ?? 0;
+    rest += ((word >>> ((i & 3) * 8)) & 0xff) % 10;
+  }
+  return `${first}${rest}`;
 }

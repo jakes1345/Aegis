@@ -1,52 +1,36 @@
-import { authenticate, enroll } from "./auth";
-import {
-  applyStatus,
-  callsUpdatedSince,
-  deleteDevice,
-  fcmTokens,
-  insertMessage,
-  listDevices,
-  messagesAfter,
-  messagesUpdatedSince,
-  setFcmToken,
-  toDto,
-  upsertCall,
-  type MediaItem,
-} from "./db";
-import { HttpError, json, normalisePhone, type Env } from "./env";
-import { sendData } from "./fcm";
-import { emptyTwiml, fetchMessage, sendSms, verifyWebhook } from "./twilio";
-import { accessToken, callStatusFrom, dialResult, isTerminal, requireTwilioCallFields, voiceWebhook } from "./voice";
+import { parseSigned, verifyEd25519 } from "./auth";
+import { HttpError, json, normaliseNumber, randomNumber, requireSecret, timingSafeEqual, type Env } from "./env";
+import { Mailbox, type Profile, type SignedKey } from "./mailbox";
+
+export { Mailbox };
 
 /**
- * Aegis comms relay.
+ * Aegis comms relay: store-and-forward for end-to-end encrypted envelopes
+ * between Aegis apps, addressed by Aegis number.
  *
- * Twilio-facing (signature-verified):
- *   POST /twilio/sms      inbound SMS/MMS
- *   POST /twilio/status   delivery status for outbound messages
+ * An Aegis number is not a phone number. It is a random nine-digit ID this
+ * relay hands out at registration, and it works only between Aegis apps
+ * paired with this relay.
  *
- * Phone-facing (bearer token from enrollment):
- *   POST /api/enroll                 {secret, name}         → {deviceId, token, number}
- *   GET  /api/status                                        → {number, deviceId, devices}
- *   PUT  /api/device/fcm             {token}                → registers the push token
- *   DELETE /api/device                                      → unpairs this phone
- *   GET  /api/messages?after=N       sync cursor            → {messages, next}
- *   GET  /api/messages/updates?since=T                      → status changes after epoch T
- *   POST /api/messages               {to, body}             → the stored outbound message
- *   POST /api/messages/:id/refresh                          → re-reads Twilio's status
- *
- * Voice (Twilio-facing, signature-verified):
- *   POST /twilio/voice               TwiML for app-placed and inbound calls
- *   POST /twilio/voice/dial-result   after <Dial> finishes
- *   POST /twilio/voice/status        call progress → call log
- * Voice (phone-facing):
- *   GET  /api/voice/token                                   → {token, identity, expiresAt, number}
- *   GET  /api/calls?since=T                                 → call log changes after epoch T
+ *   POST   /v1/register        {secret, ed25519, curve25519, sealing, signature, fallback, oneTimeKeys, listed}
+ *                              signed by ed25519 (X-Aegis-Sig over the body) → {number}
+ * Signed (see auth.ts):
+ *   GET    /v1/me                                          → profile + key counts
+ *   PUT    /v1/keys            {oneTimeKeys, fallback?}    → replenish
+ *   PUT    /v1/listed          {listed}
+ *   PUT    /v1/push            {endpoint|null}             → UnifiedPush endpoint to wake this device
+ *   DELETE /v1/me                                          → wipe the mailbox
+ *   GET    /v1/bundle/:number                              → a contact's keys + one session key (listed only)
+ *   GET    /v1/bundle/:number?pin=<ed25519 fingerprint>    → also unlisted, when the caller has the key from a QR
+ *   POST   /v1/send            {to, envelope}              → queue for a contact
+ *   GET    /v1/inbox                                       → waiting envelopes
+ *   POST   /v1/ack             {ids}
+ *   GET    /v1/ws                                          → live delivery (hibernatable WebSocket)
  */
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     try {
-      return await route(request, env, ctx);
+      return await route(request, env);
     } catch (e) {
       if (e instanceof HttpError) return json({ error: e.message }, e.status);
       console.error(e);
@@ -55,237 +39,206 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, "") || "/";
-  const now = Date.now();
 
   if (request.method === "GET" && path === "/") {
-    return json({ service: "aegis-comms", ok: true });
+    return json({ service: "aegis-comms", version: 2, ok: true, note: "Aegis numbers are not phone numbers." });
   }
 
-  // ── Twilio webhooks ──────────────────────────────────────────────────────
-  if (path.startsWith("/twilio/")) {
+  const bodyText = request.method === "GET" || request.method === "HEAD" ? "" : await request.text();
+
+  if (path === "/v1/register") {
     if (request.method !== "POST") throw new HttpError(405, "POST only");
-    const form = new URLSearchParams(await request.text());
-    await verifyWebhook(env, request, form);
-    switch (path) {
-      case "/twilio/sms":
-        return inboundSms(env, ctx, form, now);
-      case "/twilio/status":
-        return statusCallback(env, form, now);
-      case "/twilio/voice":
-        return voiceWebhook(env, form, url.origin);
-      case "/twilio/voice/dial-result":
-        await recordCall(env, ctx, form, now, form.get("DialCallStatus"));
-        return dialResult();
-      case "/twilio/voice/status":
-        await recordCall(env, ctx, form, now, null);
-        return emptyTwiml();
-      default:
-        throw new HttpError(404, "Not found");
+    return register(env, request, bodyText);
+  }
+
+  if (!path.startsWith("/v1/")) throw new HttpError(404, "Not found");
+
+  // ── Authenticated ─────────────────────────────────────────────────────
+  const signed = await parseSigned(request, bodyText);
+  const me = env.MAILBOX.get(env.MAILBOX.idFromName(signed.number));
+  const profile = await me.authenticate(signed.payload, signed.signature, signed.nonce, signed.ts);
+  if (!profile) throw new HttpError(401, "Signature rejected");
+
+  if (path === "/v1/me" && request.method === "GET") {
+    return json({ profile: publicProfile(profile), oneTimeKeys: await me.oneTimeKeyCount() });
+  }
+
+  if (path === "/v1/me" && request.method === "DELETE") {
+    await me.wipe();
+    return json({ ok: true });
+  }
+
+  if (path === "/v1/keys" && request.method === "PUT") {
+    const body = parseJson<{ oneTimeKeys?: unknown; fallback?: unknown }>(bodyText);
+    const oneTimeKeys = await checkedKeys(profile.ed25519, body.oneTimeKeys);
+    const fallback = body.fallback === undefined || body.fallback === null ? null : (await checkedKeys(profile.ed25519, [body.fallback]))[0] ?? null;
+    return json(await me.putKeys(oneTimeKeys, fallback));
+  }
+
+  if (path === "/v1/listed" && request.method === "PUT") {
+    const body = parseJson<{ listed?: unknown }>(bodyText);
+    if (typeof body.listed !== "boolean") throw new HttpError(400, "listed must be a boolean");
+    await me.setListed(body.listed);
+    return json({ ok: true, listed: body.listed });
+  }
+
+  if (path === "/v1/push" && request.method === "PUT") {
+    const body = parseJson<{ endpoint?: unknown }>(bodyText);
+    const endpoint = body.endpoint;
+    if (endpoint !== null && endpoint !== undefined) {
+      if (typeof endpoint !== "string" || !/^https:\/\/[^\s]{8,2048}$/.test(endpoint)) {
+        throw new HttpError(400, "endpoint must be an https URL");
+      }
     }
-  }
-
-  // ── Enrollment ───────────────────────────────────────────────────────────
-  if (path === "/api/enroll") {
-    if (request.method !== "POST") throw new HttpError(405, "POST only");
-    const body = await readJson<{ secret?: string; name?: string }>(request);
-    if (typeof body.secret !== "string") throw new HttpError(400, "secret required");
-    const { device, token } = await enroll(env, body.secret, typeof body.name === "string" ? body.name : "Aegis", now);
-    return json({ deviceId: device.id, token, number: env.TWILIO_NUMBER ?? null });
-  }
-
-  // ── Authenticated API ────────────────────────────────────────────────────
-  if (!path.startsWith("/api/")) throw new HttpError(404, "Not found");
-  const device = await authenticate(env, request, now);
-
-  if (path === "/api/status" && request.method === "GET") {
-    return json({
-      number: env.TWILIO_NUMBER ?? null,
-      deviceId: device.id,
-      pushRegistered: device.fcm_token !== null,
-      devices: await listDevices(env),
-    });
-  }
-
-  if (path === "/api/device/fcm" && request.method === "PUT") {
-    const body = await readJson<{ token?: string | null }>(request);
-    const token = typeof body.token === "string" && body.token.length > 0 ? body.token : null;
-    await setFcmToken(env, device.id, token);
+    await me.setPush(typeof endpoint === "string" ? endpoint : null);
     return json({ ok: true });
   }
 
-  if (path === "/api/device" && request.method === "DELETE") {
-    await deleteDevice(env, device.id);
-    return json({ ok: true });
+  const bundleMatch = /^\/v1\/bundle\/([0-9]{9})$/.exec(path);
+  if (bundleMatch && bundleMatch[1] && request.method === "GET") {
+    if (!(await me.rateOk("lookup", Mailbox.LOOKUP_LIMIT))) throw new HttpError(429, "Too many lookups; try again in a minute");
+    const target = normaliseNumber(bundleMatch[1]);
+    if (!target) throw new HttpError(400, "Bad number");
+    const pin = url.searchParams.get("pin");
+    const them = env.MAILBOX.get(env.MAILBOX.idFromName(target));
+    // Unlisted numbers are only handed out to a caller who already holds the
+    // owner's identity key (from a QR scan) and proves it with its fingerprint.
+    // The pin is checked before any key is claimed, so a wrong pin neither
+    // reveals the bundle nor consumes a one-time key.
+    let bundle = null;
+    if (pin === null) {
+      bundle = await them.bundle(true);
+    } else {
+      const p = await them.profile();
+      if (p && timingSafeEqual(await fingerprint(p.ed25519), pin)) bundle = await them.bundle(false);
+    }
+    if (!bundle) throw new HttpError(404, "No such Aegis number, or it is unlisted");
+    return json({ bundle });
   }
 
-  if (path === "/api/messages" && request.method === "GET") {
-    const after = Number(url.searchParams.get("after") ?? "0");
-    if (!Number.isFinite(after) || after < 0) throw new HttpError(400, "after must be a non-negative integer");
-    const rows = await messagesAfter(env, Math.floor(after), pageSize(env));
-    const next = rows.length > 0 ? rows[rows.length - 1]!.seq : Math.floor(after);
-    return json({ messages: rows.map(toDto), next, more: rows.length === pageSize(env) });
+  if (path === "/v1/send" && request.method === "POST") {
+    // Per-sender cap, so one registered identity cannot fill another's mailbox.
+    if (!(await me.rateOk("send", Mailbox.SEND_LIMIT))) throw new HttpError(429, "Too many messages; try again in a minute");
+    const body = parseJson<{ to?: unknown; envelope?: unknown }>(bodyText);
+    const to = typeof body.to === "string" ? normaliseNumber(body.to) : null;
+    if (!to) throw new HttpError(400, "to must be an Aegis number");
+    if (typeof body.envelope !== "string" || body.envelope.length === 0 || !/^[A-Za-z0-9+/=]+$/.test(body.envelope)) {
+      throw new HttpError(400, "envelope must be base64");
+    }
+    const them = env.MAILBOX.get(env.MAILBOX.idFromName(to));
+    const result = await them.enqueue(body.envelope);
+    if (!result.ok) throw new HttpError(result.reason === "no such number" ? 404 : 413, result.reason);
+    return json({ id: result.id }, 202);
   }
 
-  if (path === "/api/messages/updates" && request.method === "GET") {
-    const since = Number(url.searchParams.get("since") ?? "0");
-    if (!Number.isFinite(since) || since < 0) throw new HttpError(400, "since must be epoch millis");
-    const rows = await messagesUpdatedSince(env, Math.floor(since), pageSize(env));
-    return json({ messages: rows.map(toDto), now });
+  if (path === "/v1/inbox" && request.method === "GET") {
+    return json({ envelopes: await me.inbox() });
   }
 
-  if (path === "/api/messages" && request.method === "POST") {
-    const body = await readJson<{ to?: string; body?: string }>(request);
-    const to = typeof body.to === "string" ? normalisePhone(body.to) : null;
-    if (!to) throw new HttpError(400, "to must be a phone number");
-    if (typeof body.body !== "string" || body.body.trim().length === 0) throw new HttpError(400, "body required");
-    if (body.body.length > 1600) throw new HttpError(400, "body exceeds 1600 characters");
-    const sent = await sendSms(env, to, body.body, `${url.origin}/twilio/status`);
-    const row = await insertMessage(env, {
-      id: sent.sid,
-      direction: "out",
-      peer: to,
-      body: body.body,
-      media: [],
-      status: sent.status,
-      error: sent.errorCode !== null ? `${sent.errorCode}: ${sent.errorMessage ?? ""}` : null,
-      ts: now,
-    });
-    // Other paired phones learn about the send the same way they learn about a
-    // receipt.
-    ctx.waitUntil(pushAll(env, { kind: "message", seq: String(row.seq) }, device.id));
-    return json({ message: toDto(row) }, 201);
+  if (path === "/v1/ack" && request.method === "POST") {
+    const body = parseJson<{ ids?: unknown }>(bodyText);
+    if (!Array.isArray(body.ids)) throw new HttpError(400, "ids must be an array");
+    const ids = body.ids.filter((x): x is string => typeof x === "string").slice(0, 500);
+    return json({ removed: await me.ack(ids) });
   }
 
-  if (path === "/api/voice/token" && request.method === "GET") {
-    const issued = await accessToken(env, device.id);
-    return json({ ...issued, number: env.TWILIO_NUMBER ?? null });
-  }
-
-  if (path === "/api/calls" && request.method === "GET") {
-    const since = Number(url.searchParams.get("since") ?? "0");
-    if (!Number.isFinite(since) || since < 0) throw new HttpError(400, "since must be epoch millis");
-    const rows = await callsUpdatedSince(env, Math.floor(since), pageSize(env));
-    return json({ calls: rows, now });
-  }
-
-  const refresh = /^\/api\/messages\/([A-Za-z0-9]+)\/refresh$/.exec(path);
-  if (refresh && refresh[1] && request.method === "POST") {
-    const remote = await fetchMessage(env, refresh[1]);
-    if (!remote) throw new HttpError(404, "Twilio has no such message");
-    await applyStatus(
-      env,
-      remote.sid,
-      remote.status,
-      remote.errorCode !== null ? `${remote.errorCode}: ${remote.errorMessage ?? ""}` : null,
-      now,
-    );
-    const rows = await messagesUpdatedSince(env, now - 1, 1);
-    return json({ message: rows[0] ? toDto(rows[0]) : null, status: remote.status });
+  if (path === "/v1/ws" && request.method === "GET") {
+    return me.fetch(request);
   }
 
   throw new HttpError(404, "Not found");
 }
 
-async function inboundSms(env: Env, ctx: ExecutionContext, form: URLSearchParams, now: number): Promise<Response> {
-  const sid = form.get("MessageSid");
-  const from = form.get("From");
-  if (!sid || !from) throw new HttpError(400, "MessageSid and From required");
-  const numMedia = Number(form.get("NumMedia") ?? "0");
-  const media: MediaItem[] = [];
-  for (let i = 0; i < numMedia; i++) {
-    const mediaUrl = form.get(`MediaUrl${i}`);
-    const contentType = form.get(`MediaContentType${i}`) ?? "application/octet-stream";
-    if (mediaUrl) media.push({ url: mediaUrl, contentType });
-  }
-  const row = await insertMessage(env, {
-    id: sid,
-    direction: "in",
-    peer: normalisePhone(from) ?? from,
-    body: form.get("Body") ?? "",
-    media,
-    status: "received",
-    ts: now,
-  });
-  ctx.waitUntil(pushAll(env, { kind: "message", seq: String(row.seq) }));
-  return emptyTwiml();
-}
-
-async function statusCallback(env: Env, form: URLSearchParams, now: number): Promise<Response> {
-  const sid = form.get("MessageSid");
-  const status = form.get("MessageStatus");
-  if (!sid || !status) throw new HttpError(400, "MessageSid and MessageStatus required");
-  const code = form.get("ErrorCode");
-  const error = code ? `${code}: ${form.get("ErrorMessage") ?? ""}`.trim() : null;
-  await applyStatus(env, sid, status, error, now);
-  return emptyTwiml();
-}
-
 /**
- * Records a call's progress from a status callback or the <Dial> result. The
- * parent call is what the callbacks describe: for an app-placed call its From
- * is `client:<identity>`, for a call to the number its From is the caller.
- * Child-leg callbacks (the <Number> inside <Dial>) carry ParentCallSid and are
- * folded into the parent's row.
+ * Registration. The body is signed by the new identity's Ed25519 key (proof of
+ * possession), carries the enrollment secret, and the relay allocates a fresh
+ * Aegis number. The curve25519 and sealing keys must be signed by the Ed25519
+ * key, and every one-time key must be too: the relay checks so it never stores
+ * a bundle a contact would reject.
  */
-async function recordCall(env: Env, ctx: ExecutionContext, form: URLSearchParams, now: number, dialStatus: string | null): Promise<void> {
-  const { sid, from, to } = requireTwilioCallFields(form);
-  const parentSid = form.get("ParentCallSid");
-  // Ignore the callbacks for the client legs of an inbound call: they are the
-  // phones being rung, not a call in their own right.
-  if (parentSid !== null && to.startsWith("client:")) return;
-  const fromClient = from.startsWith("client:");
-  const direction: "in" | "out" = fromClient || parentSid !== null ? "out" : "in";
-  // For an app-placed call the parent leg's To is not the dialled number (it is
-  // the TwiML App); the number arrives with the child leg and replaces the
-  // placeholder in upsertCall.
-  const peer =
-    direction === "out"
-      ? normalisePhone(to) ?? (parentSid !== null ? to : "unknown")
-      : normalisePhone(from) ?? from;
-  const status = callStatusFrom(form.get("CallStatus"), dialStatus, direction);
-  const durationRaw = form.get("CallDuration") ?? form.get("DialCallDuration");
-  const duration = durationRaw !== null && /^\d+$/.test(durationRaw) ? Number(durationRaw) : null;
-  const { row, changed } = await upsertCall(env, { id: parentSid ?? sid, direction, peer, status, duration, now });
-  if (changed && isTerminal(row.status)) {
-    ctx.waitUntil(pushAll(env, { kind: "call", updated: String(row.updated) }));
+async function register(env: Env, request: Request, bodyText: string): Promise<Response> {
+  const secret = requireSecret(env, "ENROLL_SECRET");
+  const body = parseJson<{
+    secret?: unknown;
+    ed25519?: unknown;
+    curve25519?: unknown;
+    sealing?: unknown;
+    signature?: unknown;
+    fallback?: unknown;
+    oneTimeKeys?: unknown;
+    listed?: unknown;
+  }>(bodyText);
+  if (typeof body.secret !== "string" || !timingSafeEqual(body.secret, secret)) throw new HttpError(403, "Enrollment code rejected");
+  for (const field of ["ed25519", "curve25519", "sealing", "signature"] as const) {
+    if (typeof body[field] !== "string" || (body[field] as string).length === 0) throw new HttpError(400, `${field} required`);
   }
+  const ed25519 = body.ed25519 as string;
+  const curve25519 = body.curve25519 as string;
+  const sealing = body.sealing as string;
+  const signature = body.signature as string;
+
+  const bodySig = request.headers.get("x-aegis-sig") ?? "";
+  if (!(await verifyEd25519(ed25519, bodyText, bodySig))) throw new HttpError(401, "Body signature does not match ed25519");
+  if (!(await verifyEd25519(ed25519, `${curve25519}|${sealing}`, signature))) throw new HttpError(400, "Key binding signature invalid");
+  const fallback = body.fallback === undefined || body.fallback === null ? null : (await checkedKeys(ed25519, [body.fallback]))[0] ?? null;
+  const oneTimeKeys = await checkedKeys(ed25519, body.oneTimeKeys ?? []);
+  const listed = body.listed !== false;
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const number = randomNumber();
+    const mailbox = env.MAILBOX.get(env.MAILBOX.idFromName(number));
+    const now = Date.now();
+    const profile: Profile = { number, ed25519, curve25519, sealing, signature, fallback, listed, createdAt: now, lastSeen: now };
+    if (await mailbox.claim(profile, oneTimeKeys)) {
+      return json({ number, profile: publicProfile(profile), oneTimeKeys: oneTimeKeys.length }, 201);
+    }
+  }
+  throw new HttpError(503, "Could not allocate a number; try again");
 }
 
-/** Wakes every paired phone except [exceptDeviceId], dropping dead tokens. */
-async function pushAll(env: Env, data: Record<string, string>, exceptDeviceId?: string): Promise<void> {
-  let targets: { id: string; fcm_token: string }[];
-  try {
-    targets = await fcmTokens(env);
-  } catch (e) {
-    console.error("fcmTokens failed", e);
-    return;
+/** Validates a list of signed keys against the owner's Ed25519 key. */
+async function checkedKeys(ed25519: string, raw: unknown): Promise<SignedKey[]> {
+  if (!Array.isArray(raw)) throw new HttpError(400, "keys must be an array");
+  if (raw.length > 100) throw new HttpError(400, "at most 100 keys per request");
+  const out: SignedKey[] = [];
+  for (const item of raw) {
+    const k = item as Partial<SignedKey>;
+    if (typeof k.id !== "string" || typeof k.key !== "string" || typeof k.signature !== "string") {
+      throw new HttpError(400, "each key needs id, key and signature");
+    }
+    if (!(await verifyEd25519(ed25519, k.key, k.signature))) throw new HttpError(400, `key ${k.id} is not signed by ed25519`);
+    out.push({ id: k.id, key: k.key, signature: k.signature });
   }
-  await Promise.all(
-    targets
-      .filter((t) => t.id !== exceptDeviceId)
-      .map(async (t) => {
-        try {
-          const result = await sendData(env, t.fcm_token, data);
-          if (result === "unregistered") await setFcmToken(env, t.id, null);
-        } catch (e) {
-          console.error("push failed for device", t.id, e);
-        }
-      }),
-  );
+  return out;
 }
 
-async function readJson<T>(request: Request): Promise<T> {
+function publicProfile(p: Profile) {
+  return {
+    number: p.number,
+    ed25519: p.ed25519,
+    curve25519: p.curve25519,
+    sealing: p.sealing,
+    signature: p.signature,
+    listed: p.listed,
+    createdAt: p.createdAt,
+  };
+}
+
+/** Matches the app's `fingerprint()`: base64url of the first 12 bytes of SHA-256 over the key text. */
+async function fingerprint(ed25519: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(ed25519)));
+  let s = "";
+  for (const b of digest.subarray(0, 12)) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function parseJson<T>(text: string): T {
   try {
-    return (await request.json()) as T;
+    return JSON.parse(text) as T;
   } catch {
     throw new HttpError(400, "Body must be JSON");
   }
-}
-
-function pageSize(env: Env): number {
-  const n = Number(env.SYNC_PAGE_SIZE ?? "200");
-  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 500) : 200;
 }

@@ -1,82 +1,121 @@
 package com.xat.aegis.comms
 
+/**
+ * Formats an Aegis number for display: "482 913 605". Aegis numbers are not
+ * phone numbers; they only reach other Aegis apps on the same relay.
+ */
+fun formatAegisNumber(number: String): String =
+    if (number.length == 9) "${number.substring(0, 3)} ${number.substring(3, 6)} ${number.substring(6)}" else number
+
+/** Digits only, or null when it is not a well-formed Aegis number. */
+fun parseAegisNumber(raw: String): String? {
+    val digits = raw.filter { it.isDigit() }
+    return if (digits.length == 9 && digits[0] != '0') digits else null
+}
+
 enum class Direction { IN, OUT }
 
-data class MediaItem(val url: String, val contentType: String)
+/**
+ * Someone this identity can talk to. The keys are pinned at first contact;
+ * [verified] is true once the owner has scanned this contact's QR code (or
+ * compared safety numbers) rather than trusting the relay's lookup.
+ */
+data class Contact(
+    val number: String,
+    val name: String,
+    val ed25519: String,
+    val curve25519: String,
+    val sealing: String,
+    val signature: String,
+    val verified: Boolean,
+    val addedTs: Long,
+    /** Set when a message arrived from this identity with different keys than pinned. */
+    val keyChanged: Boolean = false
+)
 
-/** One SMS or MMS on the owner's number, as cached on the phone. */
-data class SmsMessage(
-    /** Twilio message SID. */
+/** One message in a conversation, stored on the phone with an encrypted body. */
+data class ChatMessage(
+    /** UUID chosen by the sender; also the delivery-receipt key. */
     val id: String,
-    /** Relay sequence number; the sync cursor. */
-    val seq: Long,
-    val direction: Direction,
-    /** The other party, E.164. */
     val peer: String,
+    val direction: Direction,
     val body: String,
-    val media: List<MediaItem>,
-    /** received | queued | sending | sent | delivered | undelivered | failed */
-    val status: String,
-    val error: String?,
     val ts: Long,
-    val updated: Long,
-    val read: Boolean
-) {
-    val failed: Boolean get() = status == "failed" || status == "undelivered"
-}
-
-/** A conversation with one number, summarised for the thread list. */
-data class Thread(
-    val peer: String,
-    val lastMessage: SmsMessage,
-    val unread: Int,
-    val count: Int
-)
-
-/** One call on the owner's number, from the relay's call log. */
-data class CallRecord(
-    val id: String,
-    val direction: Direction,
-    val peer: String,
-    /** ringing | in-progress | completed | missed | busy | failed | no-answer | canceled */
+    /** OUT: queued | sent | delivered | read | failed. IN: received. */
     val status: String,
-    /** Seconds, once completed. */
-    val duration: Int,
-    val ts: Long,
-    val updated: Long
-) {
-    val missed: Boolean get() = status == "missed"
-}
-
-/** Where an active call is in its life. */
-enum class CallPhase { INCOMING, CONNECTING, RINGING, CONNECTED, RECONNECTING, ENDED }
-
-/** The call currently ringing or in progress on this phone, for the in-call UI. */
-data class ActiveCall(
-    val id: String,
-    val peer: String,
-    val direction: Direction,
-    val phase: CallPhase,
-    val muted: Boolean = false,
-    val speaker: Boolean = false,
-    /** Epoch millis the call connected, 0 until it does. */
-    val connectedAt: Long = 0L,
-    /** Why the call ended, when it ended abnormally. */
+    val read: Boolean,
     val error: String? = null
+) {
+    val failed: Boolean get() = status == "failed"
+}
+
+data class ChatThread(
+    val contact: Contact,
+    val lastMessage: ChatMessage?,
+    val unread: Int
 )
 
-/** Pairing and sync state shown at the top of the COMMS tab. */
+/** Everything the COMMS tab shows above the conversations. */
 data class CommsState(
-    val paired: Boolean = false,
-    val workerUrl: String? = null,
+    val registered: Boolean = false,
+    val relayUrl: String? = null,
     val number: String? = null,
+    val displayName: String = "",
+    val listed: Boolean = true,
+    /** Whether the owner keeps the relay connection open in the background. */
+    val online: Boolean = false,
+    val connected: Boolean = false,
     val pushRegistered: Boolean = false,
-    /** True while a relay call is in flight. */
     val busy: Boolean = false,
-    /** Last relay error worth showing, or null. */
     val error: String? = null,
-    /** Epoch millis of the last successful sync, 0 if never. */
     val lastSync: Long = 0L,
-    /** Whether Twilio Voice knows this phone, so calls to the number ring it. */
-    val voiceRegistered: Boolean = false
+    /** One-time keys the relay still holds for us. */
+    val relayOneTimeKeys: Int = -1
 )
+
+/**
+ * The pairing payload carried by a QR code: the relay, the Aegis number and the
+ * full public key set, so a scan pins the identity with no trust in the relay.
+ */
+data class PairingCode(
+    val relayUrl: String,
+    val number: String,
+    val ed25519: String,
+    val curve25519: String,
+    val sealing: String,
+    val signature: String,
+    val name: String
+) {
+    fun encode(): String {
+        val q = listOf(
+            "r" to relayUrl, "n" to number, "k" to ed25519, "c" to curve25519,
+            "s" to sealing, "g" to signature, "d" to name
+        ).joinToString("&") { (k, v) -> "$k=${java.net.URLEncoder.encode(v, "UTF-8")}" }
+        return "aegis:v1?$q"
+    }
+
+    companion object {
+        fun decode(text: String): PairingCode? {
+            val t = text.trim()
+            if (!t.startsWith("aegis:v1?")) return null
+            // Any scanned QR code lands here; a malformed percent escape is
+            // "not an Aegis code", not a crash.
+            val params = runCatching {
+                t.removePrefix("aegis:v1?").split("&").mapNotNull { part ->
+                    val i = part.indexOf('=')
+                    if (i <= 0) null else part.substring(0, i) to java.net.URLDecoder.decode(part.substring(i + 1), "UTF-8")
+                }.toMap()
+            }.getOrNull() ?: return null
+            val number = params["n"]?.let { parseAegisNumber(it) } ?: return null
+            return PairingCode(
+                relayUrl = params["r"]?.trimEnd('/') ?: return null,
+                number = number,
+                ed25519 = params["k"] ?: return null,
+                curve25519 = params["c"] ?: return null,
+                sealing = params["s"] ?: return null,
+                signature = params["g"] ?: return null,
+                name = params["d"] ?: ""
+            )
+        }
+    }
+}

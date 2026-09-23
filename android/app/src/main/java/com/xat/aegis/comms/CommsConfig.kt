@@ -1,92 +1,69 @@
 package com.xat.aegis.comms
 
 import android.content.Context
-import android.util.Base64
 
-/**
- * Pairing state for the relay: where it is, who this phone is to it, and how far
- * the local cache has synced. The bearer token is stored encrypted under the
- * comms Keystore key; everything else is plain preference data.
- */
+/** Plain preference data for the comms module; secrets live in [IdentityStore]. */
 class CommsConfig(context: Context) {
 
     private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    /** Base URL of the deployed Worker, no trailing slash, or null until paired. */
-    val workerUrl: String? get() = prefs.getString(KEY_URL, null)
+    /** Base URL of the relay Worker, no trailing slash, or null until registered. */
+    val relayUrl: String? get() = prefs.getString(KEY_RELAY, null)
 
-    val deviceId: String? get() = prefs.getString(KEY_DEVICE_ID, null)
-
-    /** The owner's number in E.164 as the relay reports it. */
+    /** This identity's Aegis number, once the relay has allocated one. */
     val number: String? get() = prefs.getString(KEY_NUMBER, null)
 
-    /** Highest message sequence number the cache holds. */
-    val syncCursor: Long get() = prefs.getLong(KEY_SEQ, 0L)
+    val displayName: String get() = prefs.getString(KEY_NAME, "") ?: ""
 
-    /** Relay clock (epoch millis) up to which status updates have been applied. */
-    val updatesCursor: Long get() = prefs.getLong(KEY_UPDATED, 0L)
+    val listed: Boolean get() = prefs.getBoolean(KEY_LISTED, true)
 
-    /** The FCM token the relay last acknowledged, so a repeat is not re-sent. */
-    val registeredPushToken: String? get() = prefs.getString(KEY_PUSH, null)
+    /** The owner's choice to keep the relay connection open in the background. */
+    val online: Boolean get() = prefs.getBoolean(KEY_ONLINE, false)
 
-    /** Relay clock up to which the call log has been applied. */
-    val callsCursor: Long get() = prefs.getLong(KEY_CALLS, 0L)
+    /** The UnifiedPush endpoint the relay last acknowledged. */
+    val pushEndpoint: String? get() = prefs.getString(KEY_PUSH, null)
 
-    /** The FCM token last registered with Twilio Voice, and when. */
-    val voiceRegisteredToken: String? get() = prefs.getString(KEY_VOICE_TOKEN, null)
-    val voiceRegisteredAt: Long get() = prefs.getLong(KEY_VOICE_AT, 0L)
+    val isRegistered: Boolean get() = relayUrl != null && number != null
 
-    fun setCallsCursor(ts: Long) { prefs.edit().putLong(KEY_CALLS, ts).apply() }
-
-    fun setVoiceRegistered(token: String?, at: Long) {
-        prefs.edit().putString(KEY_VOICE_TOKEN, token).putLong(KEY_VOICE_AT, at).apply()
-    }
-
-    val isPaired: Boolean get() = workerUrl != null && prefs.contains(KEY_TOKEN)
-
-    /** The bearer token, decrypted on demand; null when unpaired or undecryptable. */
-    fun token(): String? {
-        val blob = prefs.getString(KEY_TOKEN, null) ?: return null
-        return runCatching { CommsCrypto.decryptString(Base64.decode(blob, Base64.NO_WRAP)) }.getOrNull()
-    }
-
-    fun savePairing(workerUrl: String, deviceId: String, token: String, number: String?) {
-        val sealed = Base64.encodeToString(CommsCrypto.encryptString(token), Base64.NO_WRAP)
+    fun saveRegistration(relayUrl: String, number: String, name: String, listed: Boolean) {
         prefs.edit()
-            .putString(KEY_URL, workerUrl.trimEnd('/'))
-            .putString(KEY_DEVICE_ID, deviceId)
-            .putString(KEY_TOKEN, sealed)
+            .putString(KEY_RELAY, relayUrl.trimEnd('/'))
             .putString(KEY_NUMBER, number)
-            .putLong(KEY_SEQ, 0L)
-            .putLong(KEY_UPDATED, 0L)
-            .putLong(KEY_CALLS, 0L)
+            .putString(KEY_NAME, name)
+            .putBoolean(KEY_LISTED, listed)
             .remove(KEY_PUSH)
-            .remove(KEY_VOICE_TOKEN)
-            .remove(KEY_VOICE_AT)
             .apply()
     }
 
-    fun setNumber(number: String?) { prefs.edit().putString(KEY_NUMBER, number).apply() }
-
-    fun setSyncCursor(seq: Long) { prefs.edit().putLong(KEY_SEQ, seq).apply() }
-
-    fun setUpdatesCursor(ts: Long) { prefs.edit().putLong(KEY_UPDATED, ts).apply() }
-
-    fun setRegisteredPushToken(token: String?) { prefs.edit().putString(KEY_PUSH, token).apply() }
+    fun setDisplayName(name: String) { prefs.edit().putString(KEY_NAME, name).apply() }
+    fun setListed(listed: Boolean) { prefs.edit().putBoolean(KEY_LISTED, listed).apply() }
+    fun setOnline(online: Boolean) { prefs.edit().putBoolean(KEY_ONLINE, online).apply() }
+    fun setPushEndpoint(endpoint: String?) { prefs.edit().putString(KEY_PUSH, endpoint).apply() }
 
     fun clear() { prefs.edit().clear().apply() }
 
+    /**
+     * Removes what the Twilio-era module kept in this same preferences file:
+     * its worker URL, device token, sync cursors and voice token, and the phone
+     * number that went with them. Runs once; a file without the old keys is
+     * left alone.
+     */
+    fun purgeLegacy() {
+        if (LEGACY_KEYS.none { prefs.contains(it) }) return
+        prefs.edit().apply { LEGACY_KEYS.forEach { remove(it) }; remove(KEY_NUMBER) }.apply()
+    }
+
     private companion object {
         const val PREFS = "comms"
-        const val KEY_URL = "worker_url"
-        const val KEY_DEVICE_ID = "device_id"
-        const val KEY_TOKEN = "token_enc"
+        const val KEY_RELAY = "relay_url"
         const val KEY_NUMBER = "number"
-        const val KEY_SEQ = "sync_seq"
-        const val KEY_UPDATED = "sync_updated"
-        const val KEY_PUSH = "push_token"
-        const val KEY_CALLS = "sync_calls"
-        const val KEY_VOICE_TOKEN = "voice_token"
-        const val KEY_VOICE_AT = "voice_at"
+        const val KEY_NAME = "name"
+        const val KEY_LISTED = "listed"
+        const val KEY_ONLINE = "online"
+        const val KEY_PUSH = "push_endpoint"
+        val LEGACY_KEYS = listOf(
+            "worker_url", "device_id", "token_enc", "sync_seq", "sync_updated",
+            "push_token", "sync_calls", "voice_token", "voice_at"
+        )
     }
 }

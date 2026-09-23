@@ -1,16 +1,13 @@
 {
   "name": "aegis-comms-worker",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Cloudflare Worker that gives Aegis a real phone number: relays SMS to and from Twilio, stores the conversation in D1, and wakes the phone through Firebase Cloud Messaging.",
+  "description": "Cloudflare Worker relay for Aegis comms: store-and-forward of end-to-end encrypted envelopes between Aegis apps, addressed by Aegis number.",
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "migrate": "wrangler d1 migrations apply aegis-comms --remote",
-    "migrate:local": "wrangler d1 migrations apply aegis-comms --local",
-    "setup:twilio": "node scripts/setup-twilio.mjs"
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260921.1",
