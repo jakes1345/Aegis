@@ -139,6 +139,24 @@ object CallManager {
 
     // ── Call setup ────────────────────────────────────────────────────────
 
+    /**
+     * True while the call [id] is the current, unended call. Setup and signal
+     * handlers suspend (relay round trips, SDP work), and a hang-up can run in
+     * between; every step after a suspension checks this before touching the
+     * peer connection, which the hang-up may already have disposed.
+     */
+    private fun stillLive(id: String): Boolean = _call.value?.let { it.id == id && it.phase != CallPhase.ENDED } == true
+
+    /** Drops media objects a setup created after its call had already ended. */
+    private fun abandonSetup() {
+        runCatching { pc?.close() }
+        runCatching { pc?.dispose() }
+        runCatching { audioTrack?.dispose() }
+        runCatching { audioSource?.dispose() }
+        pc = null; audioTrack = null; audioSource = null
+        stopAudio()
+    }
+
     private suspend fun placeLocked(contact: Contact) {
         if (_call.value != null) return
         val id = UUID.randomUUID().toString()
@@ -148,18 +166,22 @@ object CallManager {
         startAudio()
         try {
             createPeerConnection(id)
+            if (!stillLive(id)) { abandonSetup(); return }
             val peer = pc ?: throw IllegalStateException("no connection")
             val offer = peer.createSdp(offer = true)
+            if (!stillLive(id)) { abandonSetup(); return }
             peer.setLocal(offer)
+            if (!stillLive(id)) { abandonSetup(); return }
             val sent = CommsRepository.sendCallSignal(
                 contact,
                 JSONObject().put("k", "offer").put("cid", id).put("ts", System.currentTimeMillis()).put("sdp", offer.description)
             )
+            if (!stillLive(id)) return
             if (!sent) { endLocked("could not reach the relay", signal = null); return }
             armTimeout(RING_TIMEOUT_MS) { if (it.phase == CallPhase.DIALING) endLocked("no answer", signal = "cancel") }
         } catch (e: Exception) {
             Log.w(TAG, "placing call failed", e)
-            endLocked(e.message ?: "call setup failed", signal = "cancel")
+            if (stillLive(id)) endLocked(e.message ?: "call setup failed", signal = "cancel") else abandonSetup()
         }
     }
 
@@ -175,20 +197,25 @@ object CallManager {
         startAudio()
         try {
             createPeerConnection(c.id)
+            if (!stillLive(c.id)) { abandonSetup(); return }
             val peer = pc ?: throw IllegalStateException("no connection")
             peer.setRemote(offer)
+            if (!stillLive(c.id)) { abandonSetup(); return }
             flushPendingRemoteCandidates()
             val answer = peer.createSdp(offer = false)
+            if (!stillLive(c.id)) { abandonSetup(); return }
             peer.setLocal(answer)
+            if (!stillLive(c.id)) { abandonSetup(); return }
             val sent = CommsRepository.sendCallSignal(
                 c.peer,
                 JSONObject().put("k", "answer").put("cid", c.id).put("sdp", answer.description)
             )
+            if (!stillLive(c.id)) return
             if (!sent) { endLocked("could not reach the relay", signal = null); return }
             armTimeout(CONNECT_TIMEOUT_MS) { if (it.phase == CallPhase.CONNECTING) endLocked("could not connect", signal = "hangup") }
         } catch (e: Exception) {
             Log.w(TAG, "accepting call failed", e)
-            endLocked(e.message ?: "call setup failed", signal = "hangup")
+            if (stillLive(c.id)) endLocked(e.message ?: "call setup failed", signal = "hangup") else abandonSetup()
         }
     }
 
@@ -230,12 +257,13 @@ object CallManager {
                 val peer = pc ?: return
                 try {
                     peer.setRemote(SessionDescription(SessionDescription.Type.ANSWER, sdp))
+                    if (!stillLive(cid)) return
                     flushPendingRemoteCandidates()
-                    _call.value = current.copy(phase = CallPhase.CONNECTING)
+                    _call.value = _call.value?.copy(phase = CallPhase.CONNECTING)
                     armTimeout(CONNECT_TIMEOUT_MS) { if (it.phase == CallPhase.CONNECTING) endLocked("could not connect", signal = "hangup") }
                 } catch (e: Exception) {
                     Log.w(TAG, "bad answer", e)
-                    endLocked("bad answer from the other phone", signal = "hangup")
+                    if (stillLive(cid)) endLocked("bad answer from the other phone", signal = "hangup")
                 }
             }
             "ice" -> {
@@ -385,6 +413,8 @@ object CallManager {
         timeout?.cancel()
         timeout = serial.launch {
             delay(ms)
+            // Detach before acting: endLocked() cancels `timeout`, which must not be this job.
+            timeout = null
             _call.value?.let { block(it) }
         }
     }
@@ -398,6 +428,10 @@ object CallManager {
     private suspend fun endLocked(reason: String, signal: String?, missed: Boolean = false) {
         val c = _call.value ?: return
         if (c.phase == CallPhase.ENDED) return
+        // Claim the teardown and release the microphone before the first
+        // suspension: a hang-up and the peer's "end" can arrive together, and
+        // the relay round trip below may take the full network timeout.
+        _call.value = c.copy(phase = CallPhase.ENDED, endReason = reason)
         timeout?.cancel()
         candidateFlush?.cancel()
         outgoingCandidates.clear()
@@ -405,15 +439,16 @@ object CallManager {
         pendingOffer = null
         stopRinging()
         CommsNotifications.cancelIncomingCall(appContext)
-        if (signal != null) {
-            CommsRepository.sendCallSignal(c.peer, JSONObject().put("k", "end").put("cid", c.id).put("reason", signal))
-        }
         runCatching { pc?.close() }
         runCatching { pc?.dispose() }
         runCatching { audioTrack?.dispose() }
         runCatching { audioSource?.dispose() }
         pc = null; audioTrack = null; audioSource = null
         stopAudio()
+        CallService.stop(appContext)
+        if (signal != null) {
+            CommsRepository.sendCallSignal(c.peer, JSONObject().put("k", "end").put("cid", c.id).put("reason", signal))
+        }
 
         val now = System.currentTimeMillis()
         val body = when {
@@ -429,9 +464,6 @@ object CallManager {
         }
         CommsRepository.logCall(c.peer, c.direction, body, unread = missed)
         if (missed) CommsNotifications.missedCall(appContext, c.peer)
-
-        _call.value = c.copy(phase = CallPhase.ENDED, endReason = reason)
-        CallService.stop(appContext)
         CommsRepository.releaseLiveLink()
         serial.launch {
             delay(ENDED_LINGER_MS)
