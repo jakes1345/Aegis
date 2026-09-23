@@ -21,7 +21,7 @@ The push to the phone carries only a kind and a cursor, never message content.
 ```sh
 npm install
 npx wrangler login                      # or set CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID
-npx wrangler d1 create aegis-comms      # paste the database_id into wrangler.toml
+# The D1 database aegis-comms already exists and wrangler.toml carries its id.
 npm run migrate
 npx wrangler secret put TWILIO_ACCOUNT_SID
 npx wrangler secret put TWILIO_AUTH_TOKEN
