@@ -2204,13 +2204,13 @@ private fun cellExplainerContent(f: CatcherFinding): ExplainerContent {
         )
         "unknown_cell" -> Triple(
             "A cell tower that has never appeared in this area before has become your serving cell. " +
-            "You have been to this location many times, and the tower infrastructure here is well-established. " +
+            "You have visited this area at least 20 separate times, and the tower infrastructure here is well-established. " +
             "Portable IMSI catchers appear as unknown cells in familiar areas.",
             "A new cell at a familiar location deserves caution. If you also see technology downgrade or " +
             "signal strength anomalies, treat this as a serious surveillance indicator. Do not make sensitive " +
             "calls. Move away and observe whether the new cell disappears.",
             "Medium confidence. New towers do get installed occasionally, but this detection requires " +
-            "high baseline maturity (many prior visits) before triggering."
+            "at least 20 separate visits to the area (returns more than 30 minutes apart) before triggering."
         )
         "ephemeral_cell", "ephemeral_cell_strict" -> Triple(
             "A cell tower appeared briefly as your serving cell, then vanished. Real base stations " +
