@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -17,6 +19,31 @@ val rustJniLibs = layout.buildDirectory.dir("rust/jniLibs")
 val rustBindings = layout.buildDirectory.dir("rust/kotlin")
 val rustAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
 
+/**
+ * The NDK cargo-ndk should use: ANDROID_NDK_HOME if set, else the runner's
+ * ANDROID_NDK_LATEST_HOME, else the newest NDK installed under the SDK.
+ * cargo-ndk fails with "Error detecting NDK version for path" when it is
+ * handed nothing, which is what an unset variable looks like in CI.
+ */
+fun resolveNdkDir(): File? {
+    listOf("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "ANDROID_NDK_LATEST_HOME")
+        .mapNotNull { System.getenv(it)?.takeIf { v -> v.isNotBlank() } }
+        .map { File(it) }
+        .firstOrNull { it.isDirectory }
+        ?.let { return it }
+    val sdk = listOf("ANDROID_HOME", "ANDROID_SDK_ROOT")
+        .mapNotNull { System.getenv(it)?.takeIf { v -> v.isNotBlank() } }
+        .map { File(it) }
+        .firstOrNull { it.isDirectory }
+        ?: rootProject.file("local.properties").takeIf { it.isFile }?.let { propsFile ->
+            val props = Properties()
+            propsFile.inputStream().use { stream -> props.load(stream) }
+            props.getProperty("sdk.dir")?.let { dir -> File(dir) }
+        }
+    return sdk?.resolve("ndk")?.listFiles { f -> f.isDirectory && f.resolve("source.properties").isFile }
+        ?.maxByOrNull { it.name }
+}
+
 val cargoNdkBuild by tasks.registering(Exec::class) {
     group = "build"
     description = "Cross-compiles comms-crypto for every Android ABI with cargo-ndk"
@@ -24,6 +51,12 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
     inputs.dir(rustCrate.resolve("src"))
     inputs.files(rustCrate.resolve("Cargo.toml"), rustCrate.resolve("Cargo.lock"))
     outputs.dir(rustJniLibs)
+    doFirst {
+        val ndk = resolveNdkDir()
+            ?: throw GradleException("No Android NDK found: set ANDROID_NDK_HOME or install one under \$ANDROID_HOME/ndk")
+        environment("ANDROID_NDK_HOME", ndk.absolutePath)
+        logger.lifecycle("cargo-ndk using NDK at ${ndk.absolutePath}")
+    }
     commandLine(
         listOf("cargo", "ndk") + rustAbis.flatMap { listOf("-t", it) } +
             listOf("-o", rustJniLibs.get().asFile.absolutePath, "build", "--release", "--lib")

@@ -56,11 +56,14 @@ jobs:
         working-directory: comms-crypto
         run: cargo test --release
 
+      # ANDROID_NDK_LATEST_HOME is a runner environment variable, not a workflow
+      # `env.` value, so it is read in the shell rather than in an expression.
       - name: Build debug APK
         working-directory: android
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
+          echo "NDK: $ANDROID_NDK_HOME"
+          gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
