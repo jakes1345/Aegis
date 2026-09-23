@@ -173,7 +173,8 @@ private fun OPage1() {
         )
         Spacer(Modifier.height(20.dp))
         Text(
-            "All analysis is on-device. Nothing is transmitted to external servers.",
+            "Detection data stays on this device. The Map tab downloads map tiles from " +
+            "OpenStreetMap, which sees your IP address and the area you're viewing.",
             color = OMutedClr, fontSize = 12.sp, textAlign = TextAlign.Center
         )
         Spacer(Modifier.height(120.dp))

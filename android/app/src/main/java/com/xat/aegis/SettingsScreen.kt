@@ -600,10 +600,11 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                     color = SInkClr, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    "All detection data remains on-device. Track Detect does not transmit any " +
-                    "information to external servers. Location data, device identifiers and cellular " +
-                    "baselines are stored locally and never leave this device. Evidence exports are " +
-                    "shared only when you explicitly trigger an export.",
+                    "Detection data stays on this device. Location history, device identifiers, " +
+                    "cellular baselines, the timeline and the card vault are stored locally and are " +
+                    "never uploaded. The Map tab downloads map tiles from OpenStreetMap, which sees " +
+                    "your IP address and the area you're viewing. Evidence exports are shared only " +
+                    "when you explicitly trigger an export.",
                     color = SMutedClr, fontSize = 12.sp, lineHeight = 18.sp
                 )
             }

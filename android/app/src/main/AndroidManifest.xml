@@ -11,9 +11,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Cellular identity — needed to read serving cell info -->
-    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
-
     <!-- Wi-Fi anomaly scan reads the system's cached scan results only -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
@@ -23,7 +20,8 @@
     <!-- Restart scanning after reboot -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
-    <!-- Map tile downloads — anonymous; no user data leaves the device -->
+    <!-- Map tile downloads from OpenStreetMap. The tile server sees the device's IP
+         address and which map area is being viewed; no detection data is sent. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
