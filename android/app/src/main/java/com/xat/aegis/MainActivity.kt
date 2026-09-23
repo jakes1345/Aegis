@@ -1085,7 +1085,23 @@ private fun DetectionDetail(d: Detection, trusted: Boolean, onShowExplainer: (()
 
 // ── Map screen ─────────────────────────────────────────────────────────
 
-private fun markerBitmap(argbFill: Int, sizeDp: Int, outline: Boolean = false): BitmapDrawable {
+private data class MarkerKey(val argbFill: Int, val sizeDp: Int, val outline: Boolean)
+
+/**
+ * Marker icons by (colour, size, outline). The map redraws every 1.5 s and used to
+ * allocate a fresh bitmap for every marker each time; there are only a handful of
+ * distinct icons, so they are drawn once and shared.
+ *
+ * Touched only from the main thread (composition and effects).
+ */
+private val markerCache = HashMap<MarkerKey, BitmapDrawable>()
+
+private fun markerBitmap(argbFill: Int, sizeDp: Int, outline: Boolean = false): BitmapDrawable =
+    markerCache.getOrPut(MarkerKey(argbFill, sizeDp, outline)) {
+        drawMarkerBitmap(argbFill, sizeDp, outline)
+    }
+
+private fun drawMarkerBitmap(argbFill: Int, sizeDp: Int, outline: Boolean): BitmapDrawable {
     val px = (sizeDp * Resources.getSystem().displayMetrics.density + 0.5f).toInt()
     val bm = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888)
     val canvas = android.graphics.Canvas(bm)
@@ -1202,7 +1218,16 @@ private fun MapScreen() {
 
     DisposableEffect(Unit) {
         mapView.onResume()
-        onDispose { mapView.onPause() }
+        onDispose {
+            mapView.onPause()
+            // Leaving the tab discards this MapView (it lives in remember{}), so it has
+            // to release its tile provider threads and caches, or every visit to the
+            // Map tab leaked one. Overlays are dropped from the list first: detaching
+            // a Marker recycles its icon, and the icons are shared via markerCache.
+            // Plain removal from the list does not detach, so they survive for reuse.
+            mapView.overlays.removeAll { it !is org.osmdroid.views.overlay.TilesOverlay }
+            mapView.onDetach()
+        }
     }
 
     Box(Modifier.fillMaxSize()) {
