@@ -98,9 +98,15 @@ data class CellStatus(
     val score: Int = 0,
     val level: Threat = Threat.NONE,
     val mature: Boolean = false,
+    /**
+     * How far the baseline has come, 0..1, in separate visits to areas rather than
+     * poll counts. The visit-gated heuristics need five or more visits to an area
+     * before they can fire, so the bar is scaled to match what "Mature" means.
+     */
     val maturity: Float = 0f,
     val knownCells: Int = 0,
-    val observations: Int = 0
+    /** Separate visits recorded across every tracking area. */
+    val visits: Int = 0
 )
 
 // --- Timeline ---------------------------------------------------------------

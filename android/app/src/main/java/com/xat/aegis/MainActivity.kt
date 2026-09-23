@@ -1786,8 +1786,9 @@ private fun CellScreen(onShowExplainer: ((CatcherFinding) -> Unit)? = null) {
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        if (cell.mature) "${cell.knownCells} cells · ${cell.observations} observations · Mature"
-                        else "${cell.observations}/50 observations — keep scanning in your usual locations to build baseline",
+                        if (cell.mature) "${plural(cell.knownCells, "cell")} · ${plural(cell.visits, "visit")} · Mature"
+                        else "${cell.visits}/10 visits — keep scanning in your usual locations; a visit is a " +
+                            "return to an area after time spent somewhere else",
                         color = Muted, fontSize = 12.sp
                     )
                 }
@@ -2595,8 +2596,9 @@ private fun cellExplainerContent(f: CatcherFinding): ExplainerContent {
             "Avoid making voice calls or sending SMS until you leave the area. Use end-to-end encrypted " +
             "messaging apps over WiFi or data. Do not transmit sensitive information. Move away from the " +
             "area and observe whether the technology level returns to normal.",
-            "High confidence indicator. Technology downgrade at a location where higher tech was previously " +
-            "seen is a primary IMSI catcher signature."
+            "High confidence indicator. A drop to 2G/3G within half an hour of 4G/5G serving you at the " +
+            "same spot, without you having moved, is a primary IMSI catcher signature. Moving resets " +
+            "the comparison, so a drive into a basement car park does not count."
         )
         "cellid_tac_mismatch" -> Triple(
             "A cell tower ID that you have seen before is now claiming to be in a different area (tracking " +

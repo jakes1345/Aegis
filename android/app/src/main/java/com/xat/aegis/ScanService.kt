@@ -313,13 +313,13 @@ class ScanService : LifecycleService() {
                         val fix = track.current
                         val findings = imsiCatcher.recordAndAnalyze(cell, fix)
                         val (score, level) = imsiCatcher.scoreAndLevel(findings)
-                        val (knownCells, observations, maturity) = imsiCatcher.stats()
+                        val (knownCells, visits, maturity) = imsiCatcher.stats()
                         Registry.publishCell(
                             CellStatus(
                                 available = true, cell = cell, findings = findings,
                                 score = score, level = level,
                                 mature = maturity >= 1f, maturity = maturity,
-                                knownCells = knownCells, observations = observations
+                                knownCells = knownCells, visits = visits
                             )
                         )
                         if (level.ordinal >= Threat.MEDIUM.ordinal && findings.isNotEmpty()) {
