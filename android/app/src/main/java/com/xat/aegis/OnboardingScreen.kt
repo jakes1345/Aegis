@@ -148,11 +148,11 @@ private fun OPage1() {
                 .background(OPanelClr, RoundedCornerShape(60.dp)),
             contentAlignment = Alignment.Center
         ) {
-            Text("TD", color = OAccentClr, fontSize = 36.sp, fontWeight = FontWeight.Black)
+            Text("A", color = OAccentClr, fontSize = 44.sp, fontWeight = FontWeight.Black)
         }
         Spacer(Modifier.height(36.dp))
         Text(
-            "Track Detect",
+            "Aegis",
             color = OInkClr, fontSize = 30.sp, fontWeight = FontWeight.Black,
             letterSpacing = 1.sp, textAlign = TextAlign.Center
         )
@@ -164,7 +164,7 @@ private fun OPage1() {
         )
         Spacer(Modifier.height(24.dp))
         Text(
-            "Track Detect continuously scans for hidden surveillance devices — " +
+            "Aegis continuously scans for hidden surveillance devices — " +
             "Bluetooth trackers, IMSI catchers (fake cell towers), rogue WiFi access " +
             "points, and NFC tags — so you can detect and document covert monitoring " +
             "in real time.",
@@ -173,7 +173,8 @@ private fun OPage1() {
         )
         Spacer(Modifier.height(20.dp))
         Text(
-            "All analysis is on-device. Nothing is transmitted to external servers.",
+            "Detection data stays on this device. The Map tab downloads map tiles from " +
+            "OpenStreetMap, which sees your IP address and the area you're viewing.",
             color = OMutedClr, fontSize = 12.sp, textAlign = TextAlign.Center
         )
         Spacer(Modifier.height(120.dp))
@@ -274,7 +275,7 @@ private fun OPage3() {
         OHowItWorksItem(
             color = OAccentClr,
             title = "BLE Tracker Detection",
-            text = "Bluetooth trackers broadcast advertising packets continuously. Track Detect " +
+            text = "Bluetooth trackers broadcast advertising packets continuously. Aegis " +
                    "matches known signatures (AirTag, Tile, SmartTag) and monitors whether a device " +
                    "reappears across multiple locations — confirming it is following rather than " +
                    "just passing by."
@@ -283,7 +284,7 @@ private fun OPage3() {
         OHowItWorksItem(
             color = OBlueClr,
             title = "IMSI Catcher Detection",
-            text = "Track Detect builds a local baseline of your usual cell towers, then watches " +
+            text = "Aegis builds a local baseline of your usual cell towers, then watches " +
                    "for anomalies — forced technology downgrades, unknown cells at familiar " +
                    "locations, abnormally strong signals — that indicate a portable surveillance " +
                    "device impersonating a legitimate tower."
@@ -293,7 +294,7 @@ private fun OPage3() {
             color = OMutedClr,
             title = "WiFi & NFC",
             text = "Rogue access points mimic carrier networks to intercept traffic. NFC tags " +
-                   "hidden in objects can track location. Track Detect flags suspicious SSIDs " +
+                   "hidden in objects can track location. Aegis flags suspicious SSIDs " +
                    "and known covert-tracking NFC chip types in real time."
         )
     }
@@ -349,7 +350,7 @@ private fun OPage4(onStart: () -> Unit) {
         )
         Spacer(Modifier.height(16.dp))
         Text(
-            "Track Detect is ready. Start scanning now to begin monitoring for surveillance devices.",
+            "Aegis is ready. Start scanning now to begin monitoring for surveillance devices.",
             color = OInkDimClr, fontSize = 14.sp, textAlign = TextAlign.Center,
             lineHeight = 21.sp
         )

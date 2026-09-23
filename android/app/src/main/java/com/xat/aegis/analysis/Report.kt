@@ -27,6 +27,11 @@ object Report {
         nfc: List<NfcTag>
     ): Intent {
         val text = buildReport(status, detections, timeline, cell, nfc)
+        // Each report carries the GPS history, so earlier ones are not left lying in
+        // the cache. The share target has already been handed its copy by the time
+        // the user exports again.
+        context.cacheDir.listFiles { f -> f.isFile && f.name.startsWith("aegis_") && f.name.endsWith(".txt") }
+            ?.forEach { it.delete() }
         val file = File(context.cacheDir, "aegis_${System.currentTimeMillis()}.txt")
         file.writeText(text)
         val uri: Uri = FileProvider.getUriForFile(
@@ -35,7 +40,7 @@ object Report {
         return Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_STREAM, uri)
-            putExtra(Intent.EXTRA_SUBJECT, "Track Detect Evidence Report")
+            putExtra(Intent.EXTRA_SUBJECT, "Aegis Evidence Report")
             putExtra(Intent.EXTRA_TEXT, text.take(2000))
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
@@ -48,7 +53,7 @@ object Report {
         cell: CellStatus,
         nfc: List<NfcTag>
     ) = buildString {
-        appendLine("=== TRACK DETECT EVIDENCE REPORT ===")
+        appendLine("=== AEGIS EVIDENCE REPORT ===")
         appendLine("Generated: ${sdf.format(Date())}")
         appendLine()
 

@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "TrackDetect"
+rootProject.name = "Aegis"
 include(":app")

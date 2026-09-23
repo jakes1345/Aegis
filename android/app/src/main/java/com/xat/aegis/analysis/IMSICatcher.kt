@@ -1,6 +1,7 @@
 package com.xat.aegis.analysis
 
 import com.xat.aegis.CatcherFinding
+import com.xat.aegis.Rat
 import com.xat.aegis.Severity
 import com.xat.aegis.ServingCell
 import com.xat.aegis.Store
@@ -93,7 +94,10 @@ class IMSICatcher(private val store: Store) {
 
         val tKey = tacKey(cell)
         val tacRec = tacs.optJSONObject(tKey)
-        val tacMaturity = tacRec?.optInt("maturity", 0) ?: 0
+        // Separate visits to this area, not polls. The old "maturity" key counted
+        // every 15-second poll, so "5 visits" arrived after 75 s and "20 visits" after
+        // five minutes; it is ignored rather than trusted, and areas re-learn.
+        val tacVisits = tacRec?.optInt("visits", 0) ?: 0
 
         // Several heuristics only mean anything while you are standing still: crossing
         // cells, swapping radio technology and signal jumps are all what travelling
@@ -107,9 +111,12 @@ class IMSICatcher(private val store: Store) {
             else -> true
         }
 
-        // 1 — RAT downgrade
+        // 1 — RAT downgrade, to 2G/3G in an area known to have LTE or better. That is
+        // what the explainer describes and what interception equipment forces. A 5G
+        // to LTE fallback is routine — NR coverage is patchy indoors and at the edge
+        // of every cell — and used to raise this on its own.
         val maxRatRank = tacRec?.optInt("maxRatRank", 0) ?: 0
-        if (tacMaturity >= 5 && cell.rat.rank in 1 until maxRatRank) {
+        if (tacVisits >= 5 && cell.rat.rank in 1..Rat.UMTS.rank && maxRatRank >= Rat.LTE.rank) {
             findings += CatcherFinding(
                 id = "rat_downgrade", severity = Severity.HIGH,
                 title = "Radio downgrade detected",
@@ -146,7 +153,7 @@ class IMSICatcher(private val store: Store) {
         // 4 — Signal outlier
         val maxDbm = tacRec?.optInt("maxDbm", -160) ?: -160
         val dbm = cell.signalDbm
-        if (dbm != null && tacMaturity >= 5 && dbm > maxDbm + 15) {
+        if (dbm != null && tacVisits >= 5 && dbm > maxDbm + 15) {
             findings += CatcherFinding(
                 id = "signal_outlier", severity = Severity.MEDIUM,
                 title = "Unusually strong signal",
@@ -155,7 +162,7 @@ class IMSICatcher(private val store: Store) {
         }
 
         // 5 — Unknown cell at familiar area
-        if (tacMaturity >= 20) {
+        if (tacVisits >= 20) {
             val known = tacRec?.optJSONArray("cells") ?: JSONArray()
             var found = false
             for (i in 0 until known.length()) if (known.optString(i) == cell.cellId) { found = true; break }
@@ -163,7 +170,7 @@ class IMSICatcher(private val store: Store) {
                 findings += CatcherFinding(
                     id = "unknown_cell", severity = Severity.MEDIUM,
                     title = "Unknown cell at familiar location",
-                    detail = "Cell ${cell.cellId} has never appeared in area ${cell.tac}, but you have been here $tacMaturity times. New permanent towers are rare; portable ones are not."
+                    detail = "Cell ${cell.cellId} has never appeared in area ${cell.tac}, but you have visited this area $tacVisits times. New permanent towers are rare; portable ones are not."
                 )
             }
         }
@@ -202,7 +209,7 @@ class IMSICatcher(private val store: Store) {
         // count is zero forever. Treating that as an indicator pinned a permanent
         // finding on the device, so it only counts once this phone has proved it can
         // report neighbours at least once.
-        if (cell.neighbors != null && cell.neighbors == 0 && tacMaturity >= 5 &&
+        if (cell.neighbors != null && cell.neighbors == 0 && tacVisits >= 5 &&
             data.optBoolean("neighborsEverSeen", false)
         ) {
             findings += CatcherFinding(
@@ -218,7 +225,7 @@ class IMSICatcher(private val store: Store) {
         // caveat as neighbours: a modem that always reports 0 is not reporting at all,
         // so this waits until a real non-zero advance has been seen on this device.
         val ta = cell.timingAdvance
-        if (ta != null && ta == 0 && cell.rat == com.xat.aegis.Rat.LTE && tacMaturity >= 5 &&
+        if (ta != null && ta == 0 && cell.rat == Rat.LTE && tacVisits >= 5 &&
             data.optBoolean("taEverNonZero", false)
         ) {
             findings += CatcherFinding(
@@ -292,7 +299,15 @@ class IMSICatcher(private val store: Store) {
         cellRec.put("rat", cell.rat.name)
 
         val tacRec = tacs.optJSONObject(tKey) ?: JSONObject().also { tacs.put(tKey, it) }
-        tacRec.put("maturity", tacRec.optInt("maturity", 0) + 1)
+        // A visit is a first sighting, or a return after more than VISIT_GAP_MS away.
+        // Polls in between only move lastSeenTs forward, so a long stay is one visit.
+        val lastSeenTs = tacRec.optLong("lastSeenTs", 0L)
+        if (lastSeenTs == 0L || now - lastSeenTs > VISIT_GAP_MS) {
+            tacRec.put("visits", tacRec.optInt("visits", 0) + 1)
+        }
+        tacRec.put("lastSeenTs", now)
+        // Written by earlier versions as a per-poll count; meaningless as a visit count.
+        tacRec.remove("maturity")
         if (cell.rat.rank > tacRec.optInt("maxRatRank", 0)) tacRec.put("maxRatRank", cell.rat.rank)
         val dbm = cell.signalDbm
         if (dbm != null && dbm > tacRec.optInt("maxDbm", -160)) tacRec.put("maxDbm", dbm)
@@ -349,6 +364,11 @@ class IMSICatcher(private val store: Store) {
                 .put("tacs", JSONObject())
                 .put("cellTacs", JSONObject())
         )
+    }
+
+    private companion object {
+        /** Time away from an area after which being back there counts as a new visit. */
+        const val VISIT_GAP_MS = 30 * 60_000L
     }
 
     fun stats(): Triple<Int, Int, Float> {

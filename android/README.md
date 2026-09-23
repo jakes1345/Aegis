@@ -1,4 +1,4 @@
-# Track Detect — Android
+# Aegis — Android
 
 A real BLE tracker detector, not a port. The Node tool in this repo is a
 terminal application and does not run on Android, so this is a native Kotlin
@@ -22,7 +22,7 @@ Every push builds one in CI.
 
 1. Open the **Actions** tab on GitHub
 2. Pick the most recent **Android APK** run
-3. Download the `track-detect-debug-apk` artifact
+3. Download the `aegis-debug-apk` artifact
 4. Unzip it and install the `.apk` on your phone
 
 You will need to allow installation from unknown sources. It is a debug build,
@@ -46,18 +46,18 @@ binary out of the repository.
 | Permission | Why |
 |---|---|
 | Nearby devices (`BLUETOOTH_SCAN`) | The scan itself |
-| Precise location | Android requires it for BLE scanning, and this app genuinely uses the fix — it is what proves a device travelled with you |
+| Precise location | Android requires it for BLE scanning and for reading your own modem's serving cell (the IMSI-catcher checks), and this app genuinely uses the fix — it is what proves a device travelled with you |
 | Notifications | The one alert that matters, when something crosses into confirmed-following |
 | Foreground service | Scanning has to continue while the screen is off, or it never accumulates enough evidence |
-| Phone state | Reads your own modem's serving cell for the IMSI-catcher checks |
 | Wi-Fi state | Reads the system's existing scan results; the app never triggers a Wi-Fi scan of its own |
 | NFC | The passive HF tag sweep on the NFC tab |
-| Background location | Only so scanning survives a reboot, and only when you had it running |
+| Background location | Optional, requested only from Settings → "Resume scanning after reboot". Android only lets a location service start at boot with "Allow all the time"; without it, scanning simply waits until you open the app |
 
 Declining notifications costs you the alert, not the detector — scanning still runs.
 
-Nothing leaves the phone. There is no network permission in the manifest at all,
-which you can verify yourself.
+Detection data stays on the phone. The one network use is the Map tab, which
+downloads map tiles from OpenStreetMap — the tile server sees your IP address and
+the area you are viewing, and nothing else.
 
 ## Screen on versus screen off
 

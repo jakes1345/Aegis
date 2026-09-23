@@ -56,8 +56,9 @@ dependencies {
 
     implementation("com.google.android.gms:play-services-location:21.3.0")
 
-    // Live tile map — renders OpenStreetMap tiles. Network is used only for
-    // anonymous tile downloads; no user data is transmitted.
+    // Live tile map — renders OpenStreetMap tiles. The network is used only for tile
+    // downloads, which expose the device's IP and the viewed area to the tile server;
+    // no detection data is transmitted.
     implementation("org.osmdroid:osmdroid-android:6.1.20")
 
     // Card vault — BiometricPrompt and AppCompatActivity for vault unlock

@@ -1,10 +1,11 @@
 package com.xat.aegis
 
 import android.content.Context
-import com.xat.aegis.VaultCard
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 
 /** Shared state between the scanning service, the NFC reader and the UI. */
 object Registry {
@@ -29,7 +30,12 @@ object Registry {
 
     fun publish(list: List<Detection>) { _detections.value = list }
 
-    fun update(block: (ScanStatus) -> ScanStatus) { _status.value = block(_status.value) }
+    /**
+     * Read-modify-write of the scan status, retried if another thread got there
+     * first. The BLE binder thread, the main thread and the service's coroutines all
+     * call this; a plain `value = block(value)` let one of two racing updates vanish.
+     */
+    fun update(block: (ScanStatus) -> ScanStatus) { _status.update(block) }
 
     fun publishCell(status: CellStatus) { _cell.value = status }
 
@@ -40,7 +46,7 @@ object Registry {
     fun addNfc(tag: NfcTag) {
         // Newest first, and a re-tap of the same card replaces the old row
         // rather than stacking duplicates.
-        _nfc.value = (listOf(tag) + _nfc.value.filter { it.uid != tag.uid }).take(50)
+        _nfc.update { current -> (listOf(tag) + current.filter { it.uid != tag.uid }).take(50) }
     }
 
     fun clearNfc() { _nfc.value = emptyList() }
@@ -79,12 +85,12 @@ object Registry {
             ?.toSet() ?: emptySet()
     }
 
-    fun trust(address: String) = setTrusted(_trusted.value + address)
+    fun trust(address: String) = setTrusted { it + address }
 
-    fun untrust(address: String) = setTrusted(_trusted.value - address)
+    fun untrust(address: String) = setTrusted { it - address }
 
-    private fun setTrusted(next: Set<String>) {
-        _trusted.value = next
+    private fun setTrusted(change: (Set<String>) -> Set<String>) {
+        val next = _trusted.updateAndGet(change)
         appContext
             ?.getSharedPreferences(AppSettings.PREFS_NAME, Context.MODE_PRIVATE)
             ?.edit()
@@ -97,17 +103,28 @@ object Registry {
     private val _phoneHealth = MutableStateFlow(PhoneHealth())
     val phoneHealth: StateFlow<PhoneHealth> = _phoneHealth.asStateFlow()
     fun publishPhoneHealth(h: PhoneHealth) { _phoneHealth.value = h }
+    fun updatePhoneHealth(block: (PhoneHealth) -> PhoneHealth) { _phoneHealth.update(block) }
 
     // --- Card vault ----------------------------------------------------------
 
-    private val _vault = MutableStateFlow<List<VaultCard>>(emptyList())
-    val vault: StateFlow<List<VaultCard>> = _vault.asStateFlow()
-    fun publishVault(cards: List<VaultCard>) { _vault.value = cards }
+    //
+    // Decrypted cards exist here only between a successful unlock and the activity
+    // going to the background; the rest of the time this holds Locked (or the
+    // reason the vault could not be read), never the cards.
 
-    /** ID of the vault card currently being emulated via HCE, or null. */
-    private val _emulating = MutableStateFlow<String?>(null)
-    val emulating: StateFlow<String?> = _emulating.asStateFlow()
-    fun setEmulating(id: String?) { _emulating.value = id }
+    private val _vault = MutableStateFlow<VaultState>(VaultState.Locked)
+    val vault: StateFlow<VaultState> = _vault.asStateFlow()
+    fun publishVault(state: VaultState) { _vault.value = state }
+    fun lockVault() { _vault.value = VaultState.Locked }
+
+    /**
+     * The vault card currently being emulated via HCE, or null. Holds the label as
+     * well as the id so the banner and STOP keep working after the vault re-locks —
+     * emulation is typically used with Aegis in the background.
+     */
+    private val _emulating = MutableStateFlow<ArmedCard?>(null)
+    val emulating: StateFlow<ArmedCard?> = _emulating.asStateFlow()
+    fun setEmulating(card: ArmedCard?) { _emulating.value = card }
 
     fun reset() {
         _detections.value = emptyList()

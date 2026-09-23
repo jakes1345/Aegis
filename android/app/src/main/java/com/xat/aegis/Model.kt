@@ -179,13 +179,31 @@ data class VaultCard(
     val apduPairs: List<Pair<String, String>> = emptyList()
 )
 
+/** What the NFC tab can show of the vault right now. */
+sealed interface VaultState {
+    /** Not unlocked this session, or re-locked when the app left the screen. */
+    data object Locked : VaultState
+    /** Unlock in progress (authentication or decryption running). */
+    data object Unlocking : VaultState
+    data class Unlocked(val cards: List<VaultCard>) : VaultState
+    /**
+     * The vault could not be opened. Nothing was overwritten. [retryable] is false
+     * when the key is gone for good and trying again cannot help; [erasable] is true
+     * when there is stored data the user may choose to delete to start over.
+     */
+    data class Failed(val message: String, val retryable: Boolean, val erasable: Boolean) : VaultState
+}
+
+/** The card currently armed for Host Card Emulation. */
+data class ArmedCard(val id: String, val label: String)
+
 // --- WiFi anomaly -----------------------------------------------------------
 
 data class WifiAnomaly(
     val ssid: String,
     val bssid: String,
     val rssi: Int,
-    val reason: String,       // e.g. "known_catcher_ssid", "open_unsecured", "duplicate_ssid"
+    val reason: String,       // e.g. "known_catcher_ssid", "carrier_open_network", "open_twin_of_secured"
     val threat: Threat,
     val ts: Long
 )
@@ -222,13 +240,25 @@ data class PhoneHealthFinding(
     val detail: String
 )
 
+/** A camera another app currently holds open. */
+data class CameraInUse(
+    val id: String,
+    /** "front", "back", "external", or null when the camera does not say. */
+    val facing: String?
+)
+
 data class PhoneHealth(
     val findings: List<PhoneHealthFinding> = emptyList(),
-    val activeMic: List<String> = emptyList(),
-    val activeCamera: List<String> = emptyList()
+    /**
+     * Number of audio recordings active on the device. Android does not reveal which
+     * app owns a recording to a third-party app, so this is a count, not a list.
+     */
+    val activeRecordings: Int = 0,
+    /** Cameras currently open by another app — Aegis never opens the camera itself. */
+    val camerasInUse: List<CameraInUse> = emptyList()
 ) {
     val level: Threat get() = when {
-        activeMic.isNotEmpty() || activeCamera.isNotEmpty() -> Threat.CRITICAL
+        activeRecordings > 0 || camerasInUse.isNotEmpty() -> Threat.CRITICAL
         findings.any { it.severity == Severity.CRITICAL } -> Threat.CRITICAL
         findings.any { it.severity == Severity.HIGH } -> Threat.HIGH
         findings.any { it.severity == Severity.MEDIUM } -> Threat.MEDIUM

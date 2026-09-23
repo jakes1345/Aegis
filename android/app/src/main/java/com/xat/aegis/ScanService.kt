@@ -62,7 +62,6 @@ class ScanService : LifecycleService() {
     private lateinit var imsiCatcher: IMSICatcher
     private lateinit var eventLog: EventLog
     private lateinit var cellStore: Store
-    private lateinit var timelineStore: Store
 
     private val alerted = HashSet<String>()
     private val gpsTrail = ArrayList<LatLon>(500)
@@ -151,10 +150,10 @@ class ScanService : LifecycleService() {
         screenOn = getSystemService(PowerManager::class.java)?.isInteractive ?: true
 
         cellStore = Store(this, "imsi_baseline.json")
-        timelineStore = Store(this, "timeline.json")
         cellMonitor = CellMonitor(this)
         imsiCatcher = IMSICatcher(cellStore)
-        eventLog = EventLog(timelineStore)
+        // Shared with the activity, which records NFC scans into the same log.
+        eventLog = TimelineLog.get(this)
         Registry.publishTimeline(eventLog.snapshot())
         phoneHealthMonitor = PhoneHealthMonitor(this)
         phoneHealthMonitor.start()
@@ -187,7 +186,10 @@ class ScanService : LifecycleService() {
                 this, NOTIFICATION_ID, buildOngoing(0, 0),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
             )
-        } catch (e: SecurityException) {
+        } catch (e: Exception) {
+            // SecurityException when location access is missing, or
+            // ForegroundServiceStartNotAllowedException (an IllegalStateException)
+            // when the system refuses a start from the background.
             running = false
             Registry.update { it.copy(scanning = false, error = "Location permission required to scan") }
             stopSelf()
@@ -282,7 +284,11 @@ class ScanService : LifecycleService() {
             Registry.update { it.copy(hasFix = false) }
             return
         }
-        val request = LocationRequest.Builder(Priority.PRIORITY_BALANCED_POWER_ACCURACY, 15_000L)
+        // High accuracy, not balanced: balanced power returns Wi-Fi/cell fixes of
+        // ~100 m or worse, and ObservationArea discards anything over 50 m, so places
+        // never accumulated and nothing could ever be confirmed as following. This
+        // is already a location foreground service; GPS is what it is for.
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 15_000L)
             .setMinUpdateIntervalMillis(10_000L).setMinUpdateDistanceMeters(25f).build()
         try {
             location.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
@@ -384,8 +390,10 @@ class ScanService : LifecycleService() {
                 // Phone health: immediately on first cycle, then every ~30s
                 publishCycle++
                 if (publishCycle == 1 || publishCycle % 20 == 0) {
-                    val health = phoneHealthMonitor.scan()
-                    Registry.publishPhoneHealth(health)
+                    // Only the findings: mic and camera state is pushed by the
+                    // monitor's callbacks and must not be overwritten here.
+                    val findings = phoneHealthMonitor.scan()
+                    Registry.updatePhoneHealth { it.copy(findings = findings) }
                 }
 
                 // WiFi anomaly scan: immediately on first cycle, then every ~60s
@@ -587,7 +595,7 @@ class ScanService : LifecycleService() {
 
     private fun buildOngoing(watching: Int, following: Int): Notification =
         NotificationCompat.Builder(this, CHANNEL_ONGOING)
-            .setContentTitle("Track Detect").setContentText(ongoingText(watching, following))
+            .setContentTitle("Aegis").setContentText(ongoingText(watching, following))
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setOngoing(true).setContentIntent(contentIntent())
             .setCategory(NotificationCompat.CATEGORY_SERVICE).build()
@@ -653,7 +661,7 @@ class ScanService : LifecycleService() {
         }
         Registry.update { it.copy(scanning = false) }
         cellStore.flush()
-        timelineStore.flush()
+        TimelineLog.flush()
         phoneHealthMonitor.stop()
         super.onDestroy()
     }
