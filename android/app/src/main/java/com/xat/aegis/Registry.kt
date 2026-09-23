@@ -153,6 +153,12 @@ object Registry {
     fun requestTab(index: Int) { _tabRequest.value = index }
     fun takeTabRequest(): Int? = _tabRequest.getAndUpdate { null }
 
+    /** A conversation the COMMS tab should open, set from a message notification. */
+    private val _threadRequest = MutableStateFlow<String?>(null)
+    val threadRequest: StateFlow<String?> = _threadRequest.asStateFlow()
+    fun requestThread(peer: String) { _threadRequest.value = peer }
+    fun takeThreadRequest(): String? = _threadRequest.getAndUpdate { null }
+
     fun reset() {
         _detections.value = emptyList()
         _status.value = ScanStatus()

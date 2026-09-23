@@ -1,0 +1,30 @@
+# Aegis comms relay.
+#
+# Secrets (set with `wrangler secret put <NAME>`, never in this file):
+#   TWILIO_ACCOUNT_SID            Twilio account SID (AC…)
+#   TWILIO_AUTH_TOKEN             Twilio auth token; also validates webhook signatures
+#   TWILIO_NUMBER                 The purchased number in E.164, e.g. +15551234567
+#   FIREBASE_SERVICE_ACCOUNT_JSON The Firebase service-account key file, verbatim
+#   ENROLL_SECRET                 One-time code typed into Aegis to pair a phone
+#
+# `wrangler deploy` prints the Worker URL; scripts/setup-twilio.mjs points the
+# number's SMS and status webhooks at it.
+
+name = "aegis-comms"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "aegis-comms"
+# Fill in after `wrangler d1 create aegis-comms`.
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[vars]
+# How many messages one sync call returns at most.
+SYNC_PAGE_SIZE = "200"

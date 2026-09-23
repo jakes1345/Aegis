@@ -4,6 +4,15 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Firebase Cloud Messaging wakes the app for texts and calls on the COMMS tab.
+// The google-services plugin turns google-services.json into resources and fails
+// the build when the file is absent, so it is applied only when the file exists:
+// a checkout without it (CI, a fork without a Firebase project) still builds, and
+// the app then runs with push off and syncs on open instead.
+if (file("google-services.json").exists()) {
+    apply(plugin = "com.google.gms.google-services")
+}
+
 android {
     namespace = "com.xat.aegis"
     compileSdk = 35
@@ -64,4 +73,12 @@ dependencies {
     // Card vault — BiometricPrompt and AppCompatActivity for vault unlock
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.biometric:biometric:1.1.0")
+
+    // COMMS — HTTPS to the owner's relay Worker, and Firebase Cloud Messaging for
+    // wake-ups. The push payload is a kind and a cursor; message content is
+    // fetched from the relay over TLS, never sent through Google.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation(platform("com.google.firebase:firebase-bom:34.19.0"))
+    implementation("com.google.firebase:firebase-messaging")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
 }
