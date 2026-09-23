@@ -74,6 +74,7 @@ import com.xat.aegis.analysis.CardVault
 import com.xat.aegis.analysis.NfcScanner
 import com.xat.aegis.analysis.PhoneHealthMonitor
 import com.xat.aegis.analysis.Report
+import com.xat.aegis.comms.CallPhase
 import com.xat.aegis.comms.CommsNotifications
 import com.xat.aegis.comms.CommsPushService
 import com.xat.aegis.comms.CommsRepository
@@ -964,6 +965,14 @@ private fun MainApp(
     val wifi by Registry.wifi.collectAsStateWithLifecycle()
     val phoneHealth by Registry.phoneHealth.collectAsStateWithLifecycle()
     val unreadTexts by CommsRepository.unread.collectAsStateWithLifecycle()
+    val missedCalls by CommsRepository.missedCalls.collectAsStateWithLifecycle()
+    val activeCall by CommsRepository.activeCall.collectAsStateWithLifecycle()
+
+    // A call ringing or in progress takes the COMMS tab regardless of where the
+    // user was: the full-screen intent lands there, and so does the in-app case.
+    LaunchedEffect(activeCall?.id, activeCall?.phase) {
+        if (activeCall != null && activeCall?.phase != CallPhase.ENDED) tab = TAB_COMMS
+    }
 
     // A tag delivered by a system NFC intent lands on the NFC tab; a message
     // notification lands on the COMMS tab.
@@ -993,7 +1002,7 @@ private fun MainApp(
         nfc.any { it.suspicious },
         wifi.isNotEmpty(),
         phoneHealth.level.ordinal >= Threat.HIGH.ordinal,
-        unreadTexts > 0
+        unreadTexts > 0 || missedCalls > 0
     )
 
     Column(Modifier.fillMaxSize()) {

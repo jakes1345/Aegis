@@ -65,6 +65,34 @@ object CommsNotifications {
         context.getSystemService(NotificationManager::class.java)?.notify(notificationId(peer), notification)
     }
 
+    /** A call to the number that no phone answered. */
+    fun notifyMissedCall(context: Context, call: CallRecord, tabIndex: Int) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) return
+        ensureChannel(context)
+        val open = Intent(context, MainActivity::class.java)
+            .setAction("com.xat.aegis.OPEN_CALLS")
+            .putExtra(EXTRA_TAB, tabIndex)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        val contentIntent = PendingIntent.getActivity(
+            context, call.id.hashCode(), open,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val notification = NotificationCompat.Builder(context, CHANNEL)
+            .setSmallIcon(android.R.drawable.sym_call_missed)
+            .setContentTitle("Missed call")
+            .setContentText(call.peer)
+            .setCategory(NotificationCompat.CATEGORY_MISSED_CALL)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(contentIntent)
+            .setWhen(call.ts)
+            .setShowWhen(true)
+            .build()
+        context.getSystemService(NotificationManager::class.java)?.notify(0x5B00_0000 or (call.id.hashCode() and 0x00FF_FFFF), notification)
+    }
+
     fun cancel(context: Context, peer: String) {
         context.getSystemService(NotificationManager::class.java)?.cancel(notificationId(peer))
     }

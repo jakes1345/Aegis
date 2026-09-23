@@ -29,6 +29,19 @@ class CommsConfig(context: Context) {
     /** The FCM token the relay last acknowledged, so a repeat is not re-sent. */
     val registeredPushToken: String? get() = prefs.getString(KEY_PUSH, null)
 
+    /** Relay clock up to which the call log has been applied. */
+    val callsCursor: Long get() = prefs.getLong(KEY_CALLS, 0L)
+
+    /** The FCM token last registered with Twilio Voice, and when. */
+    val voiceRegisteredToken: String? get() = prefs.getString(KEY_VOICE_TOKEN, null)
+    val voiceRegisteredAt: Long get() = prefs.getLong(KEY_VOICE_AT, 0L)
+
+    fun setCallsCursor(ts: Long) { prefs.edit().putLong(KEY_CALLS, ts).apply() }
+
+    fun setVoiceRegistered(token: String?, at: Long) {
+        prefs.edit().putString(KEY_VOICE_TOKEN, token).putLong(KEY_VOICE_AT, at).apply()
+    }
+
     val isPaired: Boolean get() = workerUrl != null && prefs.contains(KEY_TOKEN)
 
     /** The bearer token, decrypted on demand; null when unpaired or undecryptable. */
@@ -46,7 +59,10 @@ class CommsConfig(context: Context) {
             .putString(KEY_NUMBER, number)
             .putLong(KEY_SEQ, 0L)
             .putLong(KEY_UPDATED, 0L)
+            .putLong(KEY_CALLS, 0L)
             .remove(KEY_PUSH)
+            .remove(KEY_VOICE_TOKEN)
+            .remove(KEY_VOICE_AT)
             .apply()
     }
 
@@ -69,5 +85,8 @@ class CommsConfig(context: Context) {
         const val KEY_SEQ = "sync_seq"
         const val KEY_UPDATED = "sync_updated"
         const val KEY_PUSH = "push_token"
+        const val KEY_CALLS = "sync_calls"
+        const val KEY_VOICE_TOKEN = "voice_token"
+        const val KEY_VOICE_AT = "voice_at"
     }
 }

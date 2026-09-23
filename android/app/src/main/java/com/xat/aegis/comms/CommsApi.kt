@@ -82,6 +82,34 @@ class CommsApi(private val config: CommsConfig) {
         return parseMessage(json.getJSONObject("message"))
     }
 
+    data class VoiceToken(val token: String, val identity: String, val expiresAt: Long)
+
+    /** A one-hour Twilio Voice access token for this device. */
+    fun voiceToken(): VoiceToken {
+        val json = call(Request.Builder().url(url("/api/voice/token")).get())
+        return VoiceToken(json.getString("token"), json.getString("identity"), json.getLong("expiresAt"))
+    }
+
+    data class CallUpdates(val calls: List<CallRecord>, val now: Long)
+
+    fun callsSince(ts: Long): CallUpdates {
+        val json = call(Request.Builder().url(url("/api/calls?since=$ts")).get())
+        val arr = json.getJSONArray("calls")
+        val calls = (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            CallRecord(
+                id = o.getString("id"),
+                direction = if (o.getString("direction") == "out") Direction.OUT else Direction.IN,
+                peer = o.getString("peer"),
+                status = o.optString("status", "unknown"),
+                duration = o.optInt("duration", 0),
+                ts = o.getLong("ts"),
+                updated = o.optLong("updated", o.getLong("ts"))
+            )
+        }
+        return CallUpdates(calls, json.getLong("now"))
+    }
+
     fun refresh(id: String): SmsMessage? {
         val json = call(Request.Builder().url(url("/api/messages/$id/refresh")).post(JSONObject().toBody()))
         return json.optJSONObject("message")?.let { parseMessage(it) }
