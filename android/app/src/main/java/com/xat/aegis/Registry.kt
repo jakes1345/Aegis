@@ -104,6 +104,7 @@ object Registry {
     private val _phoneHealth = MutableStateFlow(PhoneHealth())
     val phoneHealth: StateFlow<PhoneHealth> = _phoneHealth.asStateFlow()
     fun publishPhoneHealth(h: PhoneHealth) { _phoneHealth.value = h }
+    fun updatePhoneHealth(block: (PhoneHealth) -> PhoneHealth) { _phoneHealth.update(block) }
 
     // --- Card vault ----------------------------------------------------------
 

@@ -1,46 +1,110 @@
 package com.xat.aegis.analysis
 
 import android.accessibilityservice.AccessibilityServiceInfo
-import android.app.AppOpsManager
 import android.app.admin.DevicePolicyManager
 import android.content.Context
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.media.AudioManager
+import android.media.AudioRecordingConfiguration
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
-import com.xat.aegis.PhoneHealth
+import com.xat.aegis.CameraInUse
 import com.xat.aegis.PhoneHealthFinding
+import com.xat.aegis.Registry
 import com.xat.aegis.Severity
 import java.util.concurrent.ConcurrentHashMap
 
+/**
+ * Device-level surveillance indicators: who is using the microphone or a camera
+ * right now, plus the static findings in [scan].
+ *
+ * Microphone and camera use are watched through the public APIs that report on
+ * *other* apps. The previous AppOpsManager.startWatchingActive route only reports
+ * the caller's own UID unless the app holds the system-only WATCH_APPOPS
+ * permission, so it never saw anything and the Device tab always read "clear".
+ *
+ * - Microphone: AudioManager's recording callback. A third-party app is told how
+ *   many recordings are active but not which package owns them, so a count is all
+ *   there is to show — no package name is guessed.
+ * - Camera: CameraManager's availability callback. A camera becomes unavailable
+ *   when some client opens it; Aegis never opens a camera, so any unavailable
+ *   camera is held by another app.
+ *
+ * Changes are pushed straight into [Registry] as they happen rather than waiting
+ * for the service's periodic scan.
+ */
 class PhoneHealthMonitor(private val context: Context) {
 
-    private val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-    private val micActive = ConcurrentHashMap<String, Unit>()
-    private val cameraActive = ConcurrentHashMap<String, Unit>()
+    private val audioManager = context.getSystemService(AudioManager::class.java)
+    private val cameraManager = context.getSystemService(CameraManager::class.java)
 
-    private val opListener = AppOpsManager.OnOpActiveChangedListener { op, _, packageName, active ->
-        when (op) {
-            AppOpsManager.OPSTR_RECORD_AUDIO ->
-                if (active) micActive[packageName] = Unit else micActive.remove(packageName)
-            AppOpsManager.OPSTR_CAMERA ->
-                if (active) cameraActive[packageName] = Unit else cameraActive.remove(packageName)
+    /** Camera id → facing, for every camera currently unavailable. */
+    private val camerasInUse = ConcurrentHashMap<String, String>()
+
+    private val recordingCallback = object : AudioManager.AudioRecordingCallback() {
+        override fun onRecordingConfigChanged(configs: MutableList<AudioRecordingConfiguration>?) {
+            publishRecordings(configs?.size ?: 0)
+        }
+    }
+
+    private val cameraCallback = object : CameraManager.AvailabilityCallback() {
+        override fun onCameraUnavailable(cameraId: String) {
+            camerasInUse[cameraId] = facingOf(cameraId)
+            publishCameras()
+        }
+
+        override fun onCameraAvailable(cameraId: String) {
+            camerasInUse.remove(cameraId)
+            publishCameras()
         }
     }
 
     fun start() {
         runCatching {
-            appOps.startWatchingActive(
-                arrayOf(AppOpsManager.OPSTR_RECORD_AUDIO, AppOpsManager.OPSTR_CAMERA),
-                context.mainExecutor,
-                opListener
-            )
+            audioManager?.registerAudioRecordingCallback(recordingCallback, null)
+            // The callback only fires on change; pick up anything already recording.
+            publishRecordings(audioManager?.activeRecordingConfigurations?.size ?: 0)
+        }
+        runCatching {
+            // Registration immediately reports the current state of every camera.
+            cameraManager?.registerAvailabilityCallback(context.mainExecutor, cameraCallback)
         }
     }
 
     fun stop() {
-        runCatching { appOps.stopWatchingActive(opListener) }
+        runCatching { audioManager?.unregisterAudioRecordingCallback(recordingCallback) }
+        runCatching { cameraManager?.unregisterAvailabilityCallback(cameraCallback) }
+        camerasInUse.clear()
+        Registry.updatePhoneHealth { it.copy(activeRecordings = 0, camerasInUse = emptyList()) }
     }
 
-    fun scan(): PhoneHealth {
+    private fun publishRecordings(count: Int) {
+        Registry.updatePhoneHealth { it.copy(activeRecordings = count) }
+    }
+
+    private fun publishCameras() {
+        val list = camerasInUse.entries
+            .map { (id, facing) -> CameraInUse(id, facing.ifEmpty { null }) }
+            .sortedWith(compareBy({ it.id.toIntOrNull() ?: Int.MAX_VALUE }, { it.id }))
+        Registry.updatePhoneHealth { it.copy(camerasInUse = list) }
+    }
+
+    /** "front" / "back" / "external", or "" when the camera does not report it. */
+    private fun facingOf(cameraId: String): String = runCatching {
+        when (cameraManager?.getCameraCharacteristics(cameraId)?.get(CameraCharacteristics.LENS_FACING)) {
+            CameraCharacteristics.LENS_FACING_FRONT -> "front"
+            CameraCharacteristics.LENS_FACING_BACK -> "back"
+            CameraCharacteristics.LENS_FACING_EXTERNAL -> "external"
+            else -> ""
+        }
+    }.getOrDefault("")
+
+    /**
+     * The static findings — accessibility services, device admins, debug settings.
+     * Microphone and camera state is published separately as it changes.
+     */
+    fun scan(): List<PhoneHealthFinding> {
         val findings = mutableListOf<PhoneHealthFinding>()
         val pm = context.packageManager
 
@@ -112,10 +176,6 @@ class PhoneHealthMonitor(private val context: Context) {
             }
         }
 
-        return PhoneHealth(
-            findings = findings,
-            activeMic = micActive.keys.toList(),
-            activeCamera = cameraActive.keys.toList()
-        )
+        return findings
     }
 }

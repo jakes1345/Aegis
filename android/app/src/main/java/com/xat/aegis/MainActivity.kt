@@ -1925,28 +1925,38 @@ private fun DeviceScreen() {
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
 
             // ── Active mic / camera — most urgent, always at top ──────────────
-            if (health.activeMic.isNotEmpty()) {
+            // Android tells a third-party app that a recording or a camera is in use,
+            // but not which app — so nothing here names one. The status-bar privacy
+            // indicator and Settings → Privacy dashboard show the app itself.
+            if (health.activeRecordings > 0) {
                 item(key = "mic_banner") {
                     ActiveSensorBanner(
                         label = "MICROPHONE ACTIVE",
-                        packages = health.activeMic,
                         color = Critical,
-                        detail = "An app is recording audio right now."
+                        detail = if (health.activeRecordings == 1) "An app is recording audio."
+                            else "Apps are recording audio (${health.activeRecordings} active recordings).",
+                        lines = listOf(
+                            "Android does not tell Aegis which app. Tap the green privacy dot in the " +
+                                "status bar, or open Settings → Security & privacy → Privacy dashboard."
+                        )
                     )
                 }
             }
-            if (health.activeCamera.isNotEmpty()) {
+            if (health.camerasInUse.isNotEmpty()) {
                 item(key = "cam_banner") {
                     ActiveSensorBanner(
                         label = "CAMERA ACTIVE",
-                        packages = health.activeCamera,
                         color = Critical,
-                        detail = "An app is using the camera right now."
+                        detail = if (health.camerasInUse.size == 1) "A camera is in use by another app."
+                            else "${health.camerasInUse.size} cameras are in use by another app.",
+                        lines = health.camerasInUse.map { cam ->
+                            "Camera ${cam.id}${cam.facing?.let { " ($it)" } ?: ""} in use by another app"
+                        }
                     )
                 }
             }
 
-            if (health.activeMic.isEmpty() && health.activeCamera.isEmpty()) {
+            if (health.activeRecordings == 0 && health.camerasInUse.isEmpty()) {
                 item(key = "sensors_ok") {
                     Row(
                         Modifier.fillMaxWidth().clip(CardShape).background(Panel)
@@ -1990,7 +2000,7 @@ private fun DeviceScreen() {
 }
 
 @Composable
-private fun ActiveSensorBanner(label: String, packages: List<String>, color: Color, detail: String) {
+private fun ActiveSensorBanner(label: String, color: Color, detail: String, lines: List<String>) {
     Row(
         Modifier.fillMaxWidth().clip(CardShape).background(color.copy(alpha = 0.15f))
             .border(1.dp, color.copy(alpha = 0.6f), CardShape).padding(12.dp),
@@ -2001,8 +2011,8 @@ private fun ActiveSensorBanner(label: String, packages: List<String>, color: Col
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(label, color = color, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
             Text(detail, color = Ink, fontSize = 13.sp)
-            packages.forEach { pkg ->
-                Text("  • $pkg", color = InkDim, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+            lines.forEach { line ->
+                Text("  • $line", color = InkDim, fontSize = 12.sp)
             }
         }
     }

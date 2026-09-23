@@ -222,13 +222,25 @@ data class PhoneHealthFinding(
     val detail: String
 )
 
+/** A camera another app currently holds open. */
+data class CameraInUse(
+    val id: String,
+    /** "front", "back", "external", or null when the camera does not say. */
+    val facing: String?
+)
+
 data class PhoneHealth(
     val findings: List<PhoneHealthFinding> = emptyList(),
-    val activeMic: List<String> = emptyList(),
-    val activeCamera: List<String> = emptyList()
+    /**
+     * Number of audio recordings active on the device. Android does not reveal which
+     * app owns a recording to a third-party app, so this is a count, not a list.
+     */
+    val activeRecordings: Int = 0,
+    /** Cameras currently open by another app — Aegis never opens the camera itself. */
+    val camerasInUse: List<CameraInUse> = emptyList()
 ) {
     val level: Threat get() = when {
-        activeMic.isNotEmpty() || activeCamera.isNotEmpty() -> Threat.CRITICAL
+        activeRecordings > 0 || camerasInUse.isNotEmpty() -> Threat.CRITICAL
         findings.any { it.severity == Severity.CRITICAL } -> Threat.CRITICAL
         findings.any { it.severity == Severity.HIGH } -> Threat.HIGH
         findings.any { it.severity == Severity.MEDIUM } -> Threat.MEDIUM
