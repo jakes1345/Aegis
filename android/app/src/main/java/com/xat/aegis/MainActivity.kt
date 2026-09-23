@@ -420,10 +420,13 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             when (val result = withContext(Dispatchers.IO) { op(cardVault) }) {
                 is CardVault.WriteResult.Saved -> {
-                    // Only refresh what is on screen if the vault is open there. A card
-                    // added while locked must not reveal the others just because the
-                    // key happened to still be inside its auth window.
-                    if (Registry.vault.value is VaultState.Unlocked) {
+                    // If the vault was already open, keep it open with the fresh list.
+                    // If the save went through explicit BiometricPrompt (attempt > 0),
+                    // the user just proved their identity — open the vault so they can
+                    // see the card they just saved. Do NOT open it when the auth window
+                    // was silently still warm (attempt == 0) and the vault was locked —
+                    // that would reveal all cards without the user asking to see them.
+                    if (Registry.vault.value is VaultState.Unlocked || attempt > 0) {
                         Registry.publishVault(VaultState.Unlocked(result.cards))
                     }
                     onSaved()
