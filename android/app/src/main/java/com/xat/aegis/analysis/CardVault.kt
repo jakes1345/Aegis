@@ -8,6 +8,8 @@ import android.security.keystore.UserNotAuthenticatedException
 import android.util.Base64
 import com.xat.aegis.CardProfile
 import com.xat.aegis.VaultCard
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.KeyStore
@@ -31,6 +33,10 @@ import javax.crypto.spec.GCMParameterSpec
  * happen on top of a successful read, so a failed decryption can never be followed
  * by a save that replaces the stored cards with a shorter list.
  *
+ * Every operation runs under one [Mutex]: a write is read → change → write, and two
+ * of them interleaved (two quick REMOVE taps) each read the same list and the second
+ * commit silently undid the first.
+ *
  * Migration: vaults written by earlier versions are encrypted under [KEY_ALIAS_V1],
  * a key that did not require authentication. The first successful unlock decrypts
  * that blob, re-encrypts it under [KEY_ALIAS_V2], commits it, and only then removes
@@ -49,6 +55,11 @@ class CardVault(private val context: Context) {
         data object KeyInvalidated : Failure
         /** The phone has no secure lock screen, so an auth-bound key cannot exist. */
         data object NoLockScreen : Failure
+        /**
+         * A card with the same UID is already stored and the caller did not ask to
+         * replace it. Nothing was written; [existing] is the card in the way.
+         */
+        data class Duplicate(val existing: VaultCard) : Failure
         /** The ciphertext or its contents are damaged, or the Keystore failed. */
         data class Error(val cause: Throwable) : Failure
     }
@@ -78,6 +89,9 @@ class CardVault(private val context: Context) {
         const val AUTH_VALIDITY_SECONDS = 30
     }
 
+    /** Serialises every read, write and erase. */
+    private val mutex = Mutex()
+
     /** True when there is stored vault data of either generation. */
     fun hasData(): Boolean = runCatching {
         val p = prefs()
@@ -90,7 +104,9 @@ class CardVault(private val context: Context) {
      * Decrypts the vault. Must be called within the auth window, i.e. just after a
      * successful BiometricPrompt. Migrates a v1 vault on the way.
      */
-    fun load(): LoadResult = try {
+    suspend fun load(): LoadResult = mutex.withLock { loadLocked() }
+
+    private fun loadLocked(): LoadResult = try {
         val p = prefs()
         val v2 = p.getString(PREFS_KEY_V2, null)
         val v1 = p.getString(PREFS_KEY_V1, null)
@@ -136,33 +152,50 @@ class CardVault(private val context: Context) {
 
     // ── Writes ──────────────────────────────────────────────────────────────
 
-    /** Adds [card], replacing any stored card with the same UID. */
-    fun add(card: VaultCard): WriteResult =
-        modify { cards -> cards.filter { it.uid != card.uid } + card }
+    /**
+     * Adds [card]. A stored card with the same UID is replaced only when [replace]
+     * is set; otherwise the write is refused with [Failure.Duplicate] so the caller
+     * can ask. A save used to overwrite silently, which the NFC tab could trigger
+     * without ever showing the card was already there.
+     */
+    suspend fun add(card: VaultCard, replace: Boolean = false): WriteResult =
+        modify { cards ->
+            val existing = cards.firstOrNull { it.uid == card.uid }
+            if (existing != null && !replace) return@modify WriteResult.Failed(Failure.Duplicate(existing))
+            WriteResult.Saved(cards.filter { it.uid != card.uid } + card)
+        }
 
-    fun remove(id: String): WriteResult =
-        modify { cards -> cards.filter { it.id != id } }
+    suspend fun remove(id: String): WriteResult =
+        modify { cards -> WriteResult.Saved(cards.filter { it.id != id }) }
 
     /**
      * Read, change, write — and only write if the read succeeded. The previous
      * version wrote `load() + card` where a failed load returned an empty list, so
      * one bad decryption replaced the whole vault with the single new card.
+     *
+     * [change] returns [WriteResult.Saved] carrying the list to commit, or a
+     * [WriteResult.Failed] to refuse the write with nothing touched.
      */
-    private fun modify(change: (List<VaultCard>) -> List<VaultCard>): WriteResult {
-        val current = when (val r = load()) {
-            is LoadResult.Loaded -> r.cards
-            is LoadResult.Failed -> return WriteResult.Failed(r.failure)
-        }
-        val next = change(current)
-        return try {
-            val sealed = encrypt(v2KeyOrCreate(), serialize(next))
-            val committed = prefs().edit()
-                .putString(PREFS_KEY_V2, encode(sealed))
-                .commit()
-            if (committed) WriteResult.Saved(next)
-            else WriteResult.Failed(Failure.Error(IllegalStateException("Could not write vault")))
-        } catch (e: Exception) {
-            WriteResult.Failed(classify(e))
+    private suspend fun modify(change: (List<VaultCard>) -> WriteResult): WriteResult {
+        mutex.withLock {
+            val current = when (val r = loadLocked()) {
+                is LoadResult.Loaded -> r.cards
+                is LoadResult.Failed -> return WriteResult.Failed(r.failure)
+            }
+            val next = when (val decision = change(current)) {
+                is WriteResult.Saved -> decision.cards
+                is WriteResult.Failed -> return decision
+            }
+            return try {
+                val sealed = encrypt(v2KeyOrCreate(), serialize(next))
+                val committed = prefs().edit()
+                    .putString(PREFS_KEY_V2, encode(sealed))
+                    .commit()
+                if (committed) WriteResult.Saved(next)
+                else WriteResult.Failed(Failure.Error(IllegalStateException("Could not write vault")))
+            } catch (e: Exception) {
+                WriteResult.Failed(classify(e))
+            }
         }
     }
 
@@ -170,13 +203,15 @@ class CardVault(private val context: Context) {
      * Permanently deletes the stored vault and both keys. Only for the user's explicit
      * choice once the vault is unreadable (key invalidated or data damaged).
      */
-    fun erase(): Boolean = runCatching {
-        prefs().edit().remove(PREFS_KEY_V1).remove(PREFS_KEY_V2).commit()
-        val ks = ks()
-        if (ks.containsAlias(KEY_ALIAS_V1)) ks.deleteEntry(KEY_ALIAS_V1)
-        if (ks.containsAlias(KEY_ALIAS_V2)) ks.deleteEntry(KEY_ALIAS_V2)
-        true
-    }.getOrDefault(false)
+    suspend fun erase(): Boolean = mutex.withLock {
+        runCatching {
+            prefs().edit().remove(PREFS_KEY_V1).remove(PREFS_KEY_V2).commit()
+            val ks = ks()
+            if (ks.containsAlias(KEY_ALIAS_V1)) ks.deleteEntry(KEY_ALIAS_V1)
+            if (ks.containsAlias(KEY_ALIAS_V2)) ks.deleteEntry(KEY_ALIAS_V2)
+            true
+        }.getOrDefault(false)
+    }
 
     // ── Keystore ────────────────────────────────────────────────────────────
 

@@ -3,17 +3,15 @@ package com.xat.aegis.analysis
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.admin.DevicePolicyManager
 import android.content.Context
-import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.media.AudioRecordingConfiguration
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
-import com.xat.aegis.CameraInUse
 import com.xat.aegis.PhoneHealthFinding
 import com.xat.aegis.Registry
 import com.xat.aegis.Severity
-import java.util.concurrent.ConcurrentHashMap
+import java.util.Collections
 
 /**
  * Device-level surveillance indicators: who is using the microphone or a camera
@@ -26,10 +24,13 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * - Microphone: AudioManager's recording callback. A third-party app is told how
  *   many recordings are active but not which package owns them, so a count is all
- *   there is to show — no package name is guessed.
+ *   there is to show — no package name is guessed. Recordings the system has
+ *   silenced are not counted: they receive no audio.
  * - Camera: CameraManager's availability callback. A camera becomes unavailable
  *   when some client opens it; Aegis never opens a camera, so any unavailable
- *   camera is held by another app.
+ *   camera is held by another app. Opening one physical camera also takes its
+ *   logical and multi-camera siblings out of service, so this is reported as a
+ *   single "camera in use", not a count of ids.
  *
  * Changes are pushed straight into [Registry] as they happen rather than waiting
  * for the service's periodic scan.
@@ -39,23 +40,23 @@ class PhoneHealthMonitor(private val context: Context) {
     private val audioManager = context.getSystemService(AudioManager::class.java)
     private val cameraManager = context.getSystemService(CameraManager::class.java)
 
-    /** Camera id → facing, for every camera currently unavailable. */
-    private val camerasInUse = ConcurrentHashMap<String, String>()
+    /** Ids of every camera currently unavailable. */
+    private val unavailableCameras: MutableSet<String> = Collections.synchronizedSet(HashSet())
 
     private val recordingCallback = object : AudioManager.AudioRecordingCallback() {
         override fun onRecordingConfigChanged(configs: MutableList<AudioRecordingConfiguration>?) {
-            publishRecordings(configs?.size ?: 0)
+            publishRecordings(configs)
         }
     }
 
     private val cameraCallback = object : CameraManager.AvailabilityCallback() {
         override fun onCameraUnavailable(cameraId: String) {
-            camerasInUse[cameraId] = facingOf(cameraId)
+            unavailableCameras.add(cameraId)
             publishCameras()
         }
 
         override fun onCameraAvailable(cameraId: String) {
-            camerasInUse.remove(cameraId)
+            unavailableCameras.remove(cameraId)
             publishCameras()
         }
     }
@@ -64,7 +65,7 @@ class PhoneHealthMonitor(private val context: Context) {
         runCatching {
             audioManager?.registerAudioRecordingCallback(recordingCallback, null)
             // The callback only fires on change; pick up anything already recording.
-            publishRecordings(audioManager?.activeRecordingConfigurations?.size ?: 0)
+            publishRecordings(audioManager?.activeRecordingConfigurations)
         }
         runCatching {
             // Registration immediately reports the current state of every camera.
@@ -75,34 +76,29 @@ class PhoneHealthMonitor(private val context: Context) {
     fun stop() {
         runCatching { audioManager?.unregisterAudioRecordingCallback(recordingCallback) }
         runCatching { cameraManager?.unregisterAvailabilityCallback(cameraCallback) }
-        camerasInUse.clear()
-        Registry.updatePhoneHealth { it.copy(activeRecordings = 0, camerasInUse = emptyList()) }
+        unavailableCameras.clear()
+        Registry.updatePhoneHealth { it.copy(activeRecordings = 0, cameraInUse = false) }
     }
 
-    private fun publishRecordings(count: Int) {
-        Registry.updatePhoneHealth { it.copy(activeRecordings = count) }
+    private fun publishRecordings(configs: List<AudioRecordingConfiguration>?) {
+        // A silenced client is one Android has muted — a background app, or one that
+        // lost the microphone to a higher-priority recorder. It hears nothing, so it
+        // is not "an app recording audio".
+        val live = configs?.count { !it.isClientSilenced } ?: 0
+        Registry.updatePhoneHealth { it.copy(activeRecordings = live) }
     }
 
     private fun publishCameras() {
-        val list = camerasInUse.entries
-            .map { (id, facing) -> CameraInUse(id, facing.ifEmpty { null }) }
-            .sortedWith(compareBy({ it.id.toIntOrNull() ?: Int.MAX_VALUE }, { it.id }))
-        Registry.updatePhoneHealth { it.copy(camerasInUse = list) }
+        val inUse = unavailableCameras.isNotEmpty()
+        Registry.updatePhoneHealth { it.copy(cameraInUse = inUse) }
     }
-
-    /** "front" / "back" / "external", or "" when the camera does not report it. */
-    private fun facingOf(cameraId: String): String = runCatching {
-        when (cameraManager?.getCameraCharacteristics(cameraId)?.get(CameraCharacteristics.LENS_FACING)) {
-            CameraCharacteristics.LENS_FACING_FRONT -> "front"
-            CameraCharacteristics.LENS_FACING_BACK -> "back"
-            CameraCharacteristics.LENS_FACING_EXTERNAL -> "external"
-            else -> ""
-        }
-    }.getOrDefault("")
 
     /**
      * The static findings — accessibility services, device admins, debug settings.
      * Microphone and camera state is published separately as it changes.
+     *
+     * Cheap and service-free, so the Activity runs it too: the Device tab must not
+     * say "no issues" merely because the scanner is off and nothing has looked.
      */
     fun scan(): List<PhoneHealthFinding> {
         val findings = mutableListOf<PhoneHealthFinding>()
@@ -117,10 +113,14 @@ class PhoneHealthMonitor(private val context: Context) {
             val am = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
             am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
                 .forEach { svc ->
-                    val pkg = svc.resolveInfo.serviceInfo.packageName
+                    val info = svc.resolveInfo.serviceInfo
+                    val pkg = info.packageName
                     if (pkg == context.packageName) return@forEach
+                    // The id carries the service class: one app can register several
+                    // services, and the Device tab keys its list on the id, so two
+                    // findings sharing "a11y_<pkg>" crashed it.
                     findings += PhoneHealthFinding(
-                        id = "a11y_$pkg",
+                        id = "a11y_$pkg/${info.name}",
                         severity = Severity.HIGH,
                         category = "Accessibility",
                         title = "${label(pkg)} — accessibility service active",
@@ -137,7 +137,7 @@ class PhoneHealthMonitor(private val context: Context) {
             dpm.activeAdmins?.forEach { admin ->
                 if (admin.packageName == context.packageName) return@forEach
                 findings += PhoneHealthFinding(
-                    id = "admin_${admin.packageName}",
+                    id = "admin_${admin.packageName}/${admin.className}",
                     severity = Severity.HIGH,
                     category = "Device Admin",
                     title = "${label(admin.packageName)} — device admin",
@@ -176,6 +176,17 @@ class PhoneHealthMonitor(private val context: Context) {
             }
         }
 
-        return findings
+        // Guaranteed unique for the same reason IMSICatcher does it: a duplicate id
+        // takes the Device tab down.
+        return findings.distinctBy { it.id }
+    }
+
+    /** Runs [scan] and publishes the result together with when it was taken. */
+    fun scanAndPublish() {
+        val findings = scan()
+        val now = System.currentTimeMillis()
+        // Only the findings: mic and camera state is pushed by the callbacks and
+        // must not be overwritten here.
+        Registry.updatePhoneHealth { it.copy(findings = findings, findingsScannedTs = now) }
     }
 }

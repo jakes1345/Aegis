@@ -32,6 +32,13 @@ class IMSICatcher(private val store: Store) {
     private val recent = ArrayDeque<HistEntry>()
     private val ephemeral = LinkedHashMap<String, Ephemeral>()
 
+    /**
+     * Radio technology ranks seen over the last [RAT_WINDOW_MS] without moving.
+     * Emptied whenever the user is found to be travelling: LTE on the motorway says
+     * nothing about the 3G in the car park you have just driven into.
+     */
+    private val ratRanks = ArrayDeque<Pair<Long, Int>>()
+
     private var prev: ServingCell? = null
     private var prevFix: Fix? = null
 
@@ -54,7 +61,17 @@ class IMSICatcher(private val store: Store) {
         updateEphemeral(cell, now)
         recent.addLast(HistEntry(cell, now))
 
-        val findings = runChecks(cell, fix, now)
+        // Several heuristics only mean anything while you are standing still: crossing
+        // cells, swapping radio technology and signal jumps are all what travelling
+        // normally looks like. Speed is authoritative when the fix reports it;
+        // otherwise fall back to how far the last two fixes are apart.
+        val stationary = isStationary(fix)
+        if (!stationary) ratRanks.clear()
+
+        val findings = runChecks(cell, fix, now, stationary)
+        // Recorded after the checks so the downgrade test compares against what was
+        // seen before this reading, not the reading itself.
+        ratRanks.addLast(now to cell.rat.rank)
         updateBaseline(cell, now)
 
         prev = cell
@@ -62,9 +79,21 @@ class IMSICatcher(private val store: Store) {
         return findings
     }
 
+    private fun isStationary(fix: Fix?): Boolean {
+        val speed = fix?.speed
+        val previousFix = prevFix
+        return when {
+            speed != null -> speed < MOVING_SPEED_MS
+            previousFix != null && fix != null -> haversine(previousFix, fix) < 200.0
+            else -> true
+        }
+    }
+
     private fun pruneRecent(now: Long) {
         val cutoff = now - 5 * 60_000L
         while (recent.isNotEmpty() && recent.first().ts < cutoff) recent.removeFirst()
+        val ratCutoff = now - RAT_WINDOW_MS
+        while (ratRanks.isNotEmpty() && ratRanks.first().first < ratCutoff) ratRanks.removeFirst()
     }
 
     private fun updateEphemeral(current: ServingCell, now: Long) {
@@ -86,7 +115,7 @@ class IMSICatcher(private val store: Store) {
         }
     }
 
-    private fun runChecks(cell: ServingCell, fix: Fix?, now: Long): List<CatcherFinding> {
+    private fun runChecks(cell: ServingCell, fix: Fix?, now: Long, stationary: Boolean): List<CatcherFinding> {
         val findings = mutableListOf<CatcherFinding>()
         val data = store.json
         val tacs = data.optJSONObject("tacs") ?: JSONObject()
@@ -99,28 +128,24 @@ class IMSICatcher(private val store: Store) {
         // five minutes; it is ignored rather than trusted, and areas re-learn.
         val tacVisits = tacRec?.optInt("visits", 0) ?: 0
 
-        // Several heuristics only mean anything while you are standing still: crossing
-        // cells, swapping radio technology and signal jumps are all what travelling
-        // normally looks like. Speed is authoritative when the fix reports it;
-        // otherwise fall back to how far the last two fixes are apart.
-        val speed = fix?.speed
-        val previousFix = prevFix
-        val stationary = when {
-            speed != null -> speed < MOVING_SPEED_MS
-            previousFix != null && fix != null -> haversine(previousFix, fix) < 200.0
-            else -> true
-        }
-
-        // 1 — RAT downgrade, to 2G/3G in an area known to have LTE or better. That is
-        // what the explainer describes and what interception equipment forces. A 5G
-        // to LTE fallback is routine — NR coverage is patchy indoors and at the edge
-        // of every cell — and used to raise this on its own.
-        val maxRatRank = tacRec?.optInt("maxRatRank", 0) ?: 0
-        if (tacVisits >= 5 && cell.rat.rank in 1..Rat.UMTS.rank && maxRatRank >= Rat.LTE.rank) {
+        // 1 — RAT downgrade: 2G/3G now, LTE or better within the last half hour, and
+        // no movement in between. That is what interception equipment forces. A 5G to
+        // LTE fallback is routine — NR coverage is patchy indoors and at the edge of
+        // every cell — and used to raise this on its own.
+        //
+        // Judged from the in-memory history, not the area record: the stored record
+        // is keyed on the LTE tracking area code, but on 2G/3G the modem reports the
+        // location area code in that field — a different number — so a 3G cell's
+        // record never held any LTE history and this could not fire.
+        val recentMaxRank = ratRanks.maxOfOrNull { it.second } ?: 0
+        if (stationary && cell.rat.rank in 1..Rat.UMTS.rank && recentMaxRank >= Rat.LTE.rank) {
+            val was = Rat.entries.firstOrNull { it.rank == recentMaxRank }?.label ?: "rank-$recentMaxRank"
             findings += CatcherFinding(
                 id = "rat_downgrade", severity = Severity.HIGH,
                 title = "Radio downgrade detected",
-                detail = "Currently ${cell.rat.label} but this area previously used rank-$maxRatRank technology. Forced downgrade is the primary method used to intercept modern devices."
+                detail = "Currently ${cell.rat.label}, but $was was serving you here within the last " +
+                    "${RAT_WINDOW_MS / 60_000L} minutes and you have not moved. Forced downgrade is the " +
+                    "primary method used to intercept modern devices."
             )
         }
 
@@ -299,13 +324,18 @@ class IMSICatcher(private val store: Store) {
         cellRec.put("rat", cell.rat.name)
 
         val tacRec = tacs.optJSONObject(tKey) ?: JSONObject().also { tacs.put(tKey, it) }
-        // A visit is a first sighting, or a return after more than VISIT_GAP_MS away.
-        // Polls in between only move lastSeenTs forward, so a long stay is one visit.
+        // A visit is a first sighting, or a return after more than VISIT_GAP_MS away
+        // — and "away" means seen in some *other* area in between. Polls only move
+        // lastSeenTs forward, so a long stay is one visit; and a gap with no other
+        // area seen is the scanner having been off, not a trip, so stopping and
+        // restarting at home no longer counts as coming home again.
         val lastSeenTs = tacRec.optLong("lastSeenTs", 0L)
-        if (lastSeenTs == 0L || now - lastSeenTs > VISIT_GAP_MS) {
+        val previousTac = data.optString(LAST_TAC_KEY, "")
+        if (lastSeenTs == 0L || (previousTac != tKey && now - lastSeenTs > VISIT_GAP_MS)) {
             tacRec.put("visits", tacRec.optInt("visits", 0) + 1)
         }
         tacRec.put("lastSeenTs", now)
+        data.put(LAST_TAC_KEY, tKey)
         // Written by earlier versions as a per-poll count; meaningless as a visit count.
         tacRec.remove("maturity")
         if (cell.rat.rank > tacRec.optInt("maxRatRank", 0)) tacRec.put("maxRatRank", cell.rat.rank)
@@ -356,6 +386,7 @@ class IMSICatcher(private val store: Store) {
     fun resetBaseline() {
         recent.clear()
         ephemeral.clear()
+        ratRanks.clear()
         prev = null
         prevFix = null
         store.replace(
@@ -369,18 +400,30 @@ class IMSICatcher(private val store: Store) {
     private companion object {
         /** Time away from an area after which being back there counts as a new visit. */
         const val VISIT_GAP_MS = 30 * 60_000L
+        /** How long a better radio technology counts as "available here" while still. */
+        const val RAT_WINDOW_MS = 30 * 60_000L
+        /** Store key for the last tracking area observed, so "away" survives restarts. */
+        const val LAST_TAC_KEY = "lastTac"
+        /** Visits across all areas at which the baseline bar reads full. */
+        const val MATURE_VISITS = 10
     }
 
+    /**
+     * (known cells, visits across all areas, maturity 0..1). Maturity used to be
+     * derived from per-cell poll counts — 50 polls, about twelve minutes — which
+     * read "Mature" long before any visit-gated heuristic could fire. It is now
+     * visits, the unit those heuristics are gated on.
+     */
+    @Synchronized
     fun stats(): Triple<Int, Int, Float> {
         val data = store.json
-        val cellsObj = data.optJSONObject("cells")
-        val uniqueCells = cellsObj?.length() ?: 0
-        var totalObs = 0
-        if (cellsObj != null) {
-            val keys = cellsObj.keys()
-            while (keys.hasNext()) totalObs += cellsObj.optJSONObject(keys.next())?.optInt("count", 0) ?: 0
+        val uniqueCells = data.optJSONObject("cells")?.length() ?: 0
+        var totalVisits = 0
+        data.optJSONObject("tacs")?.let { tacs ->
+            val keys = tacs.keys()
+            while (keys.hasNext()) totalVisits += tacs.optJSONObject(keys.next())?.optInt("visits", 0) ?: 0
         }
-        val maturity = (totalObs.coerceIn(0, 50) / 50f)
-        return Triple(uniqueCells, totalObs, maturity)
+        val maturity = (totalVisits.coerceIn(0, MATURE_VISITS) / MATURE_VISITS.toFloat())
+        return Triple(uniqueCells, totalVisits, maturity)
     }
 }

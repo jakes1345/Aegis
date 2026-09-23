@@ -4,6 +4,7 @@ import android.content.Context
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
 
@@ -125,6 +126,32 @@ object Registry {
     private val _emulating = MutableStateFlow<ArmedCard?>(null)
     val emulating: StateFlow<ArmedCard?> = _emulating.asStateFlow()
     fun setEmulating(card: ArmedCard?) { _emulating.value = card }
+
+    /**
+     * The result of the last BiometricPrompt, waiting to be acted on. The prompt's
+     * callback publishes here instead of calling back into the Activity that showed
+     * it: if that Activity has been recreated meanwhile, the new instance picks the
+     * result up and finishes the operation the purpose describes.
+     */
+    private val _vaultAuth = MutableStateFlow<VaultAuthResult?>(null)
+    val vaultAuth: StateFlow<VaultAuthResult?> = _vaultAuth.asStateFlow()
+    fun publishVaultAuth(result: VaultAuthResult) { _vaultAuth.value = result }
+    /** Takes the pending result, so it runs exactly once. */
+    fun takeVaultAuth(): VaultAuthResult? = _vaultAuth.getAndUpdate { null }
+
+    /** A save the vault refused because the UID is already stored; the UI asks. */
+    private val _replacePrompt = MutableStateFlow<ReplacePrompt?>(null)
+    val replacePrompt: StateFlow<ReplacePrompt?> = _replacePrompt.asStateFlow()
+    fun setReplacePrompt(prompt: ReplacePrompt?) { _replacePrompt.value = prompt }
+
+    /**
+     * A tab the UI should switch to — set when a tag arrives through a system NFC
+     * intent, which the user expects to land on the NFC tab. Consumed by the UI.
+     */
+    private val _tabRequest = MutableStateFlow<Int?>(null)
+    val tabRequest: StateFlow<Int?> = _tabRequest.asStateFlow()
+    fun requestTab(index: Int) { _tabRequest.value = index }
+    fun takeTabRequest(): Int? = _tabRequest.getAndUpdate { null }
 
     fun reset() {
         _detections.value = emptyList()

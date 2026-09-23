@@ -18,6 +18,9 @@ object Report {
 
     private val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
+    /** How long an exported report stays in the cache for a share target to read. */
+    private const val EXPORT_RETENTION_MS = 24 * 60 * 60_000L
+
     fun share(
         context: Context,
         status: ScanStatus,
@@ -28,11 +31,14 @@ object Report {
     ): Intent {
         val text = buildReport(status, detections, timeline, cell, nfc)
         // Each report carries the GPS history, so earlier ones are not left lying in
-        // the cache. The share target has already been handed its copy by the time
-        // the user exports again.
+        // the cache indefinitely. They are kept for a day, not deleted at once: a
+        // mail client reads the attachment when it actually sends, which offline can
+        // be well after the share, and deleting the file underneath it lost the report.
+        val now = System.currentTimeMillis()
         context.cacheDir.listFiles { f -> f.isFile && f.name.startsWith("aegis_") && f.name.endsWith(".txt") }
+            ?.filter { now - it.lastModified() > EXPORT_RETENTION_MS }
             ?.forEach { it.delete() }
-        val file = File(context.cacheDir, "aegis_${System.currentTimeMillis()}.txt")
+        val file = File(context.cacheDir, "aegis_${now}.txt")
         file.writeText(text)
         val uri: Uri = FileProvider.getUriForFile(
             context, "${context.packageName}.fileprovider", file
