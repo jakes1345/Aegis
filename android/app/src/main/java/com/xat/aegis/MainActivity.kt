@@ -710,7 +710,7 @@ private fun ScanScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("TRACK DETECT", color = Ink, fontSize = 22.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                Text("AEGIS", color = Ink, fontSize = 22.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     TextButton(onClick = {
                         val i = Report.share(context, status, detections, timeline, cell, nfc)
@@ -1141,7 +1141,7 @@ private fun MapScreen() {
             context,
             context.getSharedPreferences("osmdroid", android.content.Context.MODE_PRIVATE)
         )
-        OsmConfig.getInstance().userAgentValue = "TrackDetect/${BuildConfig.VERSION_NAME}"
+        OsmConfig.getInstance().userAgentValue = "Aegis/${BuildConfig.VERSION_NAME}"
         MapView(context).apply {
             setTileSource(TileSourceFactory.MAPNIK)
             setMultiTouchControls(true)

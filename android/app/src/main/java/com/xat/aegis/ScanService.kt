@@ -593,7 +593,7 @@ class ScanService : LifecycleService() {
 
     private fun buildOngoing(watching: Int, following: Int): Notification =
         NotificationCompat.Builder(this, CHANNEL_ONGOING)
-            .setContentTitle("Track Detect").setContentText(ongoingText(watching, following))
+            .setContentTitle("Aegis").setContentText(ongoingText(watching, following))
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setOngoing(true).setContentIntent(contentIntent())
             .setCategory(NotificationCompat.CATEGORY_SERVICE).build()

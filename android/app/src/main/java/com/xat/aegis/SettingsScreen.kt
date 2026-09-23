@@ -571,7 +571,7 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                 Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                SSettingsKv("App", "Track Detect")
+                SSettingsKv("App", "Aegis")
                 SSettingsKv(
                     "Version",
                     "${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})"
@@ -585,7 +585,7 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                     color = SInkClr, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    "Track Detect is a counter-surveillance research tool intended for lawful personal " +
+                    "Aegis is a counter-surveillance research tool intended for lawful personal " +
                     "and professional security use. Detection of a device is not conclusive evidence of " +
                     "surveillance. Always verify findings through multiple methods before acting. " +
                     "Users are responsible for complying with all applicable laws regarding electronic " +

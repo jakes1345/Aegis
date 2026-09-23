@@ -40,7 +40,7 @@ object Report {
         return Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_STREAM, uri)
-            putExtra(Intent.EXTRA_SUBJECT, "Track Detect Evidence Report")
+            putExtra(Intent.EXTRA_SUBJECT, "Aegis Evidence Report")
             putExtra(Intent.EXTRA_TEXT, text.take(2000))
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
@@ -53,7 +53,7 @@ object Report {
         cell: CellStatus,
         nfc: List<NfcTag>
     ) = buildString {
-        appendLine("=== TRACK DETECT EVIDENCE REPORT ===")
+        appendLine("=== AEGIS EVIDENCE REPORT ===")
         appendLine("Generated: ${sdf.format(Date())}")
         appendLine()
 
