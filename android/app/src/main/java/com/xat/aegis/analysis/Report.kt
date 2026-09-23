@@ -27,6 +27,11 @@ object Report {
         nfc: List<NfcTag>
     ): Intent {
         val text = buildReport(status, detections, timeline, cell, nfc)
+        // Each report carries the GPS history, so earlier ones are not left lying in
+        // the cache. The share target has already been handed its copy by the time
+        // the user exports again.
+        context.cacheDir.listFiles { f -> f.isFile && f.name.startsWith("aegis_") && f.name.endsWith(".txt") }
+            ?.forEach { it.delete() }
         val file = File(context.cacheDir, "aegis_${System.currentTimeMillis()}.txt")
         file.writeText(text)
         val uri: Uri = FileProvider.getUriForFile(
