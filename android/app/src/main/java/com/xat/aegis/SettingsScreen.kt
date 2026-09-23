@@ -158,25 +158,67 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
     // grant happens outside the app.
     fun has(permission: String) =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+    // The persisted choice. It is only ever written true once the background
+    // permission is actually held: writing it first and hoping for the grant left
+    // the switch showing off with true stored underneath, so a tap could only re-send
+    // true, and a grant made later for some other reason switched boot-resume on
+    // unasked.
     var resumeWanted by remember { mutableStateOf(AppSettings.resumeAfterReboot) }
     var backgroundGranted by remember { mutableStateOf(has(Manifest.permission.ACCESS_BACKGROUND_LOCATION)) }
+    // The user has turned the switch on and the grant is still outstanding.
+    var awaitingBackground by remember { mutableStateOf(false) }
     var showBackgroundDialog by remember { mutableStateOf(false) }
+
+    fun persistResume(value: Boolean) {
+        resumeWanted = value
+        AppSettings.setResumeAfterReboot(context, value)
+    }
+
+    /** Called with the outcome of any step of the permission flow. */
+    fun backgroundOutcome(granted: Boolean) {
+        backgroundGranted = granted
+        if (!awaitingBackground) return
+        if (granted) {
+            awaitingBackground = false
+            persistResume(true)
+        } else {
+            // The flow ended without the grant: nothing is stored as wanted. The
+            // shortcut to the settings page stays offered while this screen is up.
+            persistResume(false)
+        }
+    }
+
+    // Heal a value stored true by an earlier version without the permission behind it.
+    LaunchedEffect(Unit) {
+        if (resumeWanted && !has(Manifest.permission.ACCESS_BACKGROUND_LOCATION)) persistResume(false)
+    }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
-        backgroundGranted = has(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        // The grant happens on Android's settings page, outside the app, so it is
+        // re-read on every return.
+        val granted = has(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        if (awaitingBackground) {
+            if (granted) backgroundOutcome(true) else backgroundGranted = false
+        } else {
+            backgroundGranted = granted
+        }
     }
     val backgroundLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted -> backgroundGranted = granted }
+    ) { granted -> backgroundOutcome(granted) }
     val foregroundLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
         // Background location can only be asked for once foreground location is held.
-        if (granted) backgroundLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        if (grants[Manifest.permission.ACCESS_FINE_LOCATION] == true) {
+            backgroundLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        } else {
+            backgroundOutcome(false)
+        }
     }
 
     if (showBackgroundDialog) {
         AlertDialog(
-            onDismissRequest = { showBackgroundDialog = false },
+            onDismissRequest = { showBackgroundDialog = false; backgroundOutcome(false) },
             containerColor = SPanelClr,
             title = {
                 Text("Allow location all the time", color = SInkClr, fontWeight = FontWeight.Bold)
@@ -195,14 +237,21 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                     if (has(Manifest.permission.ACCESS_FINE_LOCATION)) {
                         backgroundLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
                     } else {
-                        foregroundLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+                        // Android 12+ ignores a request for fine location that does
+                        // not also name coarse; both have to be in the same request.
+                        foregroundLauncher.launch(
+                            arrayOf(
+                                Manifest.permission.ACCESS_FINE_LOCATION,
+                                Manifest.permission.ACCESS_COARSE_LOCATION
+                            )
+                        )
                     }
                 }) {
                     Text("CONTINUE", color = SAccentClr, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showBackgroundDialog = false }) {
+                TextButton(onClick = { showBackgroundDialog = false; backgroundOutcome(false) }) {
                     Text("CANCEL", color = SMutedClr, letterSpacing = 1.sp)
                 }
             }
@@ -341,9 +390,15 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                     Switch(
                         checked = active,
                         onCheckedChange = { v ->
-                            resumeWanted = v
-                            AppSettings.setResumeAfterReboot(context, v)
-                            if (v && !backgroundGranted) showBackgroundDialog = true
+                            if (!v) {
+                                awaitingBackground = false
+                                persistResume(false)
+                            } else if (backgroundGranted) {
+                                persistResume(true)
+                            } else {
+                                awaitingBackground = true
+                                showBackgroundDialog = true
+                            }
                         },
                         colors = SwitchDefaults.colors(
                             checkedThumbColor = SAccentClr,
@@ -358,9 +413,10 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                         "Aegis, where you pick \"Allow all the time\".",
                         color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
                     )
-                    if (resumeWanted) {
+                    if (awaitingBackground) {
                         // After a refusal Android stops opening the page on request, so
-                        // offer the app's own settings page as the way there.
+                        // offer the app's own settings page as the way there. The
+                        // grant is picked up on return and only then stored as wanted.
                         TextButton(
                             onClick = {
                                 context.startActivity(
