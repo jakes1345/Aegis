@@ -74,6 +74,8 @@ import com.xat.aegis.analysis.CardVault
 import com.xat.aegis.analysis.NfcScanner
 import com.xat.aegis.analysis.PhoneHealthMonitor
 import com.xat.aegis.analysis.Report
+import com.xat.aegis.comms.CallManager
+import com.xat.aegis.comms.CallPhase
 import com.xat.aegis.comms.CommsNotifications
 import com.xat.aegis.comms.CommsRepository
 import android.nfc.cardemulation.CardEmulation
@@ -173,6 +175,14 @@ class MainActivity : AppCompatActivity() {
 
     /** Whether reader mode is currently enabled on the adapter by this activity. */
     private var readerModeOn = false
+
+    /**
+     * Answering from the notification lands here; the microphone is asked for
+     * if the call would be the first time. Declined means the call is declined.
+     */
+    private val microphoneForAccept = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) CallManager.accept() else CallManager.reject()
+    }
 
     /**
      * True between onResume and onPause. The lifecycle's own state cannot be used
@@ -319,9 +329,15 @@ class MainActivity : AppCompatActivity() {
         val peer = intent.getStringExtra(CommsNotifications.EXTRA_PEER)
         intent.removeExtra(CommsNotifications.EXTRA_TAB)
         intent.removeExtra(CommsNotifications.EXTRA_PEER)
+        val acceptCall = intent.getBooleanExtra(CommsNotifications.EXTRA_ACCEPT_CALL, false)
+        intent.removeExtra(CommsNotifications.EXTRA_ACCEPT_CALL)
         if (tab < 0) return
         Registry.requestTab(tab)
         if (peer != null) Registry.requestThread(peer)
+        if (acceptCall) {
+            if (granted(Manifest.permission.RECORD_AUDIO)) CallManager.accept()
+            else microphoneForAccept.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
 
     /**
@@ -963,6 +979,13 @@ private fun MainApp(
     val wifi by Registry.wifi.collectAsStateWithLifecycle()
     val phoneHealth by Registry.phoneHealth.collectAsStateWithLifecycle()
     val unreadMessages by CommsRepository.unread.collectAsStateWithLifecycle()
+    val activeCall by CallManager.call.collectAsStateWithLifecycle()
+
+    // A call ringing or in progress takes the COMMS tab regardless of where the
+    // user was: the notification lands there, and so does the in-app case.
+    LaunchedEffect(activeCall?.id, activeCall?.phase) {
+        if (activeCall != null && activeCall?.phase != CallPhase.ENDED) tab = TAB_COMMS
+    }
 
     // A tag delivered by a system NFC intent lands on the NFC tab; a message
     // notification lands on the COMMS tab.

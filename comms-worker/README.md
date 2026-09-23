@@ -42,6 +42,23 @@ The app generates its identity on the phone, registers it, and shows the Aegis
 number it was given. Two people pair by scanning each other's QR code in
 person, or by typing a listed Aegis number and then comparing safety numbers.
 
+### Calls (optional TURN)
+
+Calls are WebRTC audio between the two phones, keyed by DTLS fingerprints that
+travel inside the encrypted envelopes, so the relay never sees or handles the
+media keys. Without TURN, calls use STUN only and connect when both phones can
+reach each other directly (most home and mobile networks, not all). For calls
+across strict NATs, create a TURN key in the Cloudflare dashboard under
+Realtime → TURN and give it to the Worker:
+
+```sh
+npx wrangler secret put TURN_KEY_ID
+npx wrangler secret put TURN_KEY_API_TOKEN
+```
+
+The Worker then mints short-lived TURN credentials for `GET /v1/turn`. A TURN
+server forwards encrypted packets it cannot decrypt.
+
 ## API
 
 Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
@@ -61,6 +78,7 @@ Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
 | GET | `/v1/inbox` | Waiting envelopes |
 | POST | `/v1/ack` | Delete envelopes the app has stored |
 | GET | `/v1/ws` | Live delivery over a hibernatable WebSocket |
+| GET | `/v1/turn` | ICE servers for a call: STUN, plus short-lived TURN credentials when a TURN key is configured |
 
 Each Aegis number is a Durable Object holding the keys, the queue (up to 2000
 envelopes of 64 KiB, kept 30 days) and the live sockets.

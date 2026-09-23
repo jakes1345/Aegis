@@ -11,6 +11,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.Person
 import androidx.core.content.ContextCompat
 import com.xat.aegis.MainActivity
 
@@ -26,13 +27,18 @@ object CommsNotifications {
 
     const val CHANNEL_MESSAGES = "messages"
     const val CHANNEL_LINK = "comms_link"
+    const val CHANNEL_CALLS = "calls"
 
     /** Intent extras naming the tab and conversation MainActivity should open. */
     const val EXTRA_TAB = "com.xat.aegis.TAB"
     const val EXTRA_PEER = "com.xat.aegis.PEER"
+    /** Set when the notification's Answer button was tapped: accept the ringing call. */
+    const val EXTRA_ACCEPT_CALL = "com.xat.aegis.ACCEPT_CALL"
 
     /** Notification id of the connection service's foreground notification. */
     const val LINK_NOTIFICATION_ID = 0x5C00_0001
+    const val INCOMING_CALL_NOTIFICATION_ID = 0x5C00_0002
+    const val CALL_NOTIFICATION_ID = 0x5C00_0003
 
     fun ensureChannels(context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
@@ -47,6 +53,118 @@ object CommsNotifications {
                     setShowBadge(false)
                 }
         )
+        manager.createNotificationChannel(
+            NotificationChannel(CHANNEL_CALLS, "Calls", NotificationManager.IMPORTANCE_HIGH)
+                .apply {
+                    description = "Incoming and ongoing encrypted calls"
+                    // The app rings with the phone's own ringtone; the channel stays quiet.
+                    setSound(null, null)
+                    enableVibration(false)
+                }
+        )
+    }
+
+    // ── Calls ────────────────────────────────────────────────────────────
+
+    private fun person(contact: Contact) = Person.Builder()
+        .setName(contact.name.ifBlank { formatAegisNumber(contact.number) })
+        .setImportant(true)
+        .build()
+
+    private fun openCallScreen(context: Context, accept: Boolean, requestCode: Int): PendingIntent {
+        val open = Intent(context, MainActivity::class.java)
+            .setAction(if (accept) "com.xat.aegis.ACCEPT_CALL" else "com.xat.aegis.OPEN_CALL")
+            .putExtra(EXTRA_TAB, COMMS_TAB_INDEX)
+            .putExtra(EXTRA_ACCEPT_CALL, accept)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        return PendingIntent.getActivity(context, requestCode, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    }
+
+    /** Rings for an incoming call: a call-style card with Decline and Answer, full screen when allowed. */
+    fun incomingCall(context: Context, call: ActiveCall) {
+        if (!canPost(context)) return
+        ensureChannels(context)
+        val decline = PendingIntent.getBroadcast(
+            context, INCOMING_CALL_NOTIFICATION_ID + 1,
+            Intent(context, CallActionReceiver::class.java).setAction(CallActionReceiver.ACTION_DECLINE),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val answer = openCallScreen(context, accept = true, requestCode = INCOMING_CALL_NOTIFICATION_ID + 2)
+        val show = openCallScreen(context, accept = false, requestCode = INCOMING_CALL_NOTIFICATION_ID + 3)
+        val notification = NotificationCompat.Builder(context, CHANNEL_CALLS)
+            .setSmallIcon(android.R.drawable.sym_action_call)
+            .setContentTitle("Incoming encrypted call")
+            .setContentText(call.peer.name.ifBlank { formatAegisNumber(call.peer.number) } + if (call.peer.verified) "" else " (unverified)")
+            .setStyle(NotificationCompat.CallStyle.forIncomingCall(person(call.peer), decline, answer))
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .setContentIntent(show)
+            .setFullScreenIntent(show, true)
+            .setTimeoutAfter(50_000L)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .build()
+        context.getSystemService(NotificationManager::class.java)?.notify(INCOMING_CALL_NOTIFICATION_ID, notification)
+    }
+
+    fun cancelIncomingCall(context: Context) {
+        context.getSystemService(NotificationManager::class.java)?.cancel(INCOMING_CALL_NOTIFICATION_ID)
+    }
+
+    /** The foreground notification behind [CallService] while a call is up. */
+    fun ongoingCall(context: Context, call: ActiveCall): Notification {
+        ensureChannels(context)
+        val hangUp = PendingIntent.getBroadcast(
+            context, CALL_NOTIFICATION_ID + 1,
+            Intent(context, CallActionReceiver::class.java).setAction(CallActionReceiver.ACTION_HANGUP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val text = when (call.phase) {
+            CallPhase.DIALING -> "Calling…"
+            CallPhase.CONNECTING -> "Connecting…"
+            CallPhase.CONNECTED -> "Encrypted call in progress"
+            CallPhase.RECONNECTING -> "Reconnecting…"
+            CallPhase.INCOMING -> "Ringing"
+            CallPhase.ENDED -> "Call ended"
+        }
+        return NotificationCompat.Builder(context, CHANNEL_CALLS)
+            .setSmallIcon(android.R.drawable.sym_action_call)
+            .setContentTitle(call.peer.name.ifBlank { formatAegisNumber(call.peer.number) })
+            .setContentText(text)
+            .setStyle(NotificationCompat.CallStyle.forOngoingCall(person(call.peer), hangUp))
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setOngoing(true)
+            .setSilent(true)
+            .setContentIntent(openCallScreen(context, accept = false, requestCode = CALL_NOTIFICATION_ID + 2))
+            .apply { if (call.connectedAt > 0L) setWhen(call.connectedAt).setUsesChronometer(true) }
+            .build()
+    }
+
+    /** A call that rang out, or arrived while the phone was offline or busy. */
+    fun missedCall(context: Context, contact: Contact) {
+        if (!canPost(context)) return
+        ensureChannels(context)
+        val open = Intent(context, MainActivity::class.java)
+            .setAction("com.xat.aegis.OPEN_THREAD")
+            .putExtra(EXTRA_TAB, COMMS_TAB_INDEX)
+            .putExtra(EXTRA_PEER, contact.number)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        val contentIntent = PendingIntent.getActivity(
+            context, contact.number.hashCode() xor 0x4D, open,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val notification = NotificationCompat.Builder(context, CHANNEL_CALLS)
+            .setSmallIcon(android.R.drawable.sym_call_missed)
+            .setContentTitle("Missed call")
+            .setContentText(contact.name.ifBlank { formatAegisNumber(contact.number) })
+            .setCategory(NotificationCompat.CATEGORY_MISSED_CALL)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(contentIntent)
+            .setShowWhen(true)
+            .build()
+        context.getSystemService(NotificationManager::class.java)?.notify(0x5B00_0000 or (contact.number.hashCode() and 0x00FF_FFFF), notification)
     }
 
     /**

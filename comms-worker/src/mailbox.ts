@@ -165,6 +165,7 @@ export class Mailbox extends DurableObject<Env> {
 
   static readonly LOOKUP_LIMIT = LOOKUP_LIMIT_PER_MINUTE;
   static readonly SEND_LIMIT = SEND_LIMIT_PER_MINUTE;
+  static readonly TURN_LIMIT = 20;
 
   /** storage.delete() takes at most 128 keys; larger sets go in batches. */
   private async deleteKeys(keys: string[]): Promise<number> {

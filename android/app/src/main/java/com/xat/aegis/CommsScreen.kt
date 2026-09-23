@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.os.Build
 import android.provider.Settings
@@ -41,6 +42,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -51,8 +53,12 @@ import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import com.xat.aegis.comms.ActiveCall
+import com.xat.aegis.comms.CallManager
+import com.xat.aegis.comms.CallPhase
 import com.xat.aegis.comms.ChatMessage
 import com.xat.aegis.comms.ChatThread
+import com.xat.aegis.comms.STATUS_CALL
 import com.xat.aegis.comms.CommsNotifications
 import com.xat.aegis.comms.CommsRepository
 import com.xat.aegis.comms.Contact
@@ -108,6 +114,7 @@ private sealed class CommsPage {
 @Composable
 fun CommsScreen(openPeer: String?, onPeerConsumed: () -> Unit) {
     val state by CommsRepository.state.collectAsStateWithLifecycle()
+    val activeCall by CallManager.call.collectAsStateWithLifecycle()
     var page by remember { mutableStateOf<CommsPage>(CommsPage.List) }
 
     LaunchedEffect(openPeer) {
@@ -115,6 +122,13 @@ fun CommsScreen(openPeer: String?, onPeerConsumed: () -> Unit) {
             page = CommsPage.Thread(openPeer)
             onPeerConsumed()
         }
+    }
+
+    // A call, ringing or in progress, takes the whole tab.
+    val call = activeCall
+    if (call != null) {
+        InCallScreen(call)
+        return
     }
 
     if (!state.registered) {
@@ -198,6 +212,22 @@ private fun ToggleRow(label: String, detail: String, checked: Boolean, enabled: 
             checked = checked, onCheckedChange = onChange, enabled = enabled,
             colors = SwitchDefaults.colors(checkedThumbColor = CGround, checkedTrackColor = CAccent, uncheckedThumbColor = CInkDim, uncheckedTrackColor = CPanelHi, uncheckedBorderColor = CRule)
         )
+    }
+}
+
+/** Asks for the microphone if needed, then runs [onGranted]. */
+@Composable
+private fun rememberMicrophoneGate(onGranted: () -> Unit): () -> Unit {
+    val context = LocalContext.current
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) onGranted()
+    }
+    return {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            onGranted()
+        } else {
+            launcher.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
 }
 
@@ -567,6 +597,7 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
     LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1) }
 
     val c = contact
+    val placeCall = rememberMicrophoneGate { c?.let { CallManager.place(it) } }
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Spacer(Modifier.height(20.dp))
         Header(c?.let { contactLabel(it) } ?: formatAegisNumber(peer), onBack = onBack) {
@@ -577,6 +608,7 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
                 else -> "UNVERIFIED" to CCaution
             }
             if (label.isNotEmpty()) SmallButton(label, colour, onClick = onVerify)
+            SmallButton("CALL", CClear, enabled = c != null && !c.keyChanged, onClick = placeCall)
         }
         Text(
             "${formatAegisNumber(peer)} · end-to-end encrypted · Aegis number, not a phone number",
@@ -636,6 +668,18 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
 @Composable
 private fun MessageBubble(m: ChatMessage, onRetry: () -> Unit) {
     val mine = m.direction == Direction.OUT
+    if (m.status == STATUS_CALL) {
+        // A call record: one quiet centred line in the conversation.
+        val missed = m.body.startsWith("Missed")
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                (if (mine) "↗ " else "↙ ") + m.body + " · " + timeFmt.format(Date(m.ts)),
+                color = if (missed) CCritical else CMuted, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+                modifier = Modifier.background(CPanel, RoundedCornerShape(10.dp)).padding(horizontal = 10.dp, vertical = 4.dp)
+            )
+        }
+        return
+    }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = if (mine) Alignment.End else Alignment.Start) {
         Column(
             Modifier
@@ -667,6 +711,95 @@ private fun MessageBubble(m: ChatMessage, onRetry: () -> Unit) {
             }
         }
     }
+}
+
+// ── In a call ────────────────────────────────────────────────────────────────
+
+@Composable
+private fun InCallScreen(call: ActiveCall) {
+    val now = rememberTick(1_000L)
+    val accept = rememberMicrophoneGate { CallManager.accept() }
+    val (title, colour) = when (call.phase) {
+        CallPhase.INCOMING -> "INCOMING CALL" to CClear
+        CallPhase.DIALING -> "CALLING" to CMuted
+        CallPhase.CONNECTING -> "CONNECTING" to CMuted
+        CallPhase.CONNECTED -> "ENCRYPTED CALL" to CClear
+        CallPhase.RECONNECTING -> "RECONNECTING" to CCaution
+        CallPhase.ENDED -> "CALL ENDED" to CMuted
+    }
+    Column(
+        Modifier.fillMaxSize().padding(horizontal = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(title, color = colour, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+        Spacer(Modifier.height(12.dp))
+        Text(contactLabel(call.peer), color = CInk, fontSize = 26.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            formatAegisNumber(call.peer.number) + when {
+                call.peer.keyChanged -> " · KEYS CHANGED"
+                call.peer.verified -> " · verified"
+                else -> " · unverified"
+            },
+            color = if (call.peer.verified && !call.peer.keyChanged) CMuted else CCaution,
+            fontSize = 12.sp, fontFamily = FontFamily.Monospace
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            when {
+                call.phase == CallPhase.ENDED -> call.endReason?.replaceFirstChar { it.uppercase() } ?: "Ended"
+                call.connectedAt > 0L -> CallManager.durationText(now - call.connectedAt)
+                call.phase == CallPhase.INCOMING -> "Aegis call · not a phone call"
+                else -> "Setting up the encrypted connection"
+            },
+            color = if (call.phase == CallPhase.ENDED && call.connectedAt == 0L) CCaution else CInkDim,
+            fontSize = 14.sp, fontFamily = FontFamily.Monospace
+        )
+        Spacer(Modifier.height(48.dp))
+        when (call.phase) {
+            CallPhase.INCOMING -> Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                CallButton("DECLINE", CCritical) { CallManager.reject() }
+                CallButton("ACCEPT", CClear) { accept() }
+            }
+            CallPhase.ENDED -> Unit
+            else -> Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    ToggleChip(if (call.muted) "UNMUTE" else "MUTE", call.muted) { CallManager.toggleMute() }
+                    ToggleChip("SPEAKER", call.speaker) { CallManager.toggleSpeaker() }
+                }
+                CallButton("HANG UP", CCritical) { CallManager.hangUp() }
+            }
+        }
+        Spacer(Modifier.height(40.dp))
+        Text(
+            buildString {
+                append("End-to-end encrypted: the keys for the audio were exchanged inside your encrypted session, so the relay cannot listen or step in.")
+                if (call.relayed) append(" Audio is being forwarded by a TURN relay, which carries it but cannot decrypt it.")
+            },
+            color = CMuted, fontSize = 11.sp, lineHeight = 15.sp, textAlign = TextAlign.Center
+        )
+    }
+}
+
+@Composable
+private fun CallButton(label: String, colour: Color, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        colors = ButtonDefaults.buttonColors(containerColor = colour, contentColor = Color(0xFF12161D)),
+        shape = RoundedCornerShape(28.dp),
+        modifier = Modifier.height(56.dp).widthIn(min = 140.dp)
+    ) { Text(label, fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
+}
+
+@Composable
+private fun ToggleChip(label: String, on: Boolean, onClick: () -> Unit) {
+    TextButton(
+        onClick = onClick,
+        shape = RoundedCornerShape(20.dp),
+        border = BorderStroke(1.dp, if (on) CAccent else CRule),
+        colors = ButtonDefaults.textButtonColors(containerColor = if (on) CAccent.copy(alpha = 0.15f) else CPanel)
+    ) { Text(label, color = if (on) CAccent else CInkDim, fontSize = 12.sp, letterSpacing = 1.sp) }
 }
 
 // ── Verify a contact ─────────────────────────────────────────────────────────

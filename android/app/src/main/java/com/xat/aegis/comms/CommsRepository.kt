@@ -91,6 +91,7 @@ object CommsRepository {
         identities = IdentityStore(appContext)
         store = CommsStore(appContext)
         relay = RelayClient(identities, config)
+        CallManager.init(appContext)
         initialised = true
         publishConfig()
         scope.launch { refreshUnread() }
@@ -457,6 +458,39 @@ object CommsRepository {
             .put("k", bundle.ed25519).put("c", bundle.curve25519).put("s", bundle.sealing).put("g", bundle.signature)
     }
 
+    /**
+     * Sends a call signal (offer, answer, ICE, end) to [contact] through the
+     * encrypted session. Returns false when it could not be delivered now.
+     */
+    suspend fun sendCallSignal(contact: Contact, payload: JSONObject): Boolean = withContext(Dispatchers.IO) {
+        if (!config.isRegistered) return@withContext false
+        lock.withLock {
+            payload.put("v", 1).put("t", "call")
+            putSelf(payload)
+            when (val r = deliver(contact, payload)) {
+                Deliver.Sent -> true
+                is Deliver.Failed -> { Log.w(TAG, "call signal to ${contact.number} failed: ${r.reason}"); false }
+                is Deliver.Offline -> { Log.w(TAG, "call signal to ${contact.number} not sent: ${r.reason}"); false }
+            }
+        }
+    }
+
+    /** Records a call in the conversation with [contact]; a missed call shows as unread. */
+    suspend fun logCall(contact: Contact, direction: Direction, body: String, unread: Boolean) = withContext(Dispatchers.IO) {
+        store.insertMessage(
+            ChatMessage(UUID.randomUUID().toString(), contact.number, direction, body, System.currentTimeMillis(), STATUS_CALL, read = !unread)
+        )
+        bump()
+    }
+
+    /**
+     * Keeps the relay socket open for a call's signalling even when the owner
+     * has comms offline; released when the call ends. Called from the app's
+     * own screen, so the foreground service start is permitted.
+     */
+    fun holdLiveLink() { if (initialised && config.isRegistered && !config.online) CommsService.start(appContext) }
+    fun releaseLiveLink() { if (initialised && !config.online) CommsService.stop(appContext) }
+
     /** Sends a control message that is not stored locally (receipts, resync). Caller holds [lock]. */
     private fun sendControl(contact: Contact, payload: JSONObject) {
         putSelf(payload)
@@ -566,6 +600,7 @@ object CommsRepository {
                 // side; anything still queued for them goes through it next flush.
                 Log.i(TAG, "resync from ${contact.number}")
             }
+            "call" -> CallManager.onSignal(contact, json, envelopeTs)
         }
     }
 
