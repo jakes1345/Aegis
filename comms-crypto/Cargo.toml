@@ -1,0 +1,38 @@
+[package]
+name = "aegis_comms_crypto"
+version = "1.0.0"
+edition = "2021"
+description = "End-to-end encryption for Aegis comms: vodozemac (Olm double ratchet) identities and sessions, plus a sealed-sender envelope layer, exposed to Kotlin through UniFFI."
+license = "MIT"
+publish = false
+
+[lib]
+name = "aegis_comms_crypto"
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+vodozemac = { version = "0.11", features = ["experimental-session-config"] }
+uniffi = { version = "0.32", features = ["cli"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+zeroize = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+# Not stripped: uniffi-bindgen reads the binding metadata from the library symbols,
+# and the Android Gradle plugin strips native libraries for the APK itself.
+strip = false
+panic = "abort"
