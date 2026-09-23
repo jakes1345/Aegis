@@ -179,13 +179,31 @@ data class VaultCard(
     val apduPairs: List<Pair<String, String>> = emptyList()
 )
 
+/** What the NFC tab can show of the vault right now. */
+sealed interface VaultState {
+    /** Not unlocked this session, or re-locked when the app left the screen. */
+    data object Locked : VaultState
+    /** Unlock in progress (authentication or decryption running). */
+    data object Unlocking : VaultState
+    data class Unlocked(val cards: List<VaultCard>) : VaultState
+    /**
+     * The vault could not be opened. Nothing was overwritten. [retryable] is false
+     * when the key is gone for good and trying again cannot help; [erasable] is true
+     * when there is stored data the user may choose to delete to start over.
+     */
+    data class Failed(val message: String, val retryable: Boolean, val erasable: Boolean) : VaultState
+}
+
+/** The card currently armed for Host Card Emulation. */
+data class ArmedCard(val id: String, val label: String)
+
 // --- WiFi anomaly -----------------------------------------------------------
 
 data class WifiAnomaly(
     val ssid: String,
     val bssid: String,
     val rssi: Int,
-    val reason: String,       // e.g. "known_catcher_ssid", "open_unsecured", "duplicate_ssid"
+    val reason: String,       // e.g. "known_catcher_ssid", "carrier_open_network", "open_twin_of_secured"
     val threat: Threat,
     val ts: Long
 )

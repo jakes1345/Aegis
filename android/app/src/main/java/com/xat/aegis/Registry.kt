@@ -1,7 +1,6 @@
 package com.xat.aegis
 
 import android.content.Context
-import com.xat.aegis.VaultCard
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -108,14 +107,24 @@ object Registry {
 
     // --- Card vault ----------------------------------------------------------
 
-    private val _vault = MutableStateFlow<List<VaultCard>>(emptyList())
-    val vault: StateFlow<List<VaultCard>> = _vault.asStateFlow()
-    fun publishVault(cards: List<VaultCard>) { _vault.value = cards }
+    //
+    // Decrypted cards exist here only between a successful unlock and the activity
+    // going to the background; the rest of the time this holds Locked (or the
+    // reason the vault could not be read), never the cards.
 
-    /** ID of the vault card currently being emulated via HCE, or null. */
-    private val _emulating = MutableStateFlow<String?>(null)
-    val emulating: StateFlow<String?> = _emulating.asStateFlow()
-    fun setEmulating(id: String?) { _emulating.value = id }
+    private val _vault = MutableStateFlow<VaultState>(VaultState.Locked)
+    val vault: StateFlow<VaultState> = _vault.asStateFlow()
+    fun publishVault(state: VaultState) { _vault.value = state }
+    fun lockVault() { _vault.value = VaultState.Locked }
+
+    /**
+     * The vault card currently being emulated via HCE, or null. Holds the label as
+     * well as the id so the banner and STOP keep working after the vault re-locks —
+     * emulation is typically used with Aegis in the background.
+     */
+    private val _emulating = MutableStateFlow<ArmedCard?>(null)
+    val emulating: StateFlow<ArmedCard?> = _emulating.asStateFlow()
+    fun setEmulating(card: ArmedCard?) { _emulating.value = card }
 
     fun reset() {
         _detections.value = emptyList()
