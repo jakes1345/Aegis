@@ -40,6 +40,11 @@ class CallService : Service() {
         }
         val current = CallManager.call.value
         if (current == null || current.phase == CallPhase.ENDED) {
+            // Started for a call that ended before the service ran (a call that
+            // failed at once, say). A service started in the foreground must go
+            // foreground before it stops, or Android kills the whole app.
+            runCatching { startForeground(CommsNotifications.CALL_NOTIFICATION_ID, CommsNotifications.callEndedPlaceholder(this), ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE) }
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }

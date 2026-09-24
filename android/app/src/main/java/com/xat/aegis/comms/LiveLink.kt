@@ -51,6 +51,40 @@ object LiveLink {
     private var loop: Job? = null
     private var stopper: Job? = null
 
+    /** What the socket delivered, in the order the relay sent it. */
+    private sealed class Inbound {
+        class Envelope(val socket: WebSocket, val envelope: RelayClient.Envelope) : Inbound()
+        /** The relay has replayed the backlog; what queued up locally can go now. */
+        object Ready : Inbound()
+    }
+
+    /**
+     * Envelopes are handled one at a time in arrival order. Handling each in its
+     * own coroutine let a call's ICE candidates or its cancel overtake the offer
+     * they belong to, so they were dropped or the cancel was missed.
+     */
+    private val inbound = Channel<Inbound>(Channel.UNLIMITED)
+
+    init {
+        scope.launch {
+            for (item in inbound) {
+                try {
+                    when (item) {
+                        is Inbound.Envelope -> if (CommsRepository.handleEnvelope(item.envelope)) {
+                            item.socket.send(JSONObject().put("type", "ack").put("ids", JSONArray(listOf(item.envelope.id))).toString())
+                        }
+                        Inbound.Ready -> CommsRepository.flushOutbox()
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // One bad envelope must not stop delivery of the rest.
+                    CommsLog.add("Error handling a relay delivery: ${e.javaClass.simpleName}: ${e.message}")
+                }
+            }
+        }
+    }
+
     /** Ends the reconnect back-off early when a new hold arrives. */
     private val kicks = Channel<Unit>(Channel.CONFLATED)
 
@@ -168,16 +202,12 @@ object LiveLink {
                         CommsLog.add("Relay sent an envelope this app could not parse")
                         return
                     }
-                    scope.launch {
-                        if (CommsRepository.handleEnvelope(envelope)) {
-                            webSocket.send(JSONObject().put("type", "ack").put("ids", JSONArray(listOf(envelope.id))).toString())
-                        }
-                    }
+                    inbound.trySend(Inbound.Envelope(webSocket, envelope))
                 }
                 "ready" -> {
                     wasReady = true
                     // The backlog has been replayed; now send what queued up while offline.
-                    scope.launch { CommsRepository.flushOutbox() }
+                    inbound.trySend(Inbound.Ready)
                 }
             }
         }

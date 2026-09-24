@@ -30,6 +30,8 @@
          many phones (Samsung especially) otherwise cuts the background relay
          connection so incoming calls never ring. Asked for from COMMS settings. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- COMMS calls: the proximity sensor switches the screen off at the ear. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Wi-Fi anomaly scan reads the system's cached scan results only -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />

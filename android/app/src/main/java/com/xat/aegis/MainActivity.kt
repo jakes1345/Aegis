@@ -224,6 +224,20 @@ class MainActivity : AppCompatActivity() {
 
         CommsRepository.init(applicationContext)
         CommsNotifications.ensureChannels(this)
+
+        // Most calls arrive to a locked phone. While one is ringing or under way,
+        // this screen may show over the lock screen and switch the display on;
+        // at any other time Aegis stays behind the lock like any app. Collected
+        // for the Activity's whole life (not only while started) so the flags are
+        // set before the full-screen intent brings it forward.
+        lifecycleScope.launch {
+            CallManager.call.collect { c ->
+                val live = c != null && c.phase != CallPhase.ENDED
+                setShowWhenLocked(live)
+                setTurnScreenOn(live && c?.phase == CallPhase.INCOMING)
+            }
+        }
+
         handleOpenThreadIntent(intent)
 
         val onboardingAlreadyDone = isOnboardingDone(this)

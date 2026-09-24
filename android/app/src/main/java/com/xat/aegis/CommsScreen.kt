@@ -1076,6 +1076,23 @@ private fun CommsSettingsScreen(onBack: () -> Unit) {
                 )
                 if (!batteryFree) SmallButton("ALLOW", CAccent) { openBatterySettings(context) }
             }
+            var fullScreen by remember { mutableStateOf(CommsNotifications.canUseFullScreen(context)) }
+            DisposableEffect(lifecycleOwner) {
+                val observer = LifecycleEventObserver { _, event ->
+                    if (event == Lifecycle.Event.ON_RESUME) fullScreen = CommsNotifications.canUseFullScreen(context)
+                }
+                lifecycleOwner.lifecycle.addObserver(observer)
+                onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+            }
+            if (!fullScreen) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Full-screen calls: off. On a locked phone an incoming call shows only as a notification.",
+                        color = CCaution, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.weight(1f)
+                    )
+                    SmallButton("ALLOW", CAccent) { CommsNotifications.openFullScreenSettings(context) }
+                }
+            }
             Text(
                 "Relay one-time keys: ${if (state.relayOneTimeKeys >= 0) state.relayOneTimeKeys else "unknown"} · topped up on sync",
                 color = CMuted, fontSize = 10.sp, fontFamily = FontFamily.Monospace

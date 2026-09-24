@@ -506,17 +506,18 @@ object CommsRepository {
 
     /**
      * Sends a call signal (offer, answer, ICE, end) to [contact] through the
-     * encrypted session. Returns false when it could not be delivered now.
+     * encrypted session. Returns null once the relay has it, or the reason it
+     * could not be sent, which the call screen shows as it is.
      */
-    suspend fun sendCallSignal(contact: Contact, payload: JSONObject): Boolean = withContext(Dispatchers.IO) {
-        if (!config.isRegistered) return@withContext false
+    suspend fun sendCallSignal(contact: Contact, payload: JSONObject): String? = withContext(Dispatchers.IO) {
+        if (!config.isRegistered) return@withContext "this phone is not registered with a relay"
         lock.withLock {
             putSelf(payload)
             val kind = CommsWire.callKind(payload)
             when (val r = deliver(contact, payload)) {
-                Deliver.Sent -> { if (kind != CommsWire.CALL_ICE) CommsLog.add("Call $kind sent to ${formatAegisNumber(contact.number)}"); true }
-                is Deliver.Failed -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} failed: ${r.reason}"); false }
-                is Deliver.Offline -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} not sent: ${r.reason}"); false }
+                Deliver.Sent -> { if (kind != CommsWire.CALL_ICE) CommsLog.add("Call $kind sent to ${formatAegisNumber(contact.number)}"); null }
+                is Deliver.Failed -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} failed: ${r.reason}"); r.reason }
+                is Deliver.Offline -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} not sent: ${r.reason}"); r.reason }
             }
         }
     }

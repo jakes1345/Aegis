@@ -150,10 +150,27 @@ class RelayClient(
     /** One STUN or TURN server for a call, as the relay hands it out. */
     data class IceServer(val urls: List<String>, val username: String?, val credential: String?)
 
-    /** ICE servers for a call: STUN always, TURN with short-lived credentials when the relay has a key. */
+    /** The last ICE server list the relay gave, reused when a fetch is slow or fails. */
+    @Volatile
+    private var lastIceServers: Pair<Long, List<IceServer>>? = null
+
+    /** A client that gives up quickly: a call should not wait 15 s on a slow relay for its server list. */
+    private val quick: OkHttpClient by lazy { http.newBuilder().callTimeout(4, TimeUnit.SECONDS).build() }
+
+    /**
+     * ICE servers for a call: STUN always, TURN with short-lived credentials when
+     * the relay has a key. A list fetched in the last few hours is reused if the
+     * relay does not answer within four seconds.
+     */
     fun turn(): List<IceServer> {
-        val json = signed("GET", "/v1/turn")
-        return parsed {
+        val cached = lastIceServers?.takeIf { System.currentTimeMillis() - it.first < ICE_CACHE_MS }?.second
+        val json = try {
+            execute(signedRequest("GET", "/v1/turn", null), quick)
+        } catch (e: RelayException) {
+            if (cached != null) return cached
+            throw e
+        }
+        val servers = parsed {
             val arr = json.getJSONArray("iceServers")
             (0 until arr.length()).mapNotNull { i ->
                 val o = arr.getJSONObject(i)
@@ -161,6 +178,8 @@ class RelayClient(
                 IceServer(urls, o.optString("username").takeIf { it.isNotEmpty() }, o.optString("credential").takeIf { it.isNotEmpty() })
             }
         }
+        if (servers.isNotEmpty()) lastIceServers = System.currentTimeMillis() to servers
+        return servers
     }
 
     /** Opens the live-delivery socket. The caller owns the returned socket. */
@@ -218,9 +237,9 @@ class RelayClient(
         return builder
     }
 
-    private fun execute(builder: Request.Builder): JSONObject {
+    private fun execute(builder: Request.Builder, client: OkHttpClient = http): JSONObject {
         val response = try {
-            http.newCall(builder.build()).execute()
+            client.newCall(builder.build()).execute()
         } catch (e: IOException) {
             throw RelayException("Could not reach the relay: ${e.message ?: e.javaClass.simpleName}")
         }
@@ -271,6 +290,8 @@ class RelayClient(
         /** [RelayException.code] for a response the client could not parse; not a network failure. */
         const val MALFORMED = -1
         private const val CLOCK_WARN_MS = 30_000L
+        /** The relay mints TURN credentials for 24 h and hands them out for at most 6 h. */
+        private const val ICE_CACHE_MS = 5 * 60 * 60_000L
         private val JSON = "application/json; charset=utf-8".toMediaType()
     }
 }

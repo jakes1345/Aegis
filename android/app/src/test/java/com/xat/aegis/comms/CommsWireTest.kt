@@ -29,6 +29,7 @@ class CommsWireTest {
         for ((built, kind) in listOf(
             CommsWire.callOffer("cid-1", 1_700_000_000_000, "v=0 offer sdp") to CommsWire.CALL_OFFER,
             CommsWire.callAnswer("cid-1", "v=0 answer sdp") to CommsWire.CALL_ANSWER,
+            CommsWire.callReoffer("cid-1", "v=0 restart sdp") to CommsWire.CALL_REOFFER,
             CommsWire.callIce("cid-1", listOf(CommsWire.Candidate("0", 0, "candidate:1 1 udp 1 1.2.3.4 5 typ host"))) to CommsWire.CALL_ICE,
             CommsWire.callEnd("cid-1", "hangup") to CommsWire.CALL_END,
         )) {
@@ -96,7 +97,7 @@ class CommsWireTest {
     fun noBuilderUsesAReservedField() {
         val all = listOf(
             CommsWire.message("i", 1, "b"), CommsWire.receipt(listOf("i"), "read"), CommsWire.resync(),
-            CommsWire.callOffer("c", 1, "s"), CommsWire.callAnswer("c", "s"),
+            CommsWire.callOffer("c", 1, "s"), CommsWire.callAnswer("c", "s"), CommsWire.callReoffer("c", "s"),
             CommsWire.callIce("c", listOf(CommsWire.Candidate("0", 0, "x"))), CommsWire.callEnd("c", "r"),
         )
         for (p in all) for (f in CommsWire.SENDER_FIELDS) assertTrue("${CommsWire.type(p)} uses $f", !p.has(f))

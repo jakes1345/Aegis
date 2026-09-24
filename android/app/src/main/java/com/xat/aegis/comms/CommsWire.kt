@@ -22,8 +22,8 @@ import org.json.JSONObject
  *   msg      "id", "ts", "body"
  *   receipt  "status" ("delivered" | "read"), "ids": [message ids]
  *   resync   nothing more; its pre-key envelope starts a fresh session
- *   call     "ck": offer | answer | ice | end, "cid": call id, and
- *            offer "ts", "sdp" · answer "sdp" · ice "cands": [{"m","i","c"}] · end "reason"
+ *   call     "ck": offer | answer | ice | reoffer | end, "cid": call id, and
+ *            offer "ts", "sdp" · answer "sdp" · reoffer "sdp" · ice "cands": [{"m","i","c"}] · end "reason"
  *
  * Pure Kotlin and org.json, so the JVM tests use exactly this code.
  */
@@ -69,6 +69,12 @@ object CommsWire {
     const val CALL_ANSWER = "answer"
     const val CALL_ICE = "ice"
     const val CALL_END = "end"
+    /** A fresh offer for a call already under way (ICE restart after a network change); answered with "answer". */
+    const val CALL_REOFFER = "reoffer"
+    const val END_HANGUP = "hangup"
+    const val END_CANCEL = "cancel"
+    const val END_REJECT = "reject"
+    const val END_BUSY = "busy"
 
     // One ICE candidate inside "cands".
     private const val C_MID = "m"
@@ -111,6 +117,8 @@ object CommsWire {
         for (c in candidates) arr.put(JSONObject().put(C_MID, c.mid).put(C_INDEX, c.index).put(C_SDP, c.sdp))
         return call(CALL_ICE, cid).put(F_CANDIDATES, arr)
     }
+
+    fun callReoffer(cid: String, sdp: String): JSONObject = call(CALL_REOFFER, cid).put(F_SDP, sdp)
 
     fun callEnd(cid: String, reason: String): JSONObject = call(CALL_END, cid).put(F_REASON, reason)
 

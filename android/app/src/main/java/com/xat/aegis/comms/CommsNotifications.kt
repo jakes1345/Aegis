@@ -28,6 +28,12 @@ object CommsNotifications {
     const val CHANNEL_MESSAGES = "messages"
     const val CHANNEL_LINK = "comms_link"
     const val CHANNEL_CALLS = "calls"
+    /**
+     * Incoming calls. The original calls channel had vibration off, so a ring
+     * whose in-app vibration Android suppressed was silent in vibrate mode.
+     * Channel settings are fixed once created, hence a new id.
+     */
+    const val CHANNEL_RINGING = "calls_ringing"
 
     /** Intent extras naming the tab and conversation MainActivity should open. */
     const val EXTRA_TAB = "com.xat.aegis.TAB"
@@ -51,6 +57,18 @@ object CommsNotifications {
                 .apply {
                     description = "Shown while Aegis keeps its connection to your relay open"
                     setShowBadge(false)
+                }
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(CHANNEL_RINGING, "Incoming calls", NotificationManager.IMPORTANCE_HIGH)
+                .apply {
+                    description = "Encrypted calls ringing on this phone"
+                    // The app plays the phone's own ringtone; the channel adds a
+                    // vibration that still works when Android mutes the app's own.
+                    setSound(null, null)
+                    enableVibration(true)
+                    vibrationPattern = longArrayOf(0, 800, 1200, 800, 1200)
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
                 }
         )
         manager.createNotificationChannel(
@@ -91,7 +109,7 @@ object CommsNotifications {
         )
         val answer = openCallScreen(context, accept = true, requestCode = INCOMING_CALL_NOTIFICATION_ID + 2)
         val show = openCallScreen(context, accept = false, requestCode = INCOMING_CALL_NOTIFICATION_ID + 3)
-        val notification = NotificationCompat.Builder(context, CHANNEL_CALLS)
+        val notification = NotificationCompat.Builder(context, CHANNEL_RINGING)
             .setSmallIcon(android.R.drawable.sym_action_call)
             .setContentTitle("Incoming encrypted call")
             .setContentText(call.peer.name.ifBlank { formatAegisNumber(call.peer.number) } + if (call.peer.verified) "" else " (unverified)")
@@ -165,6 +183,41 @@ object CommsNotifications {
             .setShowWhen(true)
             .build()
         context.getSystemService(NotificationManager::class.java)?.notify(0x5B00_0000 or (contact.number.hashCode() and 0x00FF_FFFF), notification)
+    }
+
+    /**
+     * Whether an incoming call may take over the screen of a locked phone. From
+     * Android 14 this is a special permission the owner can switch off (and
+     * some phones ship with it off); without it the call rings as a heads-up
+     * notification only.
+     */
+    fun canUseFullScreen(context: Context): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            context.getSystemService(NotificationManager::class.java)?.canUseFullScreenIntent() != false
+        } else true
+
+    /** Opens the system page where full-screen calls are allowed for Aegis (Android 14+). */
+    fun openFullScreenSettings(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return
+        val intent = Intent(android.provider.Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, android.net.Uri.parse("package:${context.packageName}"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { context.startActivity(intent) }
+            .onFailure { runCatching { context.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } }
+    }
+
+    /**
+     * The foreground notification [CallService] shows when it starts after the
+     * call has already ended: a service started in the foreground must go
+     * foreground before it may stop, or Android kills the app.
+     */
+    fun callEndedPlaceholder(context: Context): Notification {
+        ensureChannels(context)
+        return NotificationCompat.Builder(context, CHANNEL_CALLS)
+            .setSmallIcon(android.R.drawable.sym_action_call)
+            .setContentTitle("Call ended")
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .build()
     }
 
     /**
