@@ -45,6 +45,8 @@ class RelayRoundTripTest {
         @Volatile var number: String? = null
         val relay = RelayClient({ identity }, { relayUrl }, { number })
         private val inbox = LinkedBlockingQueue<RelayClient.Envelope>()
+        /** Types of the other frames the relay sent (pong, heartbeat, acked), in order. */
+        val control = LinkedBlockingQueue<String>()
         private var socket: WebSocket? = null
 
         init {
@@ -71,6 +73,7 @@ class RelayRoundTripTest {
                             webSocket.send(JSONObject().put("type", "ack").put("ids", JSONArray(listOf(env.id))).toString())
                         }
                         "ready" -> ready.countDown()
+                        else -> control.put(json.optString("type"))
                     }
                 }
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -97,6 +100,19 @@ class RelayRoundTripTest {
             val peerKeys = peer.keys
             val bundle = relay.bundle(peer.number!!, fingerprint(peerKeys.ed25519))
             identity.startSession(peerKeys, bundle.sessionKey)
+        }
+
+        /** Sends a raw frame on the live socket, as LiveLink's liveness probe does. */
+        fun sendFrame(text: String) = assertTrue("$label: socket refused the frame", socket?.send(text) == true)
+
+        /** Waits for a control frame of [type], skipping others. */
+        fun awaitControl(type: String, seconds: Long): Boolean {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds)
+            while (true) {
+                val left = deadline - System.nanoTime()
+                if (left <= 0) return false
+                if (control.poll(left, TimeUnit.NANOSECONDS) == type) return true
+            }
         }
 
         /** Posts already-encrypted bytes, as a relay redelivery or a re-send would. */
@@ -335,5 +351,19 @@ class RelayRoundTripTest {
         } catch (e: AssertionError) {
             assertTrue(e.message!!.contains("did not parse"))
         }
+    }
+
+    @Test
+    fun aPingOnTheSocketIsAnswered() {
+        // LiveLink's liveness probe: an open socket that gets no pong is replaced.
+        alice.sendFrame("{\"type\":\"ping\"}")
+        assertTrue("no pong within 5 s", alice.awaitControl("pong", 5))
+    }
+
+    @Test
+    fun theRelaySendsHeartbeatsToAConnectedPhone() {
+        // Takes up to two and a half minutes, so it runs only when asked for.
+        assumeTrue("set AEGIS_SLOW_TESTS to wait for a relay heartbeat", System.getenv("AEGIS_SLOW_TESTS") != null)
+        assertTrue("no heartbeat within 150 s", alice.awaitControl("hb", 150))
     }
 }

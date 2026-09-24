@@ -177,14 +177,6 @@ class MainActivity : AppCompatActivity() {
     private var readerModeOn = false
 
     /**
-     * Answering from the notification lands here; the microphone is asked for
-     * if the call would be the first time. Declined means the call is declined.
-     */
-    private val microphoneForAccept = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) CallManager.accept() else CallManager.reject()
-    }
-
-    /**
      * True between onResume and onPause. The lifecycle's own state cannot be used
      * for this from inside onResume: androidx only marks the Activity RESUMED after
      * onResume returns, so a guard on it there always failed and reader mode was
@@ -224,19 +216,6 @@ class MainActivity : AppCompatActivity() {
 
         CommsRepository.init(applicationContext)
         CommsNotifications.ensureChannels(this)
-
-        // Most calls arrive to a locked phone. While one is ringing or under way,
-        // this screen may show over the lock screen and switch the display on;
-        // at any other time Aegis stays behind the lock like any app. Collected
-        // for the Activity's whole life (not only while started) so the flags are
-        // set before the full-screen intent brings it forward.
-        lifecycleScope.launch {
-            CallManager.call.collect { c ->
-                val live = c != null && c.phase != CallPhase.ENDED
-                setShowWhenLocked(live)
-                setTurnScreenOn(live && c?.phase == CallPhase.INCOMING)
-            }
-        }
 
         handleOpenThreadIntent(intent)
 
@@ -340,22 +319,21 @@ class MainActivity : AppCompatActivity() {
         handleOpenThreadIntent(intent)
     }
 
-    /** A message notification asks for the COMMS tab and the conversation it is about. */
+    /**
+     * A message notification asks for the COMMS tab and the conversation it is
+     * about. This Activity is exported, so any app can send it these extras;
+     * they only ever navigate. Calls are answered in [CallActivity], which is
+     * not exported.
+     */
     private fun handleOpenThreadIntent(intent: Intent?) {
         if (intent == null || !intent.hasExtra(CommsNotifications.EXTRA_TAB)) return
         val tab = intent.getIntExtra(CommsNotifications.EXTRA_TAB, -1)
         val peer = intent.getStringExtra(CommsNotifications.EXTRA_PEER)
         intent.removeExtra(CommsNotifications.EXTRA_TAB)
         intent.removeExtra(CommsNotifications.EXTRA_PEER)
-        val acceptCall = intent.getBooleanExtra(CommsNotifications.EXTRA_ACCEPT_CALL, false)
-        intent.removeExtra(CommsNotifications.EXTRA_ACCEPT_CALL)
         if (tab < 0) return
         Registry.requestTab(tab)
         if (peer != null) Registry.requestThread(peer)
-        if (acceptCall) {
-            if (granted(Manifest.permission.RECORD_AUDIO)) CallManager.accept()
-            else microphoneForAccept.launch(Manifest.permission.RECORD_AUDIO)
-        }
     }
 
     /**
@@ -999,10 +977,19 @@ private fun MainApp(
     val unreadMessages by CommsRepository.unread.collectAsStateWithLifecycle()
     val activeCall by CallManager.call.collectAsStateWithLifecycle()
 
+    // Settings navigation and threat explainer state
+    var showSettings by remember { mutableStateOf(false) }
+    var explainerTarget by remember { mutableStateOf<ExplainerTarget?>(null) }
+
     // A call ringing or in progress takes the COMMS tab regardless of where the
-    // user was: the notification lands there, and so does the in-app case.
+    // user was. Settings and the explainer sheet are drawn over the tabs, so
+    // they close too; otherwise the call's ACCEPT button sat hidden behind them.
     LaunchedEffect(activeCall?.id, activeCall?.phase) {
-        if (activeCall != null && activeCall?.phase != CallPhase.ENDED) tab = TAB_COMMS
+        if (activeCall != null && activeCall?.phase != CallPhase.ENDED) {
+            tab = TAB_COMMS
+            showSettings = false
+            explainerTarget = null
+        }
     }
 
     // A tag delivered by a system NFC intent lands on the NFC tab; a message
@@ -1013,9 +1000,6 @@ private fun MainApp(
     }
     val threadRequest by Registry.threadRequest.collectAsStateWithLifecycle()
 
-    // Settings navigation and threat explainer state
-    var showSettings by remember { mutableStateOf(false) }
-    var explainerTarget by remember { mutableStateOf<ExplainerTarget?>(null) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     if (showSettings) {

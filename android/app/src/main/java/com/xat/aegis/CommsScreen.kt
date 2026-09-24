@@ -2,6 +2,7 @@ package com.xat.aegis
 
 import android.Manifest
 import android.app.Activity
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
@@ -11,6 +12,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -44,6 +46,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -96,6 +99,9 @@ private val CShape    = RoundedCornerShape(4.dp)
 private val timeFmt = SimpleDateFormat("HH:mm", Locale.US)
 private val dateTimeFmt = SimpleDateFormat("MMM d HH:mm", Locale.US)
 
+private const val UI_PREFS = "comms_ui"
+private const val KEY_MIC_ASKED = "microphone_asked"
+
 private const val NOT_A_PHONE = "Aegis numbers are not phone numbers. They only reach other Aegis apps on the same relay; they cannot call or text a phone."
 
 /** Where the COMMS tab is, apart from the conversation list. */
@@ -125,6 +131,19 @@ fun CommsScreen(openPeer: String?, onPeerConsumed: () -> Unit) {
             page = CommsPage.Thread(openPeer)
             onPeerConsumed()
         }
+    }
+
+    // Calls need the microphone. Asked for once as soon as this phone has a
+    // number, so the first incoming call is not also the first time the
+    // question comes up, on a locked phone, with the caller waiting.
+    val context = LocalContext.current
+    val askMicrophone = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    LaunchedEffect(state.registered) {
+        if (!state.registered || hasMicrophone(context)) return@LaunchedEffect
+        val prefs = context.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE)
+        if (prefs.getBoolean(KEY_MIC_ASKED, false)) return@LaunchedEffect
+        prefs.edit().putBoolean(KEY_MIC_ASKED, true).apply()
+        askMicrophone.launch(Manifest.permission.RECORD_AUDIO)
     }
 
     // A call, ringing or in progress, takes the whole tab.
@@ -218,18 +237,56 @@ private fun ToggleRow(label: String, detail: String, checked: Boolean, enabled: 
     }
 }
 
-/** Asks for the microphone if needed, then runs [onGranted]. */
+private fun hasMicrophone(context: Context) =
+    ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+/** Opens Aegis's page in the system settings, where a blocked permission can be allowed. */
+internal fun openAppDetails(context: Context) {
+    runCatching {
+        context.startActivity(
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }
+}
+
+/**
+ * Asks for the microphone if needed, then runs [onGranted]. A refusal used to
+ * leave CALL and ACCEPT doing nothing at all; it is now said, and once Android
+ * stops showing the dialog, the settings page where it can be allowed opens.
+ * On a locked phone the lock screen is dismissed first, since the permission
+ * dialog cannot show over it.
+ */
 @Composable
 private fun rememberMicrophoneGate(onGranted: () -> Unit): () -> Unit {
     val context = LocalContext.current
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) onGranted()
-    }
-    return {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+        if (granted) {
             onGranted()
         } else {
-            launcher.launch(Manifest.permission.RECORD_AUDIO)
+            val activity = context.findActivity()
+            val blocked = activity != null && !ActivityCompat.shouldShowRequestPermissionRationale(activity, Manifest.permission.RECORD_AUDIO)
+            Toast.makeText(
+                context,
+                if (blocked) "The microphone is blocked for Aegis. Allow it under Permissions, then try again." else "Calls need the microphone.",
+                Toast.LENGTH_LONG
+            ).show()
+            if (blocked) openAppDetails(context)
+        }
+    }
+    return {
+        if (hasMicrophone(context)) {
+            onGranted()
+        } else {
+            val activity = context.findActivity()
+            val keyguard = context.getSystemService(KeyguardManager::class.java)
+            if (activity != null && keyguard?.isKeyguardLocked == true) {
+                keyguard.requestDismissKeyguard(activity, object : KeyguardManager.KeyguardDismissCallback() {
+                    override fun onDismissSucceeded() { launcher.launch(Manifest.permission.RECORD_AUDIO) }
+                })
+            } else {
+                launcher.launch(Manifest.permission.RECORD_AUDIO)
+            }
         }
     }
 }
@@ -740,19 +797,19 @@ private fun MessageBubble(m: ChatMessage, onRetry: () -> Unit) {
 // ── In a call ────────────────────────────────────────────────────────────────
 
 @Composable
-private fun InCallScreen(call: ActiveCall) {
+internal fun InCallScreen(call: ActiveCall, modifier: Modifier = Modifier) {
     val now = rememberTick(1_000L)
     val accept = rememberMicrophoneGate { CallManager.accept() }
     val (title, colour) = when (call.phase) {
         CallPhase.INCOMING -> "INCOMING CALL" to CClear
-        CallPhase.DIALING -> "CALLING" to CMuted
+        CallPhase.DIALING -> if (call.ringing) "RINGING" to CClear else "CALLING" to CMuted
         CallPhase.CONNECTING -> "CONNECTING" to CMuted
         CallPhase.CONNECTED -> "ENCRYPTED CALL" to CClear
         CallPhase.RECONNECTING -> "RECONNECTING" to CCaution
         CallPhase.ENDED -> "CALL ENDED" to CMuted
     }
     Column(
-        Modifier.fillMaxSize().padding(horizontal = 24.dp),
+        modifier.fillMaxSize().padding(horizontal = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
@@ -775,7 +832,10 @@ private fun InCallScreen(call: ActiveCall) {
                 call.phase == CallPhase.ENDED -> call.endReason?.replaceFirstChar { it.uppercase() } ?: "Ended"
                 call.connectedAt > 0L -> CallManager.durationText(now - call.connectedAt)
                 call.phase == CallPhase.INCOMING -> "Aegis call · not a phone call"
-                else -> "Setting up the encrypted connection"
+                call.phase == CallPhase.DIALING && call.ringing -> "Their phone is ringing"
+                call.phase == CallPhase.DIALING -> "Reaching their phone"
+                call.phase == CallPhase.RECONNECTING -> "The connection dropped; bringing it back"
+                else -> "Connecting the encrypted audio"
             },
             color = if (call.phase == CallPhase.ENDED && call.connectedAt == 0L) CCaution else CInkDim,
             fontSize = 14.sp, fontFamily = FontFamily.Monospace
@@ -992,12 +1052,31 @@ private fun CommsSettingsScreen(onBack: () -> Unit) {
     var name by rememberSaveable(state.displayName) { mutableStateOf(state.displayName) }
     var confirmUnpair by remember { mutableStateOf(false) }
     var notificationsGranted by remember { mutableStateOf(CommsNotifications.canPost(context)) }
-    val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { notificationsGranted = it }
-    // Re-check after coming back from the system notification settings.
+    var callsChannelOk by remember { mutableStateOf(CommsNotifications.callsChannelOk(context)) }
+    var microphoneGranted by remember { mutableStateOf(hasMicrophone(context)) }
+    // Once refused twice, Android answers the request with "denied" without
+    // showing anything; the owner is then sent to the settings page instead.
+    fun blocked(permission: String) =
+        context.findActivity()?.let { !ActivityCompat.shouldShowRequestPermissionRationale(it, permission) } == true
+    val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        notificationsGranted = granted
+        if (!granted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && blocked(Manifest.permission.POST_NOTIFICATIONS)) {
+            CommsNotifications.openAppNotificationSettings(context)
+        }
+    }
+    val askMicrophone = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        microphoneGranted = granted
+        if (!granted && blocked(Manifest.permission.RECORD_AUDIO)) openAppDetails(context)
+    }
+    // Re-check after coming back from the system settings.
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) notificationsGranted = CommsNotifications.canPost(context)
+            if (event == Lifecycle.Event.ON_RESUME) {
+                notificationsGranted = CommsNotifications.canPost(context)
+                callsChannelOk = CommsNotifications.callsChannelOk(context)
+                microphoneGranted = hasMicrophone(context)
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -1007,11 +1086,7 @@ private fun CommsSettingsScreen(onBack: () -> Unit) {
             askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         } else {
             // Before API 33 there is no runtime permission; the switch lives in system settings.
-            context.startActivity(
-                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
-                    .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
+            CommsNotifications.openAppNotificationSettings(context)
         }
     }
 
@@ -1066,6 +1141,22 @@ private fun CommsSettingsScreen(onBack: () -> Unit) {
                     Text("Notifications are off, so new messages and incoming calls will not show until you open Aegis.", color = CCaution, fontSize = 11.sp, modifier = Modifier.weight(1f))
                     SmallButton("ALLOW", CAccent, onClick = allowNotifications)
                 }
+            } else if (!callsChannelOk) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Incoming-call notifications are switched off or set to silent, so calls do not ring or pop up. Set \"Incoming calls\" to alert.",
+                        color = CCaution, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.weight(1f)
+                    )
+                    SmallButton("FIX", CAccent) { CommsNotifications.openCallsChannelSettings(context) }
+                }
+            }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (microphoneGranted) "Microphone: allowed for calls."
+                    else "Microphone: not allowed. Calls cannot be made or answered until it is.",
+                    color = if (microphoneGranted) CMuted else CCaution, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.weight(1f)
+                )
+                if (!microphoneGranted) SmallButton("ALLOW", CAccent) { askMicrophone.launch(Manifest.permission.RECORD_AUDIO) }
             }
             val batteryFree by rememberBatteryUnrestricted()
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {

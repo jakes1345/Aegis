@@ -30,7 +30,9 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use vodozemac::olm::{Account, AccountPickle, DecryptionError, OlmMessage, Session, SessionConfig, SessionPickle};
+use vodozemac::olm::{
+    Account, AccountPickle, DecryptionError, OlmMessage, Session, SessionConfig, SessionCreationError, SessionPickle,
+};
 use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -397,6 +399,18 @@ impl Identity {
         self.inner.lock().expect("identity mutex poisoned").sessions.remove(&peer_curve25519);
     }
 
+    /// Drops the sessions of every peer not in `keep` and returns how many
+    /// peers were dropped. Any pre-key message to the fallback key creates a
+    /// session before the app knows who sent it; sessions from senders that
+    /// never became contacts would otherwise pile up in every saved state.
+    pub fn prune_sessions(&self, keep: Vec<String>) -> u32 {
+        let keep: std::collections::HashSet<String> = keep.into_iter().collect();
+        let mut inner = self.inner.lock().expect("identity mutex poisoned");
+        let before = inner.sessions.len();
+        inner.sessions.retain(|peer, _| keep.contains(peer));
+        (before - inner.sessions.len()) as u32
+    }
+
     /// Encrypts `plaintext` for `peer` and seals it for the relay. Requires a session.
     pub fn encrypt(&self, peer: PeerKeys, plaintext: Vec<u8>) -> Result<Vec<u8>> {
         verify_peer(&peer)?;
@@ -435,11 +449,23 @@ impl Identity {
         // Existing sessions first, newest first. A session that knows the
         // message's chain but has already spent its key means this exact message
         // was decrypted before: a duplicate, not a broken session.
+        //
+        // The session that decrypts moves to the front, so this phone replies on
+        // the session the peer is actually using. Without that, two phones that
+        // each started a session at the same moment kept sending on different
+        // ones for good, and the one the peer used could be pushed out of the
+        // list by newer sessions, after which its messages no longer decrypted.
         let mut spent = false;
         if let Some(sessions) = inner.sessions.get_mut(&msg.s) {
-            for session in sessions.iter_mut() {
-                match session.decrypt(&olm) {
-                    Ok(plaintext) => return Ok(Decrypted { sender_curve25519: msg.s, plaintext, new_session: false }),
+            for i in 0..sessions.len() {
+                match sessions[i].decrypt(&olm) {
+                    Ok(plaintext) => {
+                        if i != 0 {
+                            let used = sessions.remove(i);
+                            sessions.insert(0, used);
+                        }
+                        return Ok(Decrypted { sender_curve25519: msg.s, plaintext, new_session: false });
+                    }
                     Err(DecryptionError::MissingMessageKey(_)) => spent = true,
                     Err(_) => {}
                 }
@@ -470,10 +496,20 @@ impl Identity {
                 if replayed {
                     return Err(CryptoError::Duplicate);
                 }
+                // Only an unknown one-time key means the sender holds a session this
+                // phone lost (a restored backup, a used-up key) and a new one should
+                // be asked for. Any other failure is a message that was never valid
+                // (the sender field of a sealed envelope is not authenticated), and
+                // must not make the app act on the named contact's behalf.
                 let created = inner
                     .account
                     .create_inbound_session(SessionConfig::version_2(), sender_identity, &prekey)
-                    .map_err(|e| CryptoError::DecryptFrom { sender_curve25519: msg.s.clone(), reason: e.to_string() })?;
+                    .map_err(|e| match e {
+                        SessionCreationError::MissingOneTimeKey(_) => {
+                            CryptoError::DecryptFrom { sender_curve25519: msg.s.clone(), reason: e.to_string() }
+                        }
+                        other => CryptoError::Decrypt { reason: other.to_string() },
+                    })?;
                 push_session(&mut inner.sessions, msg.s.clone(), created.session);
                 inner.used_prekeys.push_back(session_id);
                 while inner.used_prekeys.len() > MAX_USED_PREKEYS {
@@ -699,6 +735,46 @@ mod tests {
         // Survives a pickle round trip too.
         let bob2 = Identity::restore(bob.pickle(key.clone()).unwrap(), key).unwrap();
         assert!(matches!(bob2.decrypt(env), Err(CryptoError::Duplicate)));
+    }
+
+    #[test]
+    fn crossed_sessions_converge_and_survive_newer_sessions() {
+        let alice = Identity::create();
+        let bob = Identity::create();
+        // Both start a session at the same moment, so each holds two.
+        alice.start_session(peer_keys(&bob), bob.public_bundle().fallback.unwrap()).unwrap();
+        bob.start_session(peer_keys(&alice), alice.public_bundle().fallback.unwrap()).unwrap();
+        let a1 = alice.encrypt(peer_keys(&bob), b"a1".to_vec()).unwrap();
+        let b1 = bob.encrypt(peer_keys(&alice), b"b1".to_vec()).unwrap();
+        bob.decrypt(a1).unwrap();
+        alice.decrypt(b1).unwrap();
+        // Alice now answers on Bob's session; Bob moves it to the front and
+        // answers on it too, so from here on both use one session.
+        let a2 = alice.encrypt(peer_keys(&bob), b"a2".to_vec()).unwrap();
+        assert_eq!(bob.decrypt(a2).unwrap().plaintext, b"a2");
+        let b2 = bob.encrypt(peer_keys(&alice), b"b2".to_vec()).unwrap();
+        assert_eq!(alice.decrypt(b2).unwrap().plaintext, b"b2");
+        // Newer sessions on Bob's side (resyncs, say) must not push out the one
+        // Alice is still sending on.
+        for _ in 0..(MAX_SESSIONS_PER_PEER - 1) {
+            bob.start_session(peer_keys(&alice), alice.public_bundle().fallback.unwrap()).unwrap();
+        }
+        let a3 = alice.encrypt(peer_keys(&bob), b"a3".to_vec()).unwrap();
+        assert_eq!(bob.decrypt(a3).unwrap().plaintext, b"a3");
+    }
+
+    #[test]
+    fn pruning_keeps_only_the_listed_peers() {
+        let alice = Identity::create();
+        let bob = Identity::create();
+        let mallory = Identity::create();
+        for sender in [&alice, &mallory] {
+            sender.start_session(peer_keys(&bob), bob.public_bundle().fallback.unwrap()).unwrap();
+            bob.decrypt(sender.encrypt(peer_keys(&bob), b"hi".to_vec()).unwrap()).unwrap();
+        }
+        assert_eq!(bob.prune_sessions(vec![alice.curve25519()]), 1);
+        assert!(bob.has_session(alice.curve25519()));
+        assert!(!bob.has_session(mallory.curve25519()));
     }
 
     #[test]

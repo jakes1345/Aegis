@@ -80,6 +80,9 @@ object CommsRepository {
     private val outboxLock = Mutex()
     private val receiptsLock = Mutex()
     private val keysLock = Mutex()
+    /** When keys were last topped up from the live connection; see [replenishKeysInBackground]. */
+    @Volatile
+    private var lastReplenishAt = 0L
     private var retryJob: Job? = null
     @Volatile private var retryBackoffMs = RETRY_MIN_MS
     private const val RETRY_MIN_MS = 5_000L
@@ -88,6 +91,9 @@ object CommsRepository {
     private const val MAX_INBOX_PAGES = 25
     private const val ONE_TIME_KEYS_MAX_WAITING = 100
     private const val FALLBACK_ROTATE_MS = 7L * 24 * 3600_000L
+    private const val REPLENISH_INTERVAL_MS = 3600_000L
+    /** How far back unconfirmed messages are sent again when a contact asks for a new session. */
+    private const val RESEND_WINDOW_MS = 7L * 24 * 3600_000L
 
     @Volatile
     private var initialised = false
@@ -121,6 +127,7 @@ object CommsRepository {
         identities = IdentityStore(appContext)
         store = CommsStore(appContext)
         relay = RelayClient({ identities.get() }, { config.relayUrl }, { config.number })
+        LiveLink.init(appContext)
         CallManager.init(appContext)
         // Identities registered before the background connection became the default
         // kept it off, so calls to them could only ring while Aegis was on screen.
@@ -135,6 +142,25 @@ object CommsRepository {
         scope.launch { refreshUnread() }
         if (config.isRegistered && config.online) CommsService.start(appContext)
         watchNetwork()
+        if (config.isRegistered) scope.launch { pruneSessions() }
+    }
+
+    /**
+     * Drops Olm sessions with anyone who is not a contact. A pre-key message
+     * creates a session before the app knows who sent it, and sessions from
+     * senders that were rejected used to stay in the saved state for good,
+     * making every save slower. Payloads still waiting for their sender to be
+     * confirmed keep theirs.
+     */
+    private suspend fun pruneSessions() {
+        runCatching {
+            lock.withLock {
+                if (!identities.exists()) return@withLock
+                val keep = store.contacts().map { it.curve25519 } + store.pending().map { it.senderCurve25519 }
+                val dropped = identities.update { it.pruneSessions(keep) }
+                if (dropped > 0u) CommsLog.add("Removed sessions with $dropped sender(s) who are not contacts")
+            }
+        }.onFailure { CommsLog.add("Could not tidy sessions: ${it.message}") }
     }
 
     /**
@@ -197,7 +223,15 @@ object CommsRepository {
      */
     fun onAppVisible(visible: Boolean) {
         if (!initialised) return
-        if (visible) LiveLink.hold(HOLD_FOREGROUND) else LiveLink.release(HOLD_FOREGROUND)
+        if (visible) {
+            LiveLink.hold(HOLD_FOREGROUND)
+            // The background service may have been refused at process start (a
+            // push wake, say) or stopped by Android since. The app on screen may
+            // always start it, and starting it again is harmless.
+            if (config.isRegistered && config.online) CommsService.start(appContext)
+        } else {
+            LiveLink.release(HOLD_FOREGROUND)
+        }
     }
 
     // ── Registration ──────────────────────────────────────────────────────
@@ -761,7 +795,14 @@ object CommsRepository {
         return try {
             when (val resolved = resolveSender(p.senderCurve25519, json)) {
                 is Resolution.Found -> { processPayload(resolved.contact, p.ts, json); store.deletePending(p.id); true }
-                is Resolution.Rejected -> { CommsLog.add("Envelope ${shortId(p.id)} rejected: ${resolved.reason}"); store.deletePending(p.id); true }
+                is Resolution.Rejected -> {
+                    CommsLog.add("Envelope ${shortId(p.id)} rejected: ${resolved.reason}")
+                    // Its pre-key message created a session for a sender who is not
+                    // a contact; nothing will ever be sent on it.
+                    if (store.contactByCurve(p.senderCurve25519) == null) identities.update { it.dropSessions(p.senderCurve25519) }
+                    store.deletePending(p.id)
+                    true
+                }
                 Resolution.Unreachable -> { CommsLog.add("Relay unreachable while confirming who sent ${shortId(p.id)}; holding it"); false }
             }
         } catch (e: IllegalStateException) {
@@ -852,7 +893,18 @@ object CommsRepository {
             CommsWire.T_RESYNC -> {
                 // Their pre-key message has already created a fresh session on our
                 // side, first in the list; everything to them from now on uses it.
-                CommsLog.add("${contact.name.ifBlank { formatAegisNumber(contact.number) }} could not read something from this phone and started a new session")
+                // Whatever they could not read is gone from the relay, so messages
+                // they never confirmed go again (they drop ids they already have),
+                // and so does the setup of a call with them.
+                val resent = store.requeueUndelivered(contact.number, System.currentTimeMillis() - RESEND_WINDOW_MS)
+                CommsLog.add(
+                    "${contact.name.ifBlank { formatAegisNumber(contact.number) }} could not read something from this phone and started a new session" +
+                        if (resent > 0) "; sending $resent message(s) again" else ""
+                )
+                if (resent > 0) bump()
+                // After the caller releases the lock.
+                scope.launch { flushOutbox() }
+                CallManager.onPeerResync(contact)
             }
             CommsWire.T_CALL -> CallManager.onSignal(contact, json, envelopeTs)
             else -> CommsLog.add("Payload of type \"${CommsWire.type(json)}\" from ${formatAegisNumber(contact.number)} not understood; ignored")
@@ -955,6 +1007,24 @@ object CommsRepository {
     fun syncInBackground() {
         if (!initialised || !config.isRegistered) return
         scope.launch { sync() }
+    }
+
+    /**
+     * Tops up one-time keys from the live connection, at most hourly. A phone
+     * kept online by the background service rarely runs a full sync, and its
+     * keys on the relay drained until every new session used the fallback key.
+     */
+    fun replenishKeysInBackground() {
+        if (!initialised || !config.isRegistered) return
+        val now = System.currentTimeMillis()
+        if (now - lastReplenishAt < REPLENISH_INTERVAL_MS) return
+        lastReplenishAt = now
+        scope.launch {
+            runCatching { replenishKeys() }.onFailure {
+                lastReplenishAt = 0L
+                CommsLog.add("Could not top up keys on the relay: ${it.message}")
+            }
+        }
     }
 
     /**

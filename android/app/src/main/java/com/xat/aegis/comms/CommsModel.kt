@@ -67,6 +67,8 @@ data class ActiveCall(
     val speaker: Boolean = false,
     /** True once the media path is through a TURN relay rather than direct. */
     val relayed: Boolean = false,
+    /** An outgoing call the other phone has reported ringing. */
+    val ringing: Boolean = false,
     /** Why the call ended, once it has. */
     val endReason: String? = null
 )

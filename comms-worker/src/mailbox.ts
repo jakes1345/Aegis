@@ -71,6 +71,13 @@ const MAX_CLAIMED_IDS = 2_000;
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
 /** How long a live socket has to ack an envelope before the owner is also woken by push. */
 const UNACKED_WAKE_MS = 8_000;
+/**
+ * A connected phone hears from the relay at least this often. The heartbeat
+ * keeps carrier NAT from forgetting an idle connection, and briefly wakes a
+ * sleeping phone, which lets it notice a connection that has died; the app
+ * reconnects when it has heard nothing for a few heartbeats.
+ */
+const HEARTBEAT_MS = 120_000;
 /** Durable Object storage deletes at most this many keys per call. */
 const DELETE_BATCH = 128;
 
@@ -303,12 +310,18 @@ export class Mailbox extends DurableObject<Env> {
     if (status === 404 || status === 410) await this.ctx.storage.delete("push");
   }
 
-  /** Sets the alarm for whichever comes first: the unacked-delivery check or the daily cleanup. */
-  private async scheduleAlarm(): Promise<void> {
+  /**
+   * Sets the alarm for whichever comes first: the unacked-delivery check, the
+   * next heartbeat while a phone is connected, or the daily cleanup.
+   */
+  private async scheduleAlarm(rearm = false): Promise<void> {
     const cleanupAt = (await this.ctx.storage.get<number>("cleanupAt")) ?? Date.now() + CLEANUP_INTERVAL_MS;
     const check = await this.ctx.storage.get<WakeCheck>("wakeCheck");
-    const next = check ? Math.min(cleanupAt, check.due) : cleanupAt;
-    const current = await this.ctx.storage.getAlarm();
+    let next = check ? Math.min(cleanupAt, check.due) : cleanupAt;
+    if (this.ctx.getWebSockets().length > 0) next = Math.min(next, Date.now() + HEARTBEAT_MS);
+    // From inside alarm() the alarm being handled may still read as set, so the
+    // handler re-arms outright; anyone else only ever brings the alarm forward.
+    const current = rearm ? null : await this.ctx.storage.getAlarm();
     if (current === null || current > next) await this.ctx.storage.setAlarm(next);
   }
 
@@ -329,11 +342,19 @@ export class Mailbox extends DurableObject<Env> {
   }
 
   /**
-   * Two jobs share the object's one alarm: waking a phone that did not ack a
-   * live delivery in time, and the daily drop of envelopes past their TTL.
+   * Three jobs share the object's one alarm: the heartbeat to a connected
+   * phone, waking a phone that did not ack a live delivery in time, and the
+   * daily drop of envelopes past their TTL.
    */
   override async alarm(): Promise<void> {
     const now = Date.now();
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send(JSON.stringify({ type: "hb", ts: now }));
+      } catch {
+        // a dead socket; the phone reconnects when it notices
+      }
+    }
     try {
       const check = await this.ctx.storage.get<WakeCheck>("wakeCheck");
       if (check && check.due <= now) {
@@ -350,7 +371,7 @@ export class Mailbox extends DurableObject<Env> {
       await this.cleanup();
       await this.ctx.storage.put("cleanupAt", now + CLEANUP_INTERVAL_MS);
     }
-    if (await this.ctx.storage.get("profile")) await this.scheduleAlarm();
+    if (await this.ctx.storage.get("profile")) await this.scheduleAlarm(true);
   }
 
   /** Drops envelopes older than the TTL. */
@@ -404,6 +425,7 @@ export class Mailbox extends DurableObject<Env> {
     const pending = await this.inbox();
     for (const envelope of pending) server.send(JSON.stringify({ type: "envelope", envelope }));
     server.send(JSON.stringify({ type: "ready", pending: pending.length, more: pending.length >= 200 }));
+    await this.scheduleAlarm();
     return new Response(null, { status: 101, webSocket: client });
   }
 

@@ -10,6 +10,7 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.Ringtone
 import android.media.RingtoneManager
+import android.media.ToneGenerator
 import android.os.Build
 import android.os.PowerManager
 import android.os.VibrationAttributes
@@ -23,6 +24,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -62,6 +64,7 @@ import kotlin.coroutines.resumeWithException
  *
  * Wire format (inside an envelope, `t` = "call"):
  *   {"ck":"offer","cid":uuid,"ts":ms,"sdp":text}
+ *   {"ck":"ringing","cid":uuid}   (the callee's phone is ringing)
  *   {"ck":"answer","cid":uuid,"sdp":text}
  *   {"ck":"ice","cid":uuid,"cands":[{"m":sdpMid,"i":mLineIndex,"c":candidate}]}
  *   {"ck":"end","cid":uuid,"reason":"hangup"|"cancel"|"reject"|"busy"}
@@ -143,6 +146,8 @@ object CallManager {
     private var timeout: Job? = null
     private var restartJob: Job? = null
     private var ringer: Ringer? = null
+    private var ringWake: PowerManager.WakeLock? = null
+    private var ringback: Ringback? = null
     private var audio: CallAudio? = null
     private var audioCallId: String? = null
 
@@ -156,17 +161,50 @@ object CallManager {
     /** Places a call to [contact]. Needs the microphone permission already granted. */
     fun place(contact: Contact) { serial.launch { placeLocked(contact) } }
 
-    /** Answers the ringing call. Needs the microphone permission already granted. */
-    fun accept() { serial.launch { acceptLocked() } }
+    /**
+     * Answers the ringing call, or only the call [callId] when given (a screen
+     * opened for one call must not answer another that replaced it). Needs the
+     * microphone permission already granted.
+     */
+    fun accept(callId: String? = null) { serial.launch { acceptLocked(callId) } }
 
     fun reject() { serial.launch { endLocked("declined", signal = CommsWire.END_REJECT) } }
 
-    fun hangUp() {
-        serial.launch {
-            val c = _call.value ?: return@launch
-            if (c.phase == CallPhase.DIALING) endLocked("cancelled", signal = CommsWire.END_CANCEL)
-            else endLocked("ended", signal = CommsWire.END_HANGUP)
-        }
+    fun hangUp() { serial.launch { hangUpLocked(null) } }
+
+    private suspend fun hangUpLocked(callId: String?) {
+        val c = _call.value ?: return
+        if (c.phase == CallPhase.ENDED || (callId != null && c.id != callId)) return
+        if (c.phase == CallPhase.DIALING) endLocked("cancelled", signal = CommsWire.END_CANCEL)
+        else endLocked("ended", signal = CommsWire.END_HANGUP)
+    }
+
+    /**
+     * Decline from the ringing notification. The receiver waits for this, so
+     * the reject is on its way before Android may freeze the process. If the
+     * process that rang has been killed since, there is no call in memory any
+     * more; the caller is still told, from the call id and number the
+     * notification carries, instead of ringing out.
+     */
+    suspend fun declineFromNotification(callId: String?, peerNumber: String?) {
+        serial.async {
+            val c = _call.value
+            if (c != null && c.phase == CallPhase.INCOMING && (callId == null || c.id == callId)) {
+                endLocked("declined", signal = CommsWire.END_REJECT)
+                return@async
+            }
+            if (callId == null || peerNumber == null || callId in endedCallIds || c?.id == callId) return@async
+            rememberEnded(callId)
+            val contact = withContext(Dispatchers.IO) { CommsRepository.contact(peerNumber) } ?: return@async
+            CommsLog.add("Declined ${label(contact)}'s call from its notification")
+            CommsRepository.sendCallSignal(contact, CommsWire.callEnd(callId, CommsWire.END_REJECT))
+            CommsRepository.logCall(contact, Direction.IN, "Call · declined", unread = false)
+        }.await()
+    }
+
+    /** Hang up from the ongoing-call notification; waits until the end signal has gone. */
+    suspend fun hangUpFromNotification(callId: String?) {
+        serial.async { hangUpLocked(callId) }.await()
     }
 
     fun toggleMute() {
@@ -184,6 +222,30 @@ object CallManager {
             val speaker = !c.speaker
             audio?.setSpeaker(speaker)
             _call.value = c.copy(speaker = speaker)
+        }
+    }
+
+    /**
+     * [contact] could not read something from this phone and started a new
+     * session. If a call with them is being set up, what they may have missed
+     * (the offer, the answer, the ringing notice) goes again on the new session;
+     * each is ignored by the other phone if it did arrive after all.
+     */
+    fun onPeerResync(contact: Contact) {
+        serial.launch {
+            val c = _call.value ?: return@launch
+            if (c.peer.number != contact.number || c.phase == CallPhase.ENDED) return@launch
+            val local = media?.takeIf { it.callId == c.id }?.pc?.localDescription
+            val payload = when {
+                c.direction == Direction.OUT && c.phase == CallPhase.DIALING && local != null ->
+                    CommsWire.callOffer(c.id, CommsRepository.relayNow(), local.description)
+                c.direction == Direction.IN && c.phase == CallPhase.CONNECTING && local != null ->
+                    CommsWire.callAnswer(c.id, local.description)
+                c.direction == Direction.IN && c.phase == CallPhase.INCOMING -> CommsWire.callRinging(c.id)
+                else -> null
+            } ?: return@launch
+            CommsLog.add("Sending the call setup to ${label(contact)} again on the new session")
+            CommsRepository.sendCallSignal(contact, payload)
         }
     }
 
@@ -226,7 +288,9 @@ object CallManager {
             if (!stillLive(id)) return
             val failure = CommsRepository.sendCallSignal(contact, CommsWire.callOffer(id, CommsRepository.relayNow(), offer.description))
             if (!stillLive(id)) return
-            if (failure != null) { endLocked(failure, signal = null); return }
+            // A failed send may still have reached the relay (the connection broke
+            // after the request went out), so the cancel is sent regardless.
+            if (failure != null) { endLocked(failure, signal = CommsWire.END_CANCEL); return }
             armTimeout(RING_TIMEOUT_MS) { if (it.id == id && it.phase == CallPhase.DIALING) endLocked("no answer", signal = CommsWire.END_CANCEL) }
         } catch (e: Exception) {
             Log.w(TAG, "placing call failed", e)
@@ -234,9 +298,9 @@ object CallManager {
         }
     }
 
-    private suspend fun acceptLocked() {
+    private suspend fun acceptLocked(callId: String? = null) {
         val c = _call.value ?: return
-        if (c.phase != CallPhase.INCOMING) return
+        if (c.phase != CallPhase.INCOMING || (callId != null && c.id != callId)) return
         val offer = pendingOffer ?: run { endLocked("offer lost", signal = CommsWire.END_REJECT); return }
         stopRinging()
         CommsNotifications.cancelIncomingCall(appContext)
@@ -258,7 +322,7 @@ object CallManager {
             if (!stillLive(c.id)) return
             val failure = CommsRepository.sendCallSignal(c.peer, CommsWire.callAnswer(c.id, answer.description))
             if (!stillLive(c.id)) return
-            if (failure != null) { endLocked(failure, signal = null); return }
+            if (failure != null) { endLocked(failure, signal = CommsWire.END_HANGUP); return }
             armTimeout(CONNECT_TIMEOUT_MS) { if (it.id == c.id && it.phase == CallPhase.CONNECTING) endLocked("could not connect", signal = CommsWire.END_HANGUP) }
         } catch (e: Exception) {
             Log.w(TAG, "accepting call failed", e)
@@ -276,6 +340,14 @@ object CallManager {
         }
         when (kind) {
             CommsWire.CALL_OFFER -> onOffer(contact, cid, json, envelopeTs)
+            CommsWire.CALL_RINGING -> {
+                val current = _call.value
+                if (current == null || current.id != cid || current.direction != Direction.OUT) return
+                if (current.phase != CallPhase.DIALING || current.ringing) return
+                CommsLog.add("${label(contact)}'s phone is ringing")
+                _call.value = current.copy(ringing = true)
+                startRingback()
+            }
             CommsWire.CALL_ANSWER -> {
                 val current = _call.value
                 if (current == null || current.id != cid || current.phase == CallPhase.ENDED || current.phase == CallPhase.INCOMING) return
@@ -285,6 +357,7 @@ object CallManager {
                 // repeated or stale answer would be rejected by WebRTC anyway.
                 if (m.pc.signalingState() != PeerConnection.SignalingState.HAVE_LOCAL_OFFER) return
                 val first = current.phase == CallPhase.DIALING
+                if (first) stopRingback()
                 try {
                     m.pc.setRemote(SessionDescription(SessionDescription.Type.ANSWER, sdp))
                     if (!stillLive(cid)) return
@@ -440,9 +513,19 @@ object CallManager {
         }
         runCatching { startRinging() }
             .onFailure { CommsLog.add("Ringtone could not play: ${it.message}") }
+        // Keep the relay socket open while ringing: a phone woken by a push
+        // would otherwise see the caller's cancel only on the next wake-up,
+        // and keep ringing for a call nobody is on.
+        CommsRepository.holdLiveLink()
         // Ring only for as long as the caller is still waiting.
         armTimeout((RING_TIMEOUT_MS - age).coerceAtLeast(MIN_RING_MS)) {
             if (it.id == cid && it.phase == CallPhase.INCOMING) endLocked("missed", signal = null, missed = true)
+        }
+        // Tell the caller it rings here, so they hear ringback rather than silence.
+        serial.launch {
+            if (_call.value?.let { it.id == cid && it.phase == CallPhase.INCOMING } == true) {
+                CommsRepository.sendCallSignal(contact, CommsWire.callRinging(cid))
+            }
         }
     }
 
@@ -682,6 +765,7 @@ object CallManager {
         pendingRemoteCandidates.clear()
         pendingOffer = null
         stopRinging()
+        stopRingback()
         CommsNotifications.cancelIncomingCall(appContext)
         media?.takeIf { it.callId == c.id }?.let { it.dispose(); media = null }
         stopAudio(c.id)
@@ -733,12 +817,30 @@ object CallManager {
     }
 
     private fun startRinging() {
+        // A phone woken by a push for this call would otherwise go back to
+        // sleep in the middle of ringing.
+        if (ringWake == null) {
+            ringWake = appContext.getSystemService(PowerManager::class.java)
+                ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "aegis:ringing")
+                ?.apply { setReferenceCounted(false); acquire(RING_TIMEOUT_MS + 5_000L) }
+        }
         if (ringer == null) ringer = Ringer(appContext).also { it.start() }
     }
 
     private fun stopRinging() {
         ringer?.stop()
         ringer = null
+        ringWake?.let { runCatching { if (it.isHeld) it.release() } }
+        ringWake = null
+    }
+
+    private fun startRingback() {
+        if (ringback == null) ringback = Ringback().also { it.start() }
+    }
+
+    private fun stopRingback() {
+        ringback?.stop()
+        ringback = null
     }
 
     fun durationText(ms: Long): String {
@@ -902,5 +1004,23 @@ private class Ringer(private val context: Context) {
         ringtone = null
         runCatching { vibrator?.cancel() }
         vibrator = null
+    }
+}
+
+/**
+ * The ringback the caller hears in the earpiece once the other phone reports
+ * ringing: the standard ringing cadence on the voice-call stream, so it
+ * follows the call's routing (earpiece, speaker or headset).
+ */
+private class Ringback {
+    private val tone = runCatching { ToneGenerator(AudioManager.STREAM_VOICE_CALL, 70) }.getOrNull()
+
+    fun start() {
+        runCatching { tone?.startTone(ToneGenerator.TONE_SUP_RINGTONE) }
+    }
+
+    fun stop() {
+        runCatching { tone?.stopTone() }
+        runCatching { tone?.release() }
     }
 }

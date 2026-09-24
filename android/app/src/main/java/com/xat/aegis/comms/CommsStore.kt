@@ -211,6 +211,21 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             out
         }
 
+    /**
+     * Puts messages to [peer] that the relay took but [peer] never confirmed
+     * back in the send queue; returns how many. Used when [peer] reports it
+     * could not read something from this phone: whatever that was is gone from
+     * the relay, and resending is safe because the receiver drops a message
+     * id it already has.
+     */
+    fun requeueUndelivered(peer: String, sinceTs: Long): Int {
+        val values = ContentValues().apply { put("status", "queued"); putNull("error") }
+        return writableDatabase.update(
+            "messages", values,
+            "peer = ? AND direction = 'OUT' AND status = 'sent' AND ts > ?", arrayOf(peer, sinceTs.toString())
+        )
+    }
+
     /** Outbound messages still waiting to be sent, oldest first. */
     fun queued(): List<ChatMessage> =
         readableDatabase.query("messages", null, "direction = 'OUT' AND status = 'queued'", null, null, null, "ts ASC").use { c ->

@@ -38,6 +38,10 @@ class CommsPushReceiver : PushService() {
         // a slow network does not leave a half-fetched inbox behind.
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         val lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "aegis:comms-sync").apply { acquire(SYNC_BUDGET_MS) }
+        // A wake means the background connection is not there. Android allows the
+        // restart from here when Aegis is exempt from battery optimisation or the
+        // distributor raised it to the foreground; otherwise the app does it on open.
+        if (CommsRepository.state.value.online) CommsService.start(applicationContext)
         scope.launch {
             try {
                 if (!CommsService.syncWithin(SYNC_BUDGET_MS - 2_000L)) Log.w(TAG, "push-triggered sync did not finish in time")

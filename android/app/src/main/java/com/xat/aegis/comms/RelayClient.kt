@@ -1,5 +1,6 @@
 package com.xat.aegis.comms
 
+import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -37,6 +38,25 @@ class RelayClient(
     private val number: () -> String?,
 ) {
 
+    /** What a signed request signs. The signature headers themselves are added per attempt by [signer]. */
+    private class Signing(val method: String, val pathAndQuery: String, val bodyText: String)
+
+    /**
+     * Signs every network attempt afresh. OkHttp retries a request on a new
+     * connection when the first one broke (a stale pooled connection, a
+     * network switch mid-request). The relay accepts each nonce once, so a
+     * retry that reused the first attempt's signature was refused with 401,
+     * and a call offer that had in fact been delivered was reported as failed.
+     * With a fresh nonce the retry goes through; a duplicate envelope is
+     * dropped by the receiving phone, and duplicate keys by the relay.
+     */
+    private val signer = Interceptor { chain ->
+        val request = chain.request()
+        val signing = request.tag(Signing::class.java) ?: return@Interceptor chain.proceed(request)
+        chain.proceed(sign(request.newBuilder(), signing).build())
+    }
+
+    /** The live socket's client: no overall call timeout, which would cut the socket itself. */
     val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
@@ -46,7 +66,17 @@ class RelayClient(
         // the enrollment secret; neither may be re-sent to wherever a redirect points.
         .followRedirects(false)
         .followSslRedirects(false)
+        .addNetworkInterceptor(signer)
         .build()
+
+    /**
+     * Requests: bounded as a whole, so one stalled request (Wi-Fi that lost
+     * its internet, say) cannot hold up everything queued behind it.
+     */
+    private val rest: OkHttpClient by lazy { http.newBuilder().pingInterval(0, TimeUnit.SECONDS).callTimeout(25, TimeUnit.SECONDS).build() }
+
+    /** Sending an envelope: a call's signals must fail fast enough to be retried within the call. */
+    private val sender: OkHttpClient by lazy { rest.newBuilder().callTimeout(12, TimeUnit.SECONDS).build() }
 
     data class Registered(val number: String)
 
@@ -143,7 +173,7 @@ class RelayClient(
 
     fun send(to: String, envelope: ByteArray): String {
         val body = JSONObject().put("to", to).put("envelope", Base64.getEncoder().encodeToString(envelope))
-        val json = signed("POST", "/v1/send", body)
+        val json = execute(signedRequest("POST", "/v1/send", body), sender)
         return parsed { json.getString("id") }
     }
 
@@ -168,7 +198,7 @@ class RelayClient(
     private var lastIceServers: Pair<Long, List<IceServer>>? = null
 
     /** A client that gives up quickly: a call should not wait 15 s on a slow relay for its server list. */
-    private val quick: OkHttpClient by lazy { http.newBuilder().callTimeout(4, TimeUnit.SECONDS).build() }
+    private val quick: OkHttpClient by lazy { rest.newBuilder().callTimeout(4, TimeUnit.SECONDS).build() }
 
     /**
      * ICE servers for a call: STUN always, TURN with short-lived credentials when
@@ -197,8 +227,11 @@ class RelayClient(
 
     /** Opens the live-delivery socket. The caller owns the returned socket. */
     fun openSocket(listener: WebSocketListener): WebSocket {
-        val request = signedRequest("GET", "/v1/ws", null).build()
-        return http.newWebSocket(request, listener)
+        // OkHttp runs no network interceptors for a WebSocket upgrade, so it is
+        // signed here, once; a refused upgrade is retried by the caller.
+        val builder = signedRequest("GET", "/v1/ws", null)
+        val signing = builder.build().tag(Signing::class.java) ?: throw RelayException("Not registered with a relay")
+        return http.newWebSocket(sign(builder, signing).build(), listener)
     }
 
     fun parseEnvelope(o: JSONObject): Envelope = parsed {
@@ -226,21 +259,13 @@ class RelayClient(
     private fun signedRequest(method: String, pathAndQuery: String, body: JSONObject?): Request.Builder {
         val relay = relayUrl() ?: throw RelayException("Not registered with a relay")
         val number = number() ?: throw RelayException("Not registered with a relay")
-        val identity = identity() ?: throw RelayException("No identity on this device")
+        if (identity() == null) throw RelayException("No identity on this device")
         val bodyText = body?.toString() ?: ""
-        // The relay rejects a timestamp more than five minutes from its own clock,
-        // so a phone whose clock is off signs with the relay's time once it knows it.
-        val ts = relayNow()
-        val nonce = ByteArray(18).also { SecureRandom().nextBytes(it) }
-            .let { Base64.getUrlEncoder().withoutPadding().encodeToString(it) }
-        val payload = "$number\n$ts\n$nonce\n${method.uppercase()}\n$pathAndQuery\n${sha256Hex(bodyText)}"
         val builder = Request.Builder()
             .url(relay + pathAndQuery)
             .header("X-Aegis-Number", number)
-            .header("X-Aegis-Ts", ts.toString())
-            .header("X-Aegis-Nonce", nonce)
-            .header("X-Aegis-Sig", identity.sign(payload.toByteArray(Charsets.UTF_8)))
             .header("Accept", "application/json")
+            .tag(Signing::class.java, Signing(method.uppercase(), pathAndQuery, bodyText))
         when (method.uppercase()) {
             "GET" -> builder.get()
             "DELETE" -> builder.delete()
@@ -250,7 +275,24 @@ class RelayClient(
         return builder
     }
 
-    private fun execute(builder: Request.Builder, client: OkHttpClient = http): JSONObject {
+    /** Adds the signature headers for one attempt: a fresh nonce and the relay's current time. */
+    private fun sign(builder: Request.Builder, s: Signing): Request.Builder {
+        val number = number() ?: throw RelayException("Not registered with a relay")
+        val identity = identity() ?: throw RelayException("No identity on this device")
+        // The relay rejects a timestamp more than five minutes from its own clock,
+        // so a phone whose clock is off signs with the relay's time once it knows it.
+        val ts = relayNow()
+        val nonce = ByteArray(18).also { SecureRandom().nextBytes(it) }
+            .let { Base64.getUrlEncoder().withoutPadding().encodeToString(it) }
+        val payload = "$number\n$ts\n$nonce\n${s.method}\n${s.pathAndQuery}\n${sha256Hex(s.bodyText)}"
+        return builder
+            .header("X-Aegis-Number", number)
+            .header("X-Aegis-Ts", ts.toString())
+            .header("X-Aegis-Nonce", nonce)
+            .header("X-Aegis-Sig", identity.sign(payload.toByteArray(Charsets.UTF_8)))
+    }
+
+    private fun execute(builder: Request.Builder, client: OkHttpClient = rest): JSONObject {
         // Every network failure, including one while reading the response body
         // (a network switch mid-request), surfaces as a RelayException with code
         // 0, which callers treat as "offline, retry later".
@@ -286,16 +328,22 @@ class RelayClient(
      */
     fun relayNow(): Long = System.currentTimeMillis() + clockOffsetMs
 
-    /** Records the relay's clock from [response]; called for every HTTP and socket response. */
-    fun noteServerTime(response: Response) {
-        val server = response.headers.getDate("Date")?.time ?: return
+    /**
+     * Records the relay's clock from [response]; called for every HTTP and
+     * socket response. Returns true when that moved this phone's idea of the
+     * relay's time by more than half a minute.
+     */
+    fun noteServerTime(response: Response): Boolean {
+        val server = response.headers.getDate("Date")?.time ?: return false
         // The header has one-second resolution; half a second centres the error.
         val offset = server + 500L - System.currentTimeMillis()
         val previous = clockOffsetMs
         clockOffsetMs = offset
-        if (kotlin.math.abs(offset) > CLOCK_WARN_MS && kotlin.math.abs(offset - previous) > CLOCK_WARN_MS) {
+        val moved = kotlin.math.abs(offset - previous) > CLOCK_WARN_MS
+        if (kotlin.math.abs(offset) > CLOCK_WARN_MS && moved) {
             CommsLog.add("This phone's clock is ${offset / 1000}s off the relay's; using the relay's time")
         }
+        return moved
     }
 
     private fun signedKeyJson(k: SignedKey) = JSONObject().put("id", k.id).put("key", k.key).put("signature", k.signature)

@@ -22,8 +22,9 @@ import org.json.JSONObject
  *   msg      "id", "ts", "body"
  *   receipt  "status" ("delivered" | "read"), "ids": [message ids]
  *   resync   nothing more; its pre-key envelope starts a fresh session
- *   call     "ck": offer | answer | ice | reoffer | end, "cid": call id, and
+ *   call     "ck": offer | ringing | answer | ice | reoffer | end, "cid": call id, and
  *            offer "ts", "sdp" · answer "sdp" · reoffer "sdp" · ice "cands": [{"m","i","c"}] · end "reason"
+ *            (ringing carries nothing more: the callee's phone is ringing)
  *
  * Pure Kotlin and org.json, so the JVM tests use exactly this code.
  */
@@ -69,6 +70,8 @@ object CommsWire {
     const val CALL_ANSWER = "answer"
     const val CALL_ICE = "ice"
     const val CALL_END = "end"
+    /** Sent by the callee once its phone rings, so the caller hears ringback instead of silence. */
+    const val CALL_RINGING = "ringing"
     /** A fresh offer for a call already under way (ICE restart after a network change); answered with "answer". */
     const val CALL_REOFFER = "reoffer"
     const val END_HANGUP = "hangup"
@@ -109,6 +112,8 @@ object CommsWire {
     private fun call(kind: String, cid: String) = base(T_CALL).put(F_CALL_KIND, kind).put(F_CALL_ID, cid)
 
     fun callOffer(cid: String, ts: Long, sdp: String): JSONObject = call(CALL_OFFER, cid).put(F_TS, ts).put(F_SDP, sdp)
+
+    fun callRinging(cid: String): JSONObject = call(CALL_RINGING, cid)
 
     fun callAnswer(cid: String, sdp: String): JSONObject = call(CALL_ANSWER, cid).put(F_SDP, sdp)
 
