@@ -18,7 +18,7 @@ export function json(body: unknown, status = 200): Response {
 }
 
 export class HttpError extends Error {
-  constructor(public readonly status: number, message: string) {
+  constructor(public readonly status: number, message: string, public readonly retryAfter?: number) {
     super(message);
   }
 }
@@ -28,6 +28,8 @@ export function requireSecret(env: Env, name: "ENROLL_SECRET"): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new HttpError(503, `Relay secret ${name} is not configured`);
   }
+  // It is typed into each phone once; short ones could be guessed.
+  if (value.length < 16) throw new HttpError(503, `Relay secret ${name} is too short (16 characters at least)`);
   return value;
 }
 

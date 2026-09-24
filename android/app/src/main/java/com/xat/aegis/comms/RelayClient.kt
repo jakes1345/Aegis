@@ -128,6 +128,19 @@ class RelayClient(
         }
     }
 
+    /** A contact's public identity keys, without the one-time key a bundle claims. */
+    data class IdentityKeys(val number: String, val ed25519: String, val curve25519: String, val sealing: String, val signature: String)
+
+    /** Who holds [number] (unlisted numbers need their key's [pin]); claims none of their keys. */
+    fun identity(number: String, pin: String?): IdentityKeys {
+        val path = "/v1/identity/$number" + (pin?.let { "?pin=$it" } ?: "")
+        val json = signed("GET", path)
+        return parsed {
+            val o = json.getJSONObject("identity")
+            IdentityKeys(o.getString("number"), o.getString("ed25519"), o.getString("curve25519"), o.getString("sealing"), o.getString("signature"))
+        }
+    }
+
     fun send(to: String, envelope: ByteArray): String {
         val body = JSONObject().put("to", to).put("envelope", Base64.getEncoder().encodeToString(envelope))
         val json = signed("POST", "/v1/send", body)

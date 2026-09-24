@@ -886,7 +886,8 @@ object CommsRepository {
             return Resolution.Rejected("keys claimed by ${formatAegisNumber(from)} are not signed")
         }
         val relayView = try {
-            relay.bundle(from, fingerprint(ed))
+            // The identity lookup claims none of their one-time keys.
+            relay.identity(from, fingerprint(ed))
         } catch (e: RelayException) {
             // 404 means the relay has no such number, or the pin (their identity key)
             // does not match it: the claim is false. Anything else is the relay's problem.

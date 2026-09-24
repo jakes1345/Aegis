@@ -277,6 +277,33 @@ class RelayRoundTripTest {
     }
 
     @Test
+    fun identityLookupConfirmsKeysWithoutUsingAOneTimeKey() {
+        val before = bob.relay.me().oneTimeKeys
+        val id = alice.relay.identity(bob.number!!, fingerprint(bob.keys.ed25519))
+        assertEquals(bob.keys.curve25519, id.curve25519)
+        assertEquals(bob.keys.ed25519, id.ed25519)
+        assertEquals(before, bob.relay.me().oneTimeKeys)
+        // Unlisted, so a lookup without the pin is refused.
+        try {
+            alice.relay.identity(bob.number!!, null)
+            fail("an unlisted identity was handed out without its pin")
+        } catch (e: RelayException) {
+            assertEquals(404, e.code)
+        }
+    }
+
+    @Test
+    fun aClaimedOneTimeKeyIsNeverOfferedAgain() {
+        // Take one key, then try to publish it again: the relay must refuse to re-add it.
+        val bundle = alice.relay.bundle(bob.number!!, fingerprint(bob.keys.ed25519))
+        val after = bob.relay.me().oneTimeKeys
+        val again = bob.identity.publicBundle().let {
+            uniffi.aegis_comms_crypto.PublicBundle(it.ed25519, it.curve25519, it.sealing, it.signature, null, listOf(bundle.sessionKey))
+        }
+        assertEquals(after, bob.relay.putKeys(again))
+    }
+
+    @Test
     fun relayClockIsLearnedFromResponses() {
         alice.relay.me()
         val skew = alice.relay.relayNow() - System.currentTimeMillis()
