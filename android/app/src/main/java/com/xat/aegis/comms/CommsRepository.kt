@@ -498,11 +498,21 @@ object CommsRepository {
         }
     }
 
+    /**
+     * Adds this identity's number, name and keys to an outgoing payload. These
+     * field names are reserved in every payload type: a call signal once used
+     * "k" for its kind, which this overwrote with the identity key, so no call
+     * offer was ever recognised. A clash now fails loudly instead.
+     */
     private fun putSelf(o: JSONObject) {
         val bundle = identities.get()?.publicBundle() ?: return
+        val clash = SELF_FIELDS.filter { o.has(it) }
+        check(clash.isEmpty()) { "payload field(s) ${clash.joinToString()} are reserved for the sender's identity" }
         o.put("from", config.number).put("name", config.displayName)
             .put("k", bundle.ed25519).put("c", bundle.curve25519).put("s", bundle.sealing).put("g", bundle.signature)
     }
+
+    private val SELF_FIELDS = listOf("from", "name", "k", "c", "s", "g")
 
     /**
      * Sends a call signal (offer, answer, ICE, end) to [contact] through the
@@ -513,7 +523,7 @@ object CommsRepository {
         lock.withLock {
             payload.put("v", 1).put("t", "call")
             putSelf(payload)
-            val kind = payload.optString("k")
+            val kind = payload.optString("ck")
             when (val r = deliver(contact, payload)) {
                 Deliver.Sent -> { if (kind != "ice") CommsLog.add("Call $kind sent to ${formatAegisNumber(contact.number)}"); true }
                 is Deliver.Failed -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} failed: ${r.reason}"); false }

@@ -54,10 +54,10 @@ import kotlin.coroutines.resumeWithException
  * decrypt.
  *
  * Wire format (inside an envelope, `t` = "call"):
- *   {"k":"offer","cid":uuid,"ts":ms,"sdp":text}
- *   {"k":"answer","cid":uuid,"sdp":text}
- *   {"k":"ice","cid":uuid,"cands":[{"m":sdpMid,"i":mLineIndex,"c":candidate}]}
- *   {"k":"end","cid":uuid,"reason":"hangup"|"cancel"|"reject"|"busy"}
+ *   {"ck":"offer","cid":uuid,"ts":ms,"sdp":text}
+ *   {"ck":"answer","cid":uuid,"sdp":text}
+ *   {"ck":"ice","cid":uuid,"cands":[{"m":sdpMid,"i":mLineIndex,"c":candidate}]}
+ *   {"ck":"end","cid":uuid,"reason":"hangup"|"cancel"|"reject"|"busy"}
  *
  * All state changes run on one serial dispatcher; WebRTC callbacks and
  * repository calls hop onto it.
@@ -188,7 +188,7 @@ object CallManager {
             if (!stillLive(id)) { abandonSetup(); return }
             val sent = CommsRepository.sendCallSignal(
                 contact,
-                JSONObject().put("k", "offer").put("cid", id).put("ts", System.currentTimeMillis()).put("sdp", offer.description)
+                JSONObject().put("ck", "offer").put("cid", id).put("ts", System.currentTimeMillis()).put("sdp", offer.description)
             )
             if (!stillLive(id)) return
             if (!sent) { endLocked("could not reach the relay", signal = null); return }
@@ -222,7 +222,7 @@ object CallManager {
             if (!stillLive(c.id)) { abandonSetup(); return }
             val sent = CommsRepository.sendCallSignal(
                 c.peer,
-                JSONObject().put("k", "answer").put("cid", c.id).put("sdp", answer.description)
+                JSONObject().put("ck", "answer").put("cid", c.id).put("sdp", answer.description)
             )
             if (!stillLive(c.id)) return
             if (!sent) { endLocked("could not reach the relay", signal = null); return }
@@ -236,7 +236,7 @@ object CallManager {
     // ── Signals from the peer ─────────────────────────────────────────────
 
     private suspend fun signalLocked(contact: Contact, json: JSONObject, envelopeTs: Long) {
-        val kind = json.optString("k")
+        val kind = json.optString("ck")
         val cid = json.optString("cid").takeIf { it.isNotBlank() } ?: return
         val current = _call.value
         when (kind) {
@@ -249,7 +249,7 @@ object CallManager {
                     if (current.id != cid) {
                         // Already on a call: tell them, and note the attempt.
                         CommsLog.add("Call from ${label(contact)} while already on a call; answered busy")
-                        CommsRepository.sendCallSignal(contact, JSONObject().put("k", "end").put("cid", cid).put("reason", "busy"))
+                        CommsRepository.sendCallSignal(contact, JSONObject().put("ck", "end").put("cid", cid).put("reason", "busy"))
                         CommsRepository.logCall(contact, Direction.IN, "Missed call (busy)", unread = true)
                         CommsNotifications.missedCall(appContext, contact)
                     }
@@ -433,7 +433,7 @@ object CallManager {
         outgoingCandidates.clear()
         val cands = JSONArray()
         for (cand in batch) cands.put(JSONObject().put("m", cand.sdpMid).put("i", cand.sdpMLineIndex).put("c", cand.sdp))
-        CommsRepository.sendCallSignal(c.peer, JSONObject().put("k", "ice").put("cid", c.id).put("cands", cands))
+        CommsRepository.sendCallSignal(c.peer, JSONObject().put("ck", "ice").put("cid", c.id).put("cands", cands))
     }
 
     private fun flushPendingRemoteCandidates() {
@@ -481,7 +481,7 @@ object CallManager {
         stopAudio()
         CallService.stop(appContext)
         if (signal != null) {
-            CommsRepository.sendCallSignal(c.peer, JSONObject().put("k", "end").put("cid", c.id).put("reason", signal))
+            CommsRepository.sendCallSignal(c.peer, JSONObject().put("ck", "end").put("cid", c.id).put("reason", signal))
         }
 
         val now = System.currentTimeMillis()
