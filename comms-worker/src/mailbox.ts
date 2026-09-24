@@ -57,6 +57,8 @@ const MAX_ONE_TIME_KEYS = 100;
 const NONCE_WINDOW_MS = 5 * 60_000;
 const LOOKUP_LIMIT_PER_MINUTE = 30;
 const SEND_LIMIT_PER_MINUTE = 120;
+/** How long a live socket has to ack an envelope before the owner is also woken by push. */
+const UNACKED_WAKE_MS = 8_000;
 /** Durable Object storage deletes at most this many keys per call. */
 const DELETE_BATCH = 128;
 
@@ -214,11 +216,19 @@ export class Mailbox extends DurableObject<Env> {
         // a dead socket; the owner will fetch on reconnect
       }
     }
-    if (!delivered) {
-      const endpoint = await this.ctx.storage.get<string>("push");
-      if (endpoint) this.ctx.waitUntil(wake(endpoint));
+    const endpoint = await this.ctx.storage.get<string>("push");
+    if (endpoint) {
+      // A socket whose phone lost its network still accepts a send without
+      // error, so "delivered" only means handed over. If the phone has not
+      // acked within a few seconds, wake it through push as well.
+      this.ctx.waitUntil(delivered ? this.wakeIfUnacked(id, endpoint) : wake(endpoint));
     }
     return { ok: true, id };
+  }
+
+  private async wakeIfUnacked(id: string, endpoint: string): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, UNACKED_WAKE_MS));
+    if (await this.ctx.storage.get(`q:${id}`)) await wake(endpoint);
   }
 
   /** Every queued envelope, oldest first. */
