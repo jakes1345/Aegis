@@ -159,6 +159,12 @@ object Registry {
     fun requestThread(peer: String) { _threadRequest.value = peer }
     fun takeThreadRequest(): String? = _threadRequest.getAndUpdate { null }
 
+    /** An invite opened from a link (aegis://invite), for the COMMS tab to take. */
+    private val _inviteRequest = MutableStateFlow<String?>(null)
+    val inviteRequest: StateFlow<String?> = _inviteRequest.asStateFlow()
+    fun requestInvite(text: String) { _inviteRequest.value = text }
+    fun takeInviteRequest(): String? = _inviteRequest.getAndUpdate { null }
+
     fun reset() {
         _detections.value = emptyList()
         _status.value = ScanStatus()

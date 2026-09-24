@@ -326,6 +326,16 @@ class MainActivity : AppCompatActivity() {
      * not exported.
      */
     private fun handleOpenThreadIntent(intent: Intent?) {
+        // An invite link (the relay's invite page opens aegis://invite?c=…). It
+        // only fills in the COMMS setup or offers to add the inviter; nothing is
+        // registered or added until the owner confirms on screen.
+        val data = intent?.data
+        if (intent?.action == Intent.ACTION_VIEW && data?.scheme == "aegis" && data.host == "invite") {
+            data.getQueryParameter("c")?.let { Registry.requestInvite(it) }
+            intent.data = null
+            Registry.requestTab(CommsNotifications.COMMS_TAB_INDEX)
+            return
+        }
         if (intent == null || !intent.hasExtra(CommsNotifications.EXTRA_TAB)) return
         val tab = intent.getIntExtra(CommsNotifications.EXTRA_TAB, -1)
         val peer = intent.getStringExtra(CommsNotifications.EXTRA_PEER)
@@ -999,6 +1009,7 @@ private fun MainApp(
         if (tabRequest != null) Registry.takeTabRequest()?.let { tab = it.coerceIn(0, tabs.size - 1) }
     }
     val threadRequest by Registry.threadRequest.collectAsStateWithLifecycle()
+    val inviteRequest by Registry.inviteRequest.collectAsStateWithLifecycle()
 
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
@@ -1045,7 +1056,9 @@ private fun MainApp(
                 TAB_DEVICE -> DeviceScreen(onShown = onRefreshDeviceHealth)
                 TAB_COMMS -> CommsScreen(
                     openPeer = threadRequest,
-                    onPeerConsumed = { Registry.takeThreadRequest() }
+                    onPeerConsumed = { Registry.takeThreadRequest() },
+                    openInvite = inviteRequest,
+                    onInviteConsumed = { Registry.takeInviteRequest() }
                 )
             }
         }

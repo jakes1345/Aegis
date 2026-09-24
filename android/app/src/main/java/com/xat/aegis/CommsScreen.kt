@@ -110,6 +110,7 @@ private sealed class CommsPage {
     data class Thread(val peer: String) : CommsPage()
     data class Verify(val peer: String) : CommsPage()
     object MyCode : CommsPage()
+    object Invite : CommsPage()
     object Settings : CommsPage()
 }
 
@@ -121,10 +122,31 @@ private sealed class CommsPage {
  * consumed once.
  */
 @Composable
-fun CommsScreen(openPeer: String?, onPeerConsumed: () -> Unit) {
+fun CommsScreen(
+    openPeer: String?,
+    onPeerConsumed: () -> Unit,
+    openInvite: String? = null,
+    onInviteConsumed: () -> Unit = {}
+) {
     val state by CommsRepository.state.collectAsStateWithLifecycle()
     val activeCall by CallManager.call.collectAsStateWithLifecycle()
     var page by remember { mutableStateOf<CommsPage>(CommsPage.List) }
+    // An invite from a link: it fills in the setup screen, or, once this phone
+    // has a number, offers to add the person who sent it.
+    var invite by remember { mutableStateOf<PairingCode?>(null) }
+    var inviterToAdd by remember { mutableStateOf<PairingCode?>(null) }
+    var inviteError by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(openInvite) {
+        if (openInvite != null) {
+            val code = PairingCode.fromText(openInvite)
+            when {
+                code == null -> inviteError = "That invite link is incomplete; ask for it to be sent again."
+                state.registered -> inviterToAdd = code
+                else -> invite = code
+            }
+            onInviteConsumed()
+        }
+    }
 
     LaunchedEffect(openPeer) {
         if (openPeer != null) {
@@ -154,13 +176,17 @@ fun CommsScreen(openPeer: String?, onPeerConsumed: () -> Unit) {
     }
 
     if (!state.registered) {
-        SetupScreen()
+        SetupScreen(invite = invite, linkError = inviteError, onInvite = { invite = it; inviteError = null })
         return
+    }
+    inviterToAdd?.let { code ->
+        AddInviterDialog(code, onDone = { inviterToAdd = null }, onAdded = { page = CommsPage.Thread(it) })
     }
     when (val p = page) {
         CommsPage.List -> ThreadListScreen(
             onOpen = { page = CommsPage.Thread(it) },
             onMyCode = { page = CommsPage.MyCode },
+            onInvite = { page = CommsPage.Invite },
             onSettings = { page = CommsPage.Settings }
         )
         is CommsPage.Thread -> ThreadScreen(
@@ -174,6 +200,7 @@ fun CommsScreen(openPeer: String?, onPeerConsumed: () -> Unit) {
             onDeleted = { page = CommsPage.List }
         )
         CommsPage.MyCode -> MyCodeScreen(onBack = { page = CommsPage.List })
+        CommsPage.Invite -> InviteScreen(onBack = { page = CommsPage.List })
         CommsPage.Settings -> CommsSettingsScreen(onBack = { page = CommsPage.List })
     }
 }
@@ -345,21 +372,87 @@ private fun contactLabel(c: Contact) = c.name.ifBlank { formatAegisNumber(c.numb
 // ── Setup ────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun SetupScreen() {
+private fun SetupScreen(invite: PairingCode?, linkError: String?, onInvite: (PairingCode?) -> Unit) {
     val state by CommsRepository.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
     var url by rememberSaveable { mutableStateOf("") }
     var secret by rememberSaveable { mutableStateOf("") }
     var name by rememberSaveable { mutableStateOf("") }
     var listed by rememberSaveable { mutableStateOf(true) }
+    var inviteError by remember(linkError) { mutableStateOf(linkError) }
+    val takeInvite: (PairingCode?) -> Unit = { code ->
+        when {
+            code == null -> inviteError = "That is not an Aegis invite."
+            code.invite == null -> inviteError = "That is someone's contact code, not an invite. Ask them for an invite: COMMS → INVITE on their phone."
+            else -> { inviteError = null; onInvite(code) }
+        }
+    }
+    val scanInvite = rememberCodeScanner { takeInvite(it) }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Spacer(Modifier.height(20.dp))
         Text("COMMS", color = CInk, fontSize = 18.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
         Text("End-to-end encrypted messaging between Aegis apps, through a relay you run", color = CMuted, fontSize = 12.sp)
 
+        if (invite != null) {
+            Card {
+                Text("Join with an invite", color = CInk, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Text("Invited by", color = CMuted, fontSize = 11.sp)
+                Text(invite.name.ifBlank { formatAegisNumber(invite.number) }, color = CAccent, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text("${formatAegisNumber(invite.number)} · ${invite.relayUrl.removePrefix("https://")}", color = CInkDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                Text(
+                    "This phone makes its own keys and gets its own Aegis number on their relay. " +
+                        "${invite.name.ifBlank { "They" }} will be in your contacts, verified, with a first message telling them you joined.",
+                    color = CMuted, fontSize = 12.sp, lineHeight = 17.sp
+                )
+                OutlinedTextField(
+                    value = name, onValueChange = { name = it.take(40) },
+                    label = { Text("Your name shown to contacts (optional)", fontSize = 12.sp) },
+                    singleLine = true, modifier = Modifier.fillMaxWidth(), colors = fieldColors()
+                )
+                ToggleRow(
+                    "Listed number",
+                    if (listed) "Anyone with your number on this relay can add you." else "Unlisted: people can add you only by scanning your code. You can change this later.",
+                    listed
+                ) { listed = it }
+                state.error?.let { Text(it, color = CCritical, fontSize = 12.sp) }
+                PrimaryButton(if (state.busy) "REGISTERING…" else "REGISTER", enabled = !state.busy) {
+                    scope.launch { CommsRepository.register(invite.relayUrl, "", name, listed, invite) }
+                }
+                SmallButton("USE A RELAY URL AND SECRET INSTEAD", CMuted) { onInvite(null) }
+            }
+            Card {
+                Text("Not a phone number", color = CCaution, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text(NOT_A_PHONE, color = CMuted, fontSize = 12.sp, lineHeight = 17.sp)
+            }
+            Spacer(Modifier.height(16.dp))
+            return@Column
+        }
+
         Card {
-            Text("Get an Aegis number", color = CInk, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text("Have an invite?", color = CInk, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                "Someone already on Aegis can invite you: COMMS → INVITE on their phone. Scan the QR code it shows, " +
+                    "or copy the invite they sent you and paste it here. No relay URL or secret needed.",
+                color = CMuted, fontSize = 12.sp, lineHeight = 17.sp
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { inviteError = null; scanInvite() }, shape = CShape, border = BorderStroke(1.dp, CClear), modifier = Modifier.weight(1f)) {
+                    Text("SCAN INVITE", color = CClear, fontSize = 12.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold)
+                }
+                OutlinedButton(
+                    onClick = { takeInvite(clipboard.getText()?.text?.let { PairingCode.fromText(it) }) },
+                    shape = CShape, border = BorderStroke(1.dp, CAccent), modifier = Modifier.weight(1f)
+                ) {
+                    Text("PASTE INVITE", color = CAccent, fontSize = 12.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+            inviteError?.let { Text(it, color = CCritical, fontSize = 12.sp) }
+        }
+
+        Card {
+            Text("Or run your own relay", color = CInk, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             Text(
                 "Deploy comms-worker from the Aegis repository to Cloudflare, then enter its URL and the enrollment " +
                     "secret you set. This phone generates its keys here, never shares the private half, and the relay " +
@@ -419,7 +512,7 @@ private fun SetupScreen() {
 // ── Conversation list ────────────────────────────────────────────────────────
 
 @Composable
-private fun ThreadListScreen(onOpen: (String) -> Unit, onMyCode: () -> Unit, onSettings: () -> Unit) {
+private fun ThreadListScreen(onOpen: (String) -> Unit, onMyCode: () -> Unit, onInvite: () -> Unit, onSettings: () -> Unit) {
     val state by CommsRepository.state.collectAsStateWithLifecycle()
     val version by CommsRepository.version.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
@@ -434,6 +527,7 @@ private fun ThreadListScreen(onOpen: (String) -> Unit, onMyCode: () -> Unit, onS
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Spacer(Modifier.height(20.dp))
         Header("COMMS") {
+            SmallButton("INVITE", CAccent, onClick = onInvite)
             SmallButton("MY CODE", CInkDim, onClick = onMyCode)
             SmallButton("+ ADD", CClear, onClick = { addContact = true })
         }
@@ -997,6 +1091,123 @@ private fun VerifyScreen(peer: String, onBack: () -> Unit, onDeleted: () -> Unit
 }
 
 // ── My code ──────────────────────────────────────────────────────────────────
+
+/**
+ * Makes a one-time invite and shows it three ways: a QR code for someone
+ * standing next to you (they scan it in Aegis setup), a link to send them
+ * (it opens a page with the download and an OPEN IN AEGIS button), and the
+ * share sheet.
+ */
+@Composable
+private fun InviteScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val scope = rememberCoroutineScope()
+    var made by remember { mutableStateOf<Pair<PairingCode, Long>?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val create: () -> Unit = {
+        busy = true
+        error = null
+        scope.launch {
+            CommsRepository.createInvite()
+                .onSuccess { made = it }
+                .onFailure { error = it.message ?: "Could not make an invite" }
+            busy = false
+        }
+    }
+    val invite = made
+    val bitmap = remember(invite) { invite?.first?.let { qrBitmap(it.encode(), 720) } }
+    val until = invite?.second?.let { SimpleDateFormat("MMM d", Locale.getDefault()).format(Date(it)) }
+
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Spacer(Modifier.height(20.dp))
+        Header("INVITE", onBack = onBack)
+        Card {
+            Text("Invite someone to Aegis", color = CInk, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                "An invite lets one person get an Aegis number on your relay without the relay URL or its enrollment secret. " +
+                    "It works once and expires after seven days. They start with you as a verified contact, and you get a message when they join.",
+                color = CMuted, fontSize = 12.sp, lineHeight = 17.sp
+            )
+            if (invite == null) {
+                PrimaryButton(if (busy) "MAKING INVITE…" else "MAKE AN INVITE", enabled = !busy, onClick = create)
+            }
+            error?.let { Text(it, color = CCritical, fontSize = 12.sp) }
+        }
+        if (invite != null) {
+            val link = invite.first.inviteLink()
+            Card {
+                Text("Next to you: let them scan this", color = CInk, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text("In Aegis on their phone: COMMS → SCAN INVITE.", color = CMuted, fontSize = 12.sp)
+                if (bitmap != null) {
+                    Box(Modifier.fillMaxWidth().padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+                        Image(bitmap.asImageBitmap(), contentDescription = "Aegis invite code", modifier = Modifier.size(260.dp).clip(RoundedCornerShape(6.dp)))
+                    }
+                }
+            }
+            Card {
+                Text("Far away: send them the link", color = CInk, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "The link opens a page with the Aegis download and an OPEN IN AEGIS button. Anyone who gets the link can use it, " +
+                        "so send it only to the person you mean. Works once, until $until.",
+                    color = CMuted, fontSize = 12.sp, lineHeight = 17.sp
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    PrimaryButton("SHARE LINK") {
+                        val text = "Join me on Aegis for end-to-end encrypted messages and calls: $link\n" +
+                            "The invite works once, until $until."
+                        val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
+                        runCatching { context.startActivity(Intent.createChooser(send, "Send invite").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SmallButton("COPY LINK", CInkDim) { clipboard.setText(AnnotatedString(link)) }
+                    SmallButton("NEW INVITE", CInkDim, enabled = !busy) { made = null; create() }
+                }
+            }
+        }
+        Card {
+            Text("Not a phone number", color = CCaution, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text(NOT_A_PHONE, color = CMuted, fontSize = 12.sp, lineHeight = 17.sp)
+        }
+        Spacer(Modifier.height(16.dp))
+    }
+}
+
+/** An invite link opened on a phone that already has a number: offer to add the inviter instead. */
+@Composable
+private fun AddInviterDialog(code: PairingCode, onDone: () -> Unit, onAdded: (String) -> Unit) {
+    val scope = rememberCoroutineScope()
+    var error by remember { mutableStateOf<String?>(null) }
+    val mine = CommsRepository.state.collectAsStateWithLifecycle().value.number == code.number
+    AlertDialog(
+        onDismissRequest = onDone,
+        containerColor = CPanel,
+        title = { Text(if (mine) "Your own invite" else "Add ${code.name.ifBlank { formatAegisNumber(code.number) }}?", color = CInk, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    if (mine) "This invite is for someone who does not have Aegis yet. Send them the link."
+                    else "This phone already has an Aegis number, so the invite is not needed. You can add " +
+                        "${formatAegisNumber(code.number)} as a verified contact from it; the invite stays unused.",
+                    color = CInkDim, fontSize = 13.sp, lineHeight = 18.sp
+                )
+                error?.let { Text(it, color = CCritical, fontSize = 12.sp) }
+            }
+        },
+        confirmButton = {
+            if (!mine) TextButton(onClick = {
+                scope.launch {
+                    CommsRepository.addContactFromCode(code.copy(invite = null))
+                        .onSuccess { onDone(); onAdded(it.number) }
+                        .onFailure { error = it.message }
+                }
+            }) { Text("ADD CONTACT", color = CAccent, fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
+        },
+        dismissButton = { TextButton(onClick = onDone) { Text(if (mine) "OK" else "CANCEL", color = CMuted, letterSpacing = 1.sp) } }
+    )
+}
 
 @Composable
 private fun MyCodeScreen(onBack: () -> Unit) {
