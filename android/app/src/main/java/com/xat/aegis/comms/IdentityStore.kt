@@ -42,7 +42,13 @@ class IdentityStore(context: Context) {
             identity?.let { return it }
             if (!file.exists()) return null
             val key = keyLocked() ?: return null
-            val restored = Identity.restore(file.readText(), key)
+            // An unreadable pickle is an error, not "no identity": callers then leave
+            // envelopes on the relay instead of acknowledging and losing them.
+            val restored = try {
+                Identity.restore(file.readText(), key)
+            } catch (e: Exception) {
+                throw IllegalStateException("The identity on this phone could not be read: ${e.message}", e)
+            }
             identity = restored
             return restored
         }
@@ -79,7 +85,16 @@ class IdentityStore(context: Context) {
             val current = get() ?: throw IllegalStateException("No identity")
             val key = requireKeyLocked()
             val result = block(current)
-            persistLocked(current, key)
+            try {
+                persistLocked(current, key)
+            } catch (e: Exception) {
+                // The in-memory ratchet is now ahead of the one on disk. Drop it, so
+                // the next use reloads the last saved state and a redelivered
+                // envelope decrypts again instead of looking like a spent key.
+                identity = null
+                runCatching { current.destroy() }
+                throw IllegalStateException("The identity could not be saved: ${e.message}", e)
+            }
             return result
         }
     }
@@ -99,10 +114,16 @@ class IdentityStore(context: Context) {
     private fun persistLocked(current: Identity, key: ByteArray) {
         val pickle = current.pickle(key)
         val tmp = File(file.parentFile, "${file.name}.tmp")
-        tmp.writeText(pickle)
+        // Written and synced to a temporary file, then renamed over the pickle:
+        // a crash mid-write leaves either the old pickle or the new one, never
+        // half of one.
+        java.io.FileOutputStream(tmp).use { out ->
+            out.write(pickle.toByteArray(Charsets.UTF_8))
+            out.fd.sync()
+        }
         if (!tmp.renameTo(file)) {
-            file.writeText(pickle)
             tmp.delete()
+            throw java.io.IOException("could not replace ${file.name}")
         }
     }
 

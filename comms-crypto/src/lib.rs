@@ -19,7 +19,7 @@
 //! [`Identity`], serialised by [`Identity::pickle`] under a 32-byte key the app
 //! keeps in the Android Keystore. Nothing here touches the network or disk.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
@@ -30,7 +30,7 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use vodozemac::olm::{Account, AccountPickle, OlmMessage, Session, SessionConfig, SessionPickle};
+use vodozemac::olm::{Account, AccountPickle, DecryptionError, OlmMessage, Session, SessionConfig, SessionPickle};
 use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -57,6 +57,10 @@ pub enum CryptoError {
     /// session rather than keep failing on every message after it.
     #[error("could not decrypt a message from {sender_curve25519}: {reason}")]
     DecryptFrom { sender_curve25519: String, reason: String },
+    /// A message this device has already decrypted (its key is spent): a
+    /// redelivery or a replay. Nothing is wrong with the session; drop it.
+    #[error("message already received")]
+    Duplicate,
     #[error("could not decrypt: {reason}")]
     Decrypt { reason: String },
     #[error("could not encrypt: {reason}")]
@@ -190,13 +194,20 @@ struct State {
     sealing_secret: [u8; 32],
     /// Peer Curve25519 key (base64) → sessions, newest first.
     sessions: HashMap<String, Vec<SessionPickle>>,
+    /// Session ids of pre-key messages already accepted (absent in older pickles).
+    #[serde(default)]
+    used_prekeys: VecDeque<String>,
 }
 
 struct Inner2 {
     account: Account,
     sealing_secret: StaticSecret,
     sessions: HashMap<String, Vec<Session>>,
+    used_prekeys: VecDeque<String>,
 }
+
+/// How many accepted pre-key session ids are remembered to refuse replays.
+const MAX_USED_PREKEYS: usize = 2000;
 
 /// A device's cryptographic identity: its Olm account, its sealing key pair and
 /// its sessions with every peer. All methods are safe to call from any thread.
@@ -219,6 +230,7 @@ impl Identity {
                 account,
                 sealing_secret: StaticSecret::random_from_rng(&mut rand::thread_rng()),
                 sessions: HashMap::new(),
+                used_prekeys: VecDeque::new(),
             }),
         })
     }
@@ -252,6 +264,7 @@ impl Identity {
                 account: Account::from_pickle(state.account),
                 sealing_secret: StaticSecret::from(state.sealing_secret),
                 sessions,
+                used_prekeys: state.used_prekeys,
             }),
         }))
     }
@@ -270,6 +283,7 @@ impl Identity {
                 .iter()
                 .map(|(peer, sessions)| (peer.clone(), sessions.iter().map(Session::pickle).collect()))
                 .collect(),
+            used_prekeys: inner.used_prekeys.clone(),
         };
         let plain = Zeroizing::new(
             serde_json::to_vec(&state).map_err(|e| CryptoError::BadPickle { reason: e.to_string() })?,
@@ -418,13 +432,21 @@ impl Identity {
             .map_err(|e| CryptoError::Envelope { reason: e.to_string() })?;
         let sender_identity = curve_from(&msg.s)?;
 
-        // Existing sessions first, newest first.
+        // Existing sessions first, newest first. A session that knows the
+        // message's chain but has already spent its key means this exact message
+        // was decrypted before: a duplicate, not a broken session.
+        let mut spent = false;
         if let Some(sessions) = inner.sessions.get_mut(&msg.s) {
             for session in sessions.iter_mut() {
-                if let Ok(plaintext) = session.decrypt(&olm) {
-                    return Ok(Decrypted { sender_curve25519: msg.s, plaintext, new_session: false });
+                match session.decrypt(&olm) {
+                    Ok(plaintext) => return Ok(Decrypted { sender_curve25519: msg.s, plaintext, new_session: false }),
+                    Err(DecryptionError::MissingMessageKey(_)) => spent = true,
+                    Err(_) => {}
                 }
             }
+        }
+        if spent {
+            return Err(CryptoError::Duplicate);
         }
 
         // A pre-key message we have not seen: create the inbound session.
@@ -436,18 +458,27 @@ impl Identity {
                 // A pre-key message that already created one of our sessions is a
                 // replay: with a fallback key it would otherwise succeed again,
                 // duplicate the session and hand back stale plaintext.
-                let replayed = inner
-                    .sessions
-                    .get(&msg.s)
-                    .is_some_and(|list| list.iter().any(|s| s.session_id() == prekey.session_id()));
+                // The session ids already accepted are remembered even after a
+                // session is dropped, so a relay cannot replay an old pre-key
+                // message later to have it processed a second time.
+                let session_id = prekey.session_id();
+                let replayed = inner.used_prekeys.iter().any(|id| *id == session_id)
+                    || inner
+                        .sessions
+                        .get(&msg.s)
+                        .is_some_and(|list| list.iter().any(|s| s.session_id() == session_id));
                 if replayed {
-                    return Err(CryptoError::Decrypt { reason: "replayed pre-key message".into() });
+                    return Err(CryptoError::Duplicate);
                 }
                 let created = inner
                     .account
                     .create_inbound_session(SessionConfig::version_2(), sender_identity, &prekey)
                     .map_err(|e| CryptoError::DecryptFrom { sender_curve25519: msg.s.clone(), reason: e.to_string() })?;
                 push_session(&mut inner.sessions, msg.s.clone(), created.session);
+                inner.used_prekeys.push_back(session_id);
+                while inner.used_prekeys.len() > MAX_USED_PREKEYS {
+                    inner.used_prekeys.pop_front();
+                }
                 Ok(Decrypted { sender_curve25519: msg.s, plaintext: created.plaintext, new_session: true })
             }
             OlmMessage::Normal(_) => Err(CryptoError::NoSessionFor { sender_curve25519: msg.s }),
@@ -615,7 +646,7 @@ mod tests {
         let first = bob.decrypt(env.clone()).unwrap();
         assert!(first.new_session);
         let again = bob.decrypt(env);
-        assert!(matches!(again, Err(CryptoError::Decrypt { .. })), "replay accepted: {again:?}");
+        assert!(matches!(again, Err(CryptoError::Duplicate)), "replay accepted: {again:?}");
         assert_eq!(bob.inner.lock().unwrap().sessions[&alice.curve25519()].len(), 1);
         // The session itself keeps working after the rejected replay.
         let env2 = alice.encrypt(peer_keys(&bob), b"second".to_vec()).unwrap();
@@ -638,6 +669,55 @@ mod tests {
             Err(CryptoError::DecryptFrom { sender_curve25519, .. }) => assert_eq!(sender_curve25519, alice.curve25519()),
             other => panic!("expected DecryptFrom, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_redelivered_normal_message_is_a_duplicate_not_a_broken_session() {
+        let alice = Identity::create();
+        let bob = Identity::create();
+        alice.start_session(peer_keys(&bob), bob.public_bundle().fallback.unwrap()).unwrap();
+        bob.decrypt(alice.encrypt(peer_keys(&bob), b"hi".to_vec()).unwrap()).unwrap();
+        alice.decrypt(bob.encrypt(peer_keys(&alice), b"hello".to_vec()).unwrap()).unwrap();
+        // A normal (post-pre-key) message, delivered twice.
+        let env = alice.encrypt(peer_keys(&bob), b"once".to_vec()).unwrap();
+        assert_eq!(bob.decrypt(env.clone()).unwrap().plaintext, b"once");
+        assert!(matches!(bob.decrypt(env), Err(CryptoError::Duplicate)));
+        // And the session is unharmed.
+        let next = alice.encrypt(peer_keys(&bob), b"next".to_vec()).unwrap();
+        assert_eq!(bob.decrypt(next).unwrap().plaintext, b"next");
+    }
+
+    #[test]
+    fn a_replayed_prekey_is_refused_even_after_the_session_is_dropped() {
+        let alice = Identity::create();
+        let bob = Identity::create();
+        let key = random_key();
+        alice.start_session(peer_keys(&bob), bob.public_bundle().fallback.unwrap()).unwrap();
+        let env = alice.encrypt(peer_keys(&bob), b"first".to_vec()).unwrap();
+        bob.decrypt(env.clone()).unwrap();
+        bob.drop_sessions(alice.curve25519());
+        // Survives a pickle round trip too.
+        let bob2 = Identity::restore(bob.pickle(key.clone()).unwrap(), key).unwrap();
+        assert!(matches!(bob2.decrypt(env), Err(CryptoError::Duplicate)));
+    }
+
+    #[test]
+    fn older_pickles_without_the_replay_list_still_restore() {
+        // Decrypt a current pickle, take the new field out and re-encrypt it:
+        // exactly what a phone on an earlier version has on disk.
+        let alice = Identity::create();
+        let key = random_key();
+        let blob = B64.decode(alice.pickle(key.clone()).unwrap()).unwrap();
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let plain = cipher.decrypt(Nonce::from_slice(&blob[..12]), &blob[12..]).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        assert!(json.as_object_mut().unwrap().remove("used_prekeys").is_some());
+        let legacy = serde_json::to_vec(&json).unwrap();
+        let nonce = [7u8; 12];
+        let mut out = nonce.to_vec();
+        out.extend(cipher.encrypt(Nonce::from_slice(&nonce), legacy.as_slice()).unwrap());
+        let restored = Identity::restore(B64.encode(out), key).unwrap();
+        assert_eq!(restored.ed25519(), alice.ed25519());
     }
 
     #[test]

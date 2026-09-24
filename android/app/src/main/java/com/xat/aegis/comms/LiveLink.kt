@@ -55,7 +55,7 @@ object LiveLink {
     private sealed class Inbound {
         class Envelope(val socket: WebSocket, val envelope: RelayClient.Envelope) : Inbound()
         /** The relay has replayed the backlog; what queued up locally can go now. */
-        object Ready : Inbound()
+        class Ready(val backlogFull: Boolean) : Inbound()
     }
 
     /**
@@ -73,7 +73,12 @@ object LiveLink {
                         is Inbound.Envelope -> if (CommsRepository.handleEnvelope(item.envelope)) {
                             item.socket.send(JSONObject().put("type", "ack").put("ids", JSONArray(listOf(item.envelope.id))).toString())
                         }
-                        Inbound.Ready -> CommsRepository.flushOutbox()
+                        is Inbound.Ready -> {
+                            CommsRepository.flushOutbox()
+                            CommsRepository.flushReceipts()
+                            // The relay replays one page; a fuller mailbox is fetched by sync.
+                            if (item.backlogFull) CommsRepository.syncInBackground()
+                        }
                     }
                 } catch (e: CancellationException) {
                     throw e
@@ -126,6 +131,24 @@ object LiveLink {
             if (holders.isEmpty()) return
             if (loop?.isActive != true) loop = scope.launch { connectLoop() }
         }
+        kicks.trySend(Unit)
+    }
+
+    @Volatile
+    private var network: String? = null
+
+    /**
+     * The phone's default network changed. A socket opened over the old one can
+     * sit dead for a minute before its pings notice, and a call ringing in that
+     * minute is lost; drop it and reconnect over the new network straight away.
+     */
+    fun onNetwork(id: String) {
+        val previous = network
+        network = id
+        if (previous == null || previous == id) return
+        val current = socket ?: return
+        CommsLog.add("Network changed; reconnecting to the relay")
+        current.cancel()
         kicks.trySend(Unit)
     }
 
@@ -207,7 +230,7 @@ object LiveLink {
                 "ready" -> {
                     wasReady = true
                     // The backlog has been replayed; now send what queued up while offline.
-                    inbound.trySend(Inbound.Ready)
+                    inbound.trySend(Inbound.Ready(json.optInt("pending") >= RelayClient.INBOX_PAGE))
                 }
             }
         }

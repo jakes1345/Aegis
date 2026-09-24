@@ -238,20 +238,24 @@ class RelayClient(
     }
 
     private fun execute(builder: Request.Builder, client: OkHttpClient = http): JSONObject {
-        val response = try {
-            client.newCall(builder.build()).execute()
+        // Every network failure, including one while reading the response body
+        // (a network switch mid-request), surfaces as a RelayException with code
+        // 0, which callers treat as "offline, retry later".
+        try {
+            client.newCall(builder.build()).execute().use { res ->
+                noteServerTime(res)
+                val text = res.body?.string().orEmpty()
+                val json = runCatching { JSONObject(text) }.getOrNull()
+                if (!res.isSuccessful) {
+                    val reason = json?.optString("error")?.takeIf { it.isNotEmpty() } ?: "HTTP ${res.code}"
+                    throw RelayException(reason, res.code)
+                }
+                return json ?: throw RelayException("The relay returned something that is not JSON", MALFORMED)
+            }
+        } catch (e: RelayException) {
+            throw e
         } catch (e: IOException) {
             throw RelayException("Could not reach the relay: ${e.message ?: e.javaClass.simpleName}")
-        }
-        response.use { res ->
-            noteServerTime(res)
-            val text = res.body?.string().orEmpty()
-            val json = runCatching { JSONObject(text) }.getOrNull()
-            if (!res.isSuccessful) {
-                val reason = json?.optString("error")?.takeIf { it.isNotEmpty() } ?: "HTTP ${res.code}"
-                throw RelayException(reason, res.code)
-            }
-            return json ?: throw RelayException("The relay returned something that is not JSON")
         }
     }
 
@@ -289,6 +293,8 @@ class RelayClient(
     companion object {
         /** [RelayException.code] for a response the client could not parse; not a network failure. */
         const val MALFORMED = -1
+        /** Envelopes the relay returns per inbox fetch (Mailbox.inbox's limit). */
+        const val INBOX_PAGE = 200
         private const val CLOCK_WARN_MS = 30_000L
         /** The relay mints TURN credentials for 24 h and hands them out for at most 6 h. */
         private const val ICE_CACHE_MS = 5 * 60 * 60_000L

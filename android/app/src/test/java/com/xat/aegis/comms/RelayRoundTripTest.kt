@@ -92,6 +92,22 @@ class RelayRoundTripTest {
             relay.send(peer.number!!, identity.encrypt(peerKeys, plaintext))
         }
 
+        /** What CommsRepository.recoverSession does: a new outbound session, first in the list, old ones kept. */
+        fun startFreshSession(peer: Phone) {
+            val peerKeys = peer.keys
+            val bundle = relay.bundle(peer.number!!, fingerprint(peerKeys.ed25519))
+            identity.startSession(peerKeys, bundle.sessionKey)
+        }
+
+        /** Posts already-encrypted bytes, as a relay redelivery or a re-send would. */
+        fun sendRaw(peer: Phone, envelope: ByteArray) = relay.send(peer.number!!, envelope)
+
+        fun encryptFor(peer: Phone, payload: JSONObject): ByteArray {
+            val peerKeys = peer.keys
+            if (!identity.hasSession(peerKeys.curve25519)) startFreshSession(peer)
+            return identity.encrypt(peerKeys, CommsWire.withSender(payload, sender).toString().toByteArray(Charsets.UTF_8))
+        }
+
         class Received(val senderCurve: String, val payload: JSONObject, val newSession: Boolean)
 
         /** The next envelope off the live socket, decrypted and parsed. */
@@ -221,6 +237,43 @@ class RelayRoundTripTest {
         // From here on both directions work again.
         alice.send(bob, msg("after")); assertEquals("after", bob.receive().payload.getString(CommsWire.F_BODY))
         bob.send(alice, msg("reply")); assertEquals("reply", alice.receive().payload.getString(CommsWire.F_BODY))
+    }
+
+    @Test
+    fun messagesInFlightDuringARecoveryStillArrive() {
+        alice.send(bob, msg("one")); bob.receive()
+        bob.send(alice, msg("two")); alice.receive()
+
+        // Alice sends two more on the current session...
+        alice.send(bob, msg("in flight 1"))
+        alice.send(bob, msg("in flight 2"))
+        // ...while Bob, reacting to some unreadable envelope, starts a new session
+        // and sends a resync on it, keeping his old sessions (the v2.3 recovery).
+        bob.startFreshSession(alice)
+        bob.send(alice, CommsWire.resync())
+
+        // Bob still reads what Alice sent on the old session.
+        assertEquals("in flight 1", bob.receive().payload.getString(CommsWire.F_BODY))
+        assertEquals("in flight 2", bob.receive().payload.getString(CommsWire.F_BODY))
+        // Alice takes the resync on a new session and from then on uses it.
+        val resync = alice.receive()
+        assertEquals(CommsWire.T_RESYNC, CommsWire.type(resync.payload))
+        assertTrue(resync.newSession)
+        alice.send(bob, msg("after")); assertEquals("after", bob.receive().payload.getString(CommsWire.F_BODY))
+        bob.send(alice, msg("reply")); assertEquals("reply", alice.receive().payload.getString(CommsWire.F_BODY))
+    }
+
+    @Test
+    fun aRedeliveredEnvelopeIsADuplicateAndHarmsNothing() {
+        alice.send(bob, msg("one")); bob.receive()
+        bob.send(alice, msg("two")); alice.receive()
+        val envelope = alice.encryptFor(bob, msg("twice"))
+        alice.sendRaw(bob, envelope)
+        alice.sendRaw(bob, envelope)
+        assertEquals("twice", bob.receive().payload.getString(CommsWire.F_BODY))
+        val second = bob.receiveUndecryptable()
+        assertTrue("expected Duplicate, got $second", second is CryptoException.Duplicate)
+        alice.send(bob, msg("still fine")); assertEquals("still fine", bob.receive().payload.getString(CommsWire.F_BODY))
     }
 
     @Test
