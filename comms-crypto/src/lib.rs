@@ -51,6 +51,12 @@ pub enum CryptoError {
     /// session here can read it: the app should ask that peer to start a new one.
     #[error("no session can read a message from {sender_curve25519}")]
     NoSessionFor { sender_curve25519: String },
+    /// A message from `sender_curve25519` opened, but no session could decrypt it
+    /// and it could not start a new one (for example, it was built on a one-time
+    /// key this device no longer holds). The app should ask that peer for a fresh
+    /// session rather than keep failing on every message after it.
+    #[error("could not decrypt a message from {sender_curve25519}: {reason}")]
+    DecryptFrom { sender_curve25519: String, reason: String },
     #[error("could not decrypt: {reason}")]
     Decrypt { reason: String },
     #[error("could not encrypt: {reason}")]
@@ -440,7 +446,7 @@ impl Identity {
                 let created = inner
                     .account
                     .create_inbound_session(SessionConfig::version_2(), sender_identity, &prekey)
-                    .map_err(|e| CryptoError::Decrypt { reason: e.to_string() })?;
+                    .map_err(|e| CryptoError::DecryptFrom { sender_curve25519: msg.s.clone(), reason: e.to_string() })?;
                 push_session(&mut inner.sessions, msg.s.clone(), created.session);
                 Ok(Decrypted { sender_curve25519: msg.s, plaintext: created.plaintext, new_session: true })
             }
@@ -614,6 +620,24 @@ mod tests {
         // The session itself keeps working after the rejected replay.
         let env2 = alice.encrypt(peer_keys(&bob), b"second".to_vec()).unwrap();
         assert_eq!(bob.decrypt(env2).unwrap().plaintext, b"second");
+    }
+
+    #[test]
+    fn prekey_on_a_lost_one_time_key_names_its_sender() {
+        let alice = Identity::create();
+        let bob = Identity::create();
+        let key = random_key();
+        // Bob's state before he generated the key Alice is about to use: the same
+        // identity, but without that one-time key (a restore from an older pickle).
+        let bob_before = Identity::restore(bob.pickle(key.clone()).unwrap(), key).unwrap();
+        bob.generate_one_time_keys(1);
+        let otk = bob.public_bundle().one_time_keys[0].clone();
+        alice.start_session(peer_keys(&bob), otk).unwrap();
+        let env = alice.encrypt(peer_keys(&bob), b"hello".to_vec()).unwrap();
+        match bob_before.decrypt(env) {
+            Err(CryptoError::DecryptFrom { sender_curve25519, .. }) => assert_eq!(sender_curve25519, alice.curve25519()),
+            other => panic!("expected DecryptFrom, got {other:?}"),
+        }
     }
 
     #[test]

@@ -25,6 +25,11 @@ class CommsConfig(context: Context) {
 
     val isRegistered: Boolean get() = relayUrl != null && number != null
 
+    /** Set once the background connection has been switched on by default for this install. */
+    val onlineDefaultApplied: Boolean get() = prefs.getBoolean(KEY_ONLINE_DEFAULT, false)
+
+    fun markOnlineDefaultApplied() { prefs.edit().putBoolean(KEY_ONLINE_DEFAULT, true).apply() }
+
     fun saveRegistration(relayUrl: String, number: String, name: String, listed: Boolean) {
         prefs.edit()
             .putString(KEY_RELAY, relayUrl.trimEnd('/'))
@@ -61,6 +66,7 @@ class CommsConfig(context: Context) {
         const val KEY_LISTED = "listed"
         const val KEY_ONLINE = "online"
         const val KEY_PUSH = "push_endpoint"
+        const val KEY_ONLINE_DEFAULT = "online_default_applied"
         val LEGACY_KEYS = listOf(
             "worker_url", "device_id", "token_enc", "sync_seq", "sync_updated",
             "push_token", "sync_calls", "voice_token", "voice_at"

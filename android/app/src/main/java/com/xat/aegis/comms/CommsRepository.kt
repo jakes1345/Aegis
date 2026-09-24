@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -59,8 +60,17 @@ object CommsRepository {
     private lateinit var store: CommsStore
     private lateinit var relay: RelayClient
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /** An unexpected failure in background work is recorded instead of taking the app down. */
+    private val crashGuard = CoroutineExceptionHandler { _, e ->
+        Log.e(TAG, "comms background work failed", e)
+        CommsLog.add("Error: ${e.javaClass.simpleName}: ${e.message}")
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + crashGuard)
     private val lock = Mutex()
+
+    /** When a resync was last sent to each contact, so a run of unreadable envelopes asks only once. */
+    private val lastResync = HashMap<String, Long>()
+    private const val RESYNC_MIN_INTERVAL_MS = 60_000L
 
     @Volatile
     private var initialised = false
@@ -85,6 +95,7 @@ object CommsRepository {
     fun init(context: Context) {
         if (initialised) return
         appContext = context.applicationContext
+        CommsLog.init(appContext)
         config = CommsConfig(appContext)
         // The Twilio-era module left plaintext phone numbers and Keystore-readable
         // SMS bodies in its own database, with no screen left to delete them from.
@@ -94,11 +105,22 @@ object CommsRepository {
         store = CommsStore(appContext)
         relay = RelayClient(identities, config)
         CallManager.init(appContext)
+        // Identities registered before the background connection became the default
+        // kept it off, so calls to them could only ring while Aegis was on screen.
+        // Switch it on once; the owner can still turn it off in settings.
+        if (config.isRegistered && !config.onlineDefaultApplied) {
+            config.setOnline(true)
+            config.markOnlineDefaultApplied()
+            CommsLog.add("Background connection switched on (calls ring while Aegis is closed)")
+        }
         initialised = true
         publishConfig()
         scope.launch { refreshUnread() }
         if (config.isRegistered && config.online) CommsService.start(appContext)
     }
+
+    /** The relay's current time; see [RelayClient.relayNow]. */
+    fun relayNow(): Long = if (initialised) relay.relayNow() else System.currentTimeMillis()
 
     private fun publishConfig() {
         _state.update {
@@ -168,8 +190,10 @@ object CommsRepository {
                     // Reachable from the start: the background connection is on until
                     // the owner switches it off, so calls ring with the app closed.
                     config.setOnline(true)
+                    config.markOnlineDefaultApplied()
                     publishConfig()
                     setBusy(false)
+                    CommsLog.add("Registered as ${formatAegisNumber(registered.number)} on $url")
                     CommsService.start(appContext)
                     LiveLink.refresh()
                     Result.success(registered.number)
@@ -419,7 +443,10 @@ object CommsRepository {
                     .apply { putSelf(this) }
                 when (val outcome = deliver(contact, payload)) {
                     Deliver.Sent -> store.setStatus(m.id, "sent")
-                    is Deliver.Failed -> store.setStatus(m.id, "failed", outcome.reason)
+                    is Deliver.Failed -> {
+                        CommsLog.add("Message to ${formatAegisNumber(contact.number)} failed: ${outcome.reason}")
+                        store.setStatus(m.id, "failed", outcome.reason)
+                    }
                     is Deliver.Offline -> {
                         _state.update { it.copy(error = outcome.reason) }
                         break
@@ -486,10 +513,11 @@ object CommsRepository {
         lock.withLock {
             payload.put("v", 1).put("t", "call")
             putSelf(payload)
+            val kind = payload.optString("k")
             when (val r = deliver(contact, payload)) {
-                Deliver.Sent -> true
-                is Deliver.Failed -> { Log.w(TAG, "call signal to ${contact.number} failed: ${r.reason}"); false }
-                is Deliver.Offline -> { Log.w(TAG, "call signal to ${contact.number} not sent: ${r.reason}"); false }
+                Deliver.Sent -> { if (kind != "ice") CommsLog.add("Call $kind sent to ${formatAegisNumber(contact.number)}"); true }
+                is Deliver.Failed -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} failed: ${r.reason}"); false }
+                is Deliver.Offline -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} not sent: ${r.reason}"); false }
             }
         }
     }
@@ -515,8 +543,8 @@ object CommsRepository {
         putSelf(payload)
         when (val r = deliver(contact, payload)) {
             Deliver.Sent -> Unit
-            is Deliver.Failed -> Log.w(TAG, "control message to ${contact.number} failed: ${r.reason}")
-            is Deliver.Offline -> Log.w(TAG, "control message to ${contact.number} deferred: ${r.reason}")
+            is Deliver.Failed -> CommsLog.add("${payload.optString("t")} to ${formatAegisNumber(contact.number)} failed: ${r.reason}")
+            is Deliver.Offline -> CommsLog.add("${payload.optString("t")} to ${formatAegisNumber(contact.number)} not sent: ${r.reason}")
         }
     }
 
@@ -541,39 +569,70 @@ object CommsRepository {
     }
 
     private fun handleLocked(envelope: RelayClient.Envelope): Boolean {
+        // The live socket and an inbox fetch can both hand over the same envelope.
+        // A second copy must not reach the ratchet: its message key is already
+        // spent, so decrypting it again fails and would look like a broken session.
+        if (store.isEnvelopeSeen(envelope.id)) return true
         val decrypted = try {
             identities.update { it.decrypt(envelope.data) }
         } catch (e: CryptoException.NoSessionFor) {
             store.markEnvelopeSeen(envelope.id, envelope.ts)
-            store.contactByCurve(e.senderCurve25519)?.let { contact ->
-                Log.w(TAG, "no session for ${contact.number}; asking for a new one")
-                identities.update { it.dropSessions(contact.curve25519) }
-                sendControl(contact, JSONObject().put("v", 1).put("t", "resync"))
-            }
+            recoverSession(e.senderCurve25519, "Envelope ${shortId(envelope.id)} came on a session this phone no longer has")
+            return true
+        } catch (e: CryptoException.DecryptFrom) {
+            store.markEnvelopeSeen(envelope.id, envelope.ts)
+            recoverSession(e.senderCurve25519, "Envelope ${shortId(envelope.id)} could not be decrypted (${e.reason})")
             return true
         } catch (e: CryptoException) {
             store.markEnvelopeSeen(envelope.id, envelope.ts)
-            Log.w(TAG, "undecryptable envelope ${envelope.id}: ${e.message}")
+            CommsLog.add("Dropped envelope ${shortId(envelope.id)}: ${e.message}")
             return true
         } catch (e: IllegalStateException) {
             // The ratchet step could not be saved; leave the envelope on the relay.
-            Log.w(TAG, "identity not persisted, envelope ${envelope.id} left queued: ${e.message}")
+            CommsLog.add("Could not save the session after envelope ${shortId(envelope.id)}; left on the relay: ${e.message}")
             return false
         }
         if (!store.markEnvelopeSeen(envelope.id, envelope.ts)) return true
         val text = String(decrypted.plaintext, Charsets.UTF_8)
-        val json = runCatching { JSONObject(text) }.getOrNull() ?: return true
-        if (json.optInt("v", 0) != 1) return true
+        val json = runCatching { JSONObject(text) }.getOrNull()
+        if (json == null || json.optInt("v", 0) != 1) {
+            CommsLog.add("Envelope ${shortId(envelope.id)} decrypted but is not an Aegis payload; dropped")
+            return true
+        }
 
         when (val resolved = resolveSender(decrypted.senderCurve25519, json)) {
             is Resolution.Found -> processPayload(resolved.contact, envelope.ts, json)
-            Resolution.Rejected -> Unit
+            is Resolution.Rejected -> CommsLog.add("Envelope ${shortId(envelope.id)} rejected: ${resolved.reason}")
             Resolution.Unreachable -> {
-                Log.w(TAG, "relay unreachable while confirming the sender of ${envelope.id}; holding it")
+                CommsLog.add("Relay unreachable while confirming who sent ${shortId(envelope.id)}; holding it")
                 store.savePending(envelope.id, envelope.ts, decrypted.senderCurve25519, text)
             }
         }
         return true
+    }
+
+    /**
+     * Something from [senderCurve] could not be decrypted. Left alone, every
+     * message after it would fail the same way, so the session is dropped and
+     * the sender is asked (once a minute at most) to start a new one; the resync
+     * itself travels on a fresh session. Caller holds [lock].
+     */
+    private fun recoverSession(senderCurve: String, what: String) {
+        val contact = store.contactByCurve(senderCurve)
+        if (contact == null) {
+            CommsLog.add("$what, from someone who is not a contact; dropped")
+            return
+        }
+        val label = contact.name.ifBlank { formatAegisNumber(contact.number) }
+        identities.update { it.dropSessions(contact.curve25519) }
+        val now = System.currentTimeMillis()
+        if (now - (lastResync[contact.number] ?: 0L) < RESYNC_MIN_INTERVAL_MS) {
+            CommsLog.add("$what from $label; session reset again")
+            return
+        }
+        lastResync[contact.number] = now
+        CommsLog.add("$what from $label; session reset, asking them to start a new one")
+        sendControl(contact, JSONObject().put("v", 1).put("t", "resync"))
     }
 
     /** Retries payloads whose sender could not be confirmed earlier. Caller holds [lock]. */
@@ -583,7 +642,7 @@ object CommsRepository {
             if (json == null) { store.deletePending(p.id); continue }
             when (val resolved = resolveSender(p.senderCurve25519, json)) {
                 is Resolution.Found -> { processPayload(resolved.contact, p.ts, json); store.deletePending(p.id) }
-                Resolution.Rejected -> store.deletePending(p.id)
+                is Resolution.Rejected -> { CommsLog.add("Held envelope ${shortId(p.id)} rejected: ${resolved.reason}"); store.deletePending(p.id) }
                 Resolution.Unreachable -> return
             }
         }
@@ -617,7 +676,7 @@ object CommsRepository {
             "resync" -> {
                 // Their pre-key message has already created a fresh session on our
                 // side; anything still queued for them goes through it next flush.
-                Log.i(TAG, "resync from ${contact.number}")
+                CommsLog.add("${contact.name.ifBlank { formatAegisNumber(contact.number) }} could not read something from this phone and started a new session")
             }
             "call" -> CallManager.onSignal(contact, json, envelopeTs)
         }
@@ -626,7 +685,7 @@ object CommsRepository {
     private sealed class Resolution {
         class Found(val contact: Contact) : Resolution()
         /** The payload claims a number its keys do not hold, or is malformed; drop it. */
-        object Rejected : Resolution()
+        class Rejected(val reason: String) : Resolution()
         /** The relay was needed to confirm the sender and could not be reached; retry later. */
         object Unreachable : Resolution()
     }
@@ -639,19 +698,26 @@ object CommsRepository {
      */
     private fun resolveSender(senderCurve: String, json: JSONObject): Resolution {
         store.contactByCurve(senderCurve)?.let { return Resolution.Found(it) }
-        val from = parseAegisNumber(json.optString("from")) ?: return Resolution.Rejected
+        val from = parseAegisNumber(json.optString("from"))
+            ?: return Resolution.Rejected("sender is not a contact and gave no Aegis number")
         val ed = json.optString("k"); val curve = json.optString("c"); val sealing = json.optString("s"); val sig = json.optString("g")
-        if (curve != senderCurve || ed.isBlank() || sealing.isBlank() || sig.isBlank()) return Resolution.Rejected
-        if (!verify(ed, "$curve|$sealing".toByteArray(Charsets.UTF_8), sig)) return Resolution.Rejected
+        if (curve != senderCurve || ed.isBlank() || sealing.isBlank() || sig.isBlank()) {
+            return Resolution.Rejected("keys claimed by ${formatAegisNumber(from)} do not match the sender")
+        }
+        if (!verify(ed, "$curve|$sealing".toByteArray(Charsets.UTF_8), sig)) {
+            return Resolution.Rejected("keys claimed by ${formatAegisNumber(from)} are not signed")
+        }
         val relayView = try {
             relay.bundle(from, fingerprint(ed))
         } catch (e: RelayException) {
-            Log.w(TAG, "could not confirm sender $from with the relay: ${e.message}")
             // 404 means the relay has no such number, or the pin (their identity key)
             // does not match it: the claim is false. Anything else is the relay's problem.
-            return if (e.code == 404) Resolution.Rejected else Resolution.Unreachable
+            return if (e.code == 404) Resolution.Rejected("the relay does not know ${formatAegisNumber(from)} with those keys")
+            else Resolution.Unreachable
         }
-        if (relayView.ed25519 != ed || relayView.curve25519 != curve || relayView.sealing != sealing) return Resolution.Rejected
+        if (relayView.ed25519 != ed || relayView.curve25519 != curve || relayView.sealing != sealing) {
+            return Resolution.Rejected("the relay holds different keys for ${formatAegisNumber(from)}")
+        }
         val existing = store.contact(from)
         val contact = if (existing != null) {
             // Same number, different keys: keep the pinned name, flag it, trust nothing.

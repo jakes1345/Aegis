@@ -7,7 +7,9 @@ import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -59,6 +61,7 @@ import com.xat.aegis.comms.CallPhase
 import com.xat.aegis.comms.ChatMessage
 import com.xat.aegis.comms.ChatThread
 import com.xat.aegis.comms.STATUS_CALL
+import com.xat.aegis.comms.CommsLog
 import com.xat.aegis.comms.CommsNotifications
 import com.xat.aegis.comms.CommsRepository
 import com.xat.aegis.comms.Contact
@@ -414,6 +417,22 @@ private fun ThreadListScreen(onOpen: (String) -> Unit, onMyCode: () -> Unit, onS
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(it, color = CCritical, fontSize = 12.sp, modifier = Modifier.weight(1f))
                 SmallButton("DISMISS", CMuted) { CommsRepository.clearError() }
+            }
+        }
+        val batteryFree by rememberBatteryUnrestricted()
+        if (state.online && !batteryFree) {
+            val context = LocalContext.current
+            Spacer(Modifier.height(6.dp))
+            Row(
+                Modifier.fillMaxWidth().background(CCaution.copy(alpha = 0.12f), CShape).padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Battery saving can cut Aegis off in the background, and then calls do not ring. Allow Aegis to run unrestricted.",
+                    color = CInkDim, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.weight(1f)
+                )
+                Spacer(Modifier.width(8.dp))
+                SmallButton("ALLOW", CAccent) { openBatterySettings(context) }
             }
         }
         Spacer(Modifier.height(8.dp))
@@ -1044,9 +1063,18 @@ private fun CommsSettingsScreen(onBack: () -> Unit) {
             }
             if (!notificationsGranted) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Notifications are off, so new messages will not show until you open Aegis.", color = CCaution, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                    Text("Notifications are off, so new messages and incoming calls will not show until you open Aegis.", color = CCaution, fontSize = 11.sp, modifier = Modifier.weight(1f))
                     SmallButton("ALLOW", CAccent, onClick = allowNotifications)
                 }
+            }
+            val batteryFree by rememberBatteryUnrestricted()
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (batteryFree) "Battery: unrestricted. Android will not cut the background connection."
+                    else "Battery: optimised. Android may cut the background connection, and then calls do not ring.",
+                    color = if (batteryFree) CMuted else CCaution, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.weight(1f)
+                )
+                if (!batteryFree) SmallButton("ALLOW", CAccent) { openBatterySettings(context) }
             }
             Text(
                 "Relay one-time keys: ${if (state.relayOneTimeKeys >= 0) state.relayOneTimeKeys else "unknown"} · topped up on sync",
@@ -1088,9 +1116,90 @@ private fun CommsSettingsScreen(onBack: () -> Unit) {
             }
         }
 
+        DiagnosticsCard()
+
         TextButton(onClick = { confirmUnpair = true }, contentPadding = PaddingValues(0.dp), enabled = !state.busy) {
             Text("DELETE IDENTITY AND NUMBER", color = CCritical, fontSize = 11.sp, letterSpacing = 1.sp)
         }
         Spacer(Modifier.height(16.dp))
+    }
+}
+
+// ── Background reliability and diagnostics ───────────────────────────────────
+
+/**
+ * Whether Android exempts Aegis from battery optimisation, re-read whenever the
+ * screen resumes (the owner comes back from the system settings page).
+ */
+@Composable
+private fun rememberBatteryUnrestricted(): State<Boolean> {
+    val context = LocalContext.current
+    val power = remember { context.getSystemService(PowerManager::class.java) }
+    val unrestricted = remember { mutableStateOf(power?.isIgnoringBatteryOptimizations(context.packageName) == true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                unrestricted.value = power?.isIgnoringBatteryOptimizations(context.packageName) == true
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    return unrestricted
+}
+
+/**
+ * Asks Android to let Aegis run unrestricted. The direct request shows a
+ * one-tap system dialog; where a phone does not offer it, the battery
+ * optimisation list opens instead so the owner can find Aegis there.
+ */
+private fun openBatterySettings(context: Context) {
+    val direct = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}"))
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    val list = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(direct) }.recoverCatching { context.startActivity(list) }
+}
+
+private val logTimeFmt = SimpleDateFormat("MMM d HH:mm:ss", Locale.US)
+
+/**
+ * The comms event log: connections, envelopes that could not be read, calls
+ * that arrived too late to ring. COPY puts it on the clipboard to send to
+ * whoever is helping; it holds no message text.
+ */
+@Composable
+private fun DiagnosticsCard() {
+    val entries by CommsLog.entries.collectAsStateWithLifecycle()
+    val clipboard = LocalClipboardManager.current
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    Card {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Diagnostics", color = CInk, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            SmallButton("COPY", CAccent, enabled = entries.isNotEmpty()) {
+                val text = entries.joinToString("\n") { "${logTimeFmt.format(Date(it.ts))}  ${it.text}" }
+                clipboard.setText(AnnotatedString("Aegis comms log\n$text"))
+            }
+            SmallButton("CLEAR", CMuted, enabled = entries.isNotEmpty()) { CommsLog.clear() }
+        }
+        Text(
+            "What happened with the relay, calls and envelopes on this phone. No message text is kept. " +
+                "If a call or message goes missing, COPY this and send it along.",
+            color = CMuted, fontSize = 11.sp, lineHeight = 15.sp
+        )
+        if (entries.isEmpty()) {
+            Text("Nothing recorded yet.", color = CMuted, fontSize = 11.sp)
+        } else {
+            val shown = entries.asReversed().let { if (expanded) it else it.take(12) }
+            for (e in shown) {
+                Text(
+                    "${logTimeFmt.format(Date(e.ts))}  ${e.text}",
+                    color = CInkDim, fontSize = 10.sp, lineHeight = 13.sp, fontFamily = FontFamily.Monospace
+                )
+            }
+            if (entries.size > 12) {
+                SmallButton(if (expanded) "SHOW LESS" else "SHOW ALL ${entries.size}", CMuted) { expanded = !expanded }
+            }
+        }
     }
 }

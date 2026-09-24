@@ -5,6 +5,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
@@ -187,7 +188,9 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
         val number = config.number ?: throw RelayException("Not registered with a relay")
         val identity = identities.get() ?: throw RelayException("No identity on this device")
         val bodyText = body?.toString() ?: ""
-        val ts = System.currentTimeMillis()
+        // The relay rejects a timestamp more than five minutes from its own clock,
+        // so a phone whose clock is off signs with the relay's time once it knows it.
+        val ts = relayNow()
         val nonce = ByteArray(18).also { SecureRandom().nextBytes(it) }
             .let { Base64.encodeToString(it, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP) }
         val payload = "$number\n$ts\n$nonce\n${method.uppercase()}\n$pathAndQuery\n${sha256Hex(bodyText)}"
@@ -214,6 +217,7 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
             throw RelayException("Could not reach the relay: ${e.message ?: e.javaClass.simpleName}")
         }
         response.use { res ->
+            noteServerTime(res)
             val text = res.body?.string().orEmpty()
             val json = runCatching { JSONObject(text) }.getOrNull()
             if (!res.isSuccessful) {
@@ -221,6 +225,32 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
                 throw RelayException(reason, res.code)
             }
             return json ?: throw RelayException("The relay returned something that is not JSON")
+        }
+    }
+
+    // ── Relay clock ───────────────────────────────────────────────────────
+
+    /** Relay time minus this phone's time, learned from the `Date` header of every response. */
+    @Volatile
+    private var clockOffsetMs: Long = 0L
+
+    /**
+     * The current time by the relay's clock. Envelope timestamps are the relay's,
+     * so anything that measures an envelope's age (a call offer that waited too
+     * long to ring) compares against this rather than the phone's own clock,
+     * which may be minutes off.
+     */
+    fun relayNow(): Long = System.currentTimeMillis() + clockOffsetMs
+
+    /** Records the relay's clock from [response]; called for every HTTP and socket response. */
+    fun noteServerTime(response: Response) {
+        val server = response.headers.getDate("Date")?.time ?: return
+        // The header has one-second resolution; half a second centres the error.
+        val offset = server + 500L - System.currentTimeMillis()
+        val previous = clockOffsetMs
+        clockOffsetMs = offset
+        if (kotlin.math.abs(offset) > CLOCK_WARN_MS && kotlin.math.abs(offset - previous) > CLOCK_WARN_MS) {
+            CommsLog.add("This phone's clock is ${offset / 1000}s off the relay's; using the relay's time")
         }
     }
 
@@ -232,6 +262,7 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
     companion object {
         /** [RelayException.code] for a response the client could not parse; not a network failure. */
         const val MALFORMED = -1
+        private const val CLOCK_WARN_MS = 30_000L
         private val JSON = "application/json; charset=utf-8".toMediaType()
     }
 }
