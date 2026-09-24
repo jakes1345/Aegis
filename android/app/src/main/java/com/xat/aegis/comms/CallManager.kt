@@ -23,7 +23,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
 import org.json.JSONObject
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
@@ -188,7 +187,7 @@ object CallManager {
             if (!stillLive(id)) { abandonSetup(); return }
             val sent = CommsRepository.sendCallSignal(
                 contact,
-                JSONObject().put("ck", "offer").put("cid", id).put("ts", System.currentTimeMillis()).put("sdp", offer.description)
+                CommsWire.callOffer(id, System.currentTimeMillis(), offer.description)
             )
             if (!stillLive(id)) return
             if (!sent) { endLocked("could not reach the relay", signal = null); return }
@@ -222,7 +221,7 @@ object CallManager {
             if (!stillLive(c.id)) { abandonSetup(); return }
             val sent = CommsRepository.sendCallSignal(
                 c.peer,
-                JSONObject().put("ck", "answer").put("cid", c.id).put("sdp", answer.description)
+                CommsWire.callAnswer(c.id, answer.description)
             )
             if (!stillLive(c.id)) return
             if (!sent) { endLocked("could not reach the relay", signal = null); return }
@@ -236,12 +235,12 @@ object CallManager {
     // ── Signals from the peer ─────────────────────────────────────────────
 
     private suspend fun signalLocked(contact: Contact, json: JSONObject, envelopeTs: Long) {
-        val kind = json.optString("ck")
-        val cid = json.optString("cid").takeIf { it.isNotBlank() } ?: return
+        val kind = CommsWire.callKind(json)
+        val cid = json.optString(CommsWire.F_CALL_ID).takeIf { it.isNotBlank() } ?: return
         val current = _call.value
         when (kind) {
-            "offer" -> {
-                val sdp = json.optString("sdp").takeIf { it.isNotBlank() } ?: run {
+            CommsWire.CALL_OFFER -> {
+                val sdp = json.optString(CommsWire.F_SDP).takeIf { it.isNotBlank() } ?: run {
                     CommsLog.add("Call offer from ${label(contact)} had no session description; ignored")
                     return
                 }
@@ -249,7 +248,7 @@ object CallManager {
                     if (current.id != cid) {
                         // Already on a call: tell them, and note the attempt.
                         CommsLog.add("Call from ${label(contact)} while already on a call; answered busy")
-                        CommsRepository.sendCallSignal(contact, JSONObject().put("ck", "end").put("cid", cid).put("reason", "busy"))
+                        CommsRepository.sendCallSignal(contact, CommsWire.callEnd(cid, "busy"))
                         CommsRepository.logCall(contact, Direction.IN, "Missed call (busy)", unread = true)
                         CommsNotifications.missedCall(appContext, contact)
                     }
@@ -281,9 +280,9 @@ object CallManager {
                     .onFailure { CommsLog.add("Ringtone could not play: ${it.message}") }
                 armTimeout(RING_TIMEOUT_MS) { if (it.phase == CallPhase.INCOMING) endLocked("missed", signal = null, missed = true) }
             }
-            "answer" -> {
+            CommsWire.CALL_ANSWER -> {
                 if (current == null || current.id != cid || current.phase != CallPhase.DIALING) return
-                val sdp = json.optString("sdp").takeIf { it.isNotBlank() } ?: return
+                val sdp = json.optString(CommsWire.F_SDP).takeIf { it.isNotBlank() } ?: return
                 val peer = pc ?: return
                 try {
                     peer.setRemote(SessionDescription(SessionDescription.Type.ANSWER, sdp))
@@ -296,21 +295,19 @@ object CallManager {
                     if (stillLive(cid)) endLocked("bad answer from the other phone", signal = "hangup")
                 }
             }
-            "ice" -> {
+            CommsWire.CALL_ICE -> {
                 if (current == null || current.id != cid) return
-                val arr = json.optJSONArray("cands") ?: return
-                for (i in 0 until arr.length()) {
-                    val o = arr.optJSONObject(i) ?: continue
-                    val cand = IceCandidate(o.optString("m"), o.optInt("i", 0), o.optString("c"))
-                    if (cand.sdp.isBlank()) continue
+                for (c in CommsWire.candidates(json)) {
+                    val cand = IceCandidate(c.mid, c.index, c.sdp)
                     val peer = pc
                     if (peer != null && peer.remoteDescription != null) peer.addIceCandidate(cand) else pendingRemoteCandidates += cand
                 }
             }
-            "end" -> {
+            CommsWire.CALL_END -> {
                 if (current == null || current.id != cid) return
-                CommsLog.add("${label(contact)} ended the call (${json.optString("reason").ifBlank { "hangup" }})")
-                when (json.optString("reason")) {
+                val reason = json.optString(CommsWire.F_REASON)
+                CommsLog.add("${label(contact)} ended the call (${reason.ifBlank { "hangup" }})")
+                when (reason) {
                     "reject" -> endLocked("declined", signal = null)
                     "busy" -> endLocked("busy", signal = null)
                     "cancel" -> endLocked("missed", signal = null, missed = current.phase == CallPhase.INCOMING)
@@ -431,9 +428,8 @@ object CallManager {
         if (outgoingCandidates.isEmpty() || c.phase == CallPhase.ENDED) return
         val batch = ArrayList(outgoingCandidates)
         outgoingCandidates.clear()
-        val cands = JSONArray()
-        for (cand in batch) cands.put(JSONObject().put("m", cand.sdpMid).put("i", cand.sdpMLineIndex).put("c", cand.sdp))
-        CommsRepository.sendCallSignal(c.peer, JSONObject().put("ck", "ice").put("cid", c.id).put("cands", cands))
+        val cands = batch.map { CommsWire.Candidate(it.sdpMid ?: "", it.sdpMLineIndex, it.sdp) }
+        CommsRepository.sendCallSignal(c.peer, CommsWire.callIce(c.id, cands))
     }
 
     private fun flushPendingRemoteCandidates() {
@@ -481,7 +477,7 @@ object CallManager {
         stopAudio()
         CallService.stop(appContext)
         if (signal != null) {
-            CommsRepository.sendCallSignal(c.peer, JSONObject().put("ck", "end").put("cid", c.id).put("reason", signal))
+            CommsRepository.sendCallSignal(c.peer, CommsWire.callEnd(c.id, signal))
         }
 
         val now = System.currentTimeMillis()

@@ -1,6 +1,5 @@
 package com.xat.aegis.comms
 
-import android.util.Base64
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -17,6 +16,7 @@ import uniffi.aegis_comms_crypto.SignedKey
 import java.io.IOException
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.Base64
 import java.util.concurrent.TimeUnit
 
 /** A relay call that did not succeed, with the relay's message when it gave one. */
@@ -26,8 +26,16 @@ class RelayException(message: String, val code: Int = 0) : IOException(message)
  * HTTP and WebSocket client for the relay Worker. Every request is signed with
  * the identity's Ed25519 key (see comms-worker/src/auth.ts); nothing else
  * authenticates a device. Calls are blocking and belong on an IO dispatcher.
+ *
+ * It depends on nothing Android-specific, so the relay round-trip tests run it
+ * on the JVM against a real relay; the app hands it its identity, relay URL and
+ * Aegis number as lookups, since all three change on registration.
  */
-class RelayClient(private val identities: IdentityStore, private val config: CommsConfig) {
+class RelayClient(
+    private val identity: () -> Identity?,
+    private val relayUrl: () -> String?,
+    private val number: () -> String?,
+) {
 
     val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -121,7 +129,7 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
     }
 
     fun send(to: String, envelope: ByteArray): String {
-        val body = JSONObject().put("to", to).put("envelope", Base64.encodeToString(envelope, Base64.NO_WRAP))
+        val body = JSONObject().put("to", to).put("envelope", Base64.getEncoder().encodeToString(envelope))
         val json = signed("POST", "/v1/send", body)
         return parsed { json.getString("id") }
     }
@@ -162,7 +170,7 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
     }
 
     fun parseEnvelope(o: JSONObject): Envelope = parsed {
-        Envelope(o.getString("id"), o.getLong("ts"), Base64.decode(o.getString("data"), Base64.NO_WRAP))
+        Envelope(o.getString("id"), o.getLong("ts"), Base64.getDecoder().decode(o.getString("data")))
     }
 
     /**
@@ -184,15 +192,15 @@ class RelayClient(private val identities: IdentityStore, private val config: Com
         execute(signedRequest(method, pathAndQuery, body))
 
     private fun signedRequest(method: String, pathAndQuery: String, body: JSONObject?): Request.Builder {
-        val relay = config.relayUrl ?: throw RelayException("Not registered with a relay")
-        val number = config.number ?: throw RelayException("Not registered with a relay")
-        val identity = identities.get() ?: throw RelayException("No identity on this device")
+        val relay = relayUrl() ?: throw RelayException("Not registered with a relay")
+        val number = number() ?: throw RelayException("Not registered with a relay")
+        val identity = identity() ?: throw RelayException("No identity on this device")
         val bodyText = body?.toString() ?: ""
         // The relay rejects a timestamp more than five minutes from its own clock,
         // so a phone whose clock is off signs with the relay's time once it knows it.
         val ts = relayNow()
         val nonce = ByteArray(18).also { SecureRandom().nextBytes(it) }
-            .let { Base64.encodeToString(it, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP) }
+            .let { Base64.getUrlEncoder().withoutPadding().encodeToString(it) }
         val payload = "$number\n$ts\n$nonce\n${method.uppercase()}\n$pathAndQuery\n${sha256Hex(bodyText)}"
         val builder = Request.Builder()
             .url(relay + pathAndQuery)

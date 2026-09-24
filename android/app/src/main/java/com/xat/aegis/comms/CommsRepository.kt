@@ -17,7 +17,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
 import org.json.JSONObject
 import org.unifiedpush.android.connector.UnifiedPush
 import uniffi.aegis_comms_crypto.CryptoException
@@ -103,7 +102,7 @@ object CommsRepository {
         config.purgeLegacy()
         identities = IdentityStore(appContext)
         store = CommsStore(appContext)
-        relay = RelayClient(identities, config)
+        relay = RelayClient({ identities.get() }, { config.relayUrl }, { config.number })
         CallManager.init(appContext)
         // Identities registered before the background connection became the default
         // kept it off, so calls to them could only ring while Aegis was on screen.
@@ -438,9 +437,7 @@ object CommsRepository {
                     store.setStatus(m.id, "failed", "Contact removed")
                     continue
                 }
-                val payload = JSONObject()
-                    .put("v", 1).put("t", "msg").put("id", m.id).put("ts", m.ts).put("body", m.body)
-                    .apply { putSelf(this) }
+                val payload = CommsWire.message(m.id, m.ts, m.body).also { putSelf(it) }
                 when (val outcome = deliver(contact, payload)) {
                     Deliver.Sent -> store.setStatus(m.id, "sent")
                     is Deliver.Failed -> {
@@ -498,21 +495,14 @@ object CommsRepository {
         }
     }
 
-    /**
-     * Adds this identity's number, name and keys to an outgoing payload. These
-     * field names are reserved in every payload type: a call signal once used
-     * "k" for its kind, which this overwrote with the identity key, so no call
-     * offer was ever recognised. A clash now fails loudly instead.
-     */
+    /** Adds this identity's number, name and keys to an outgoing payload; see [CommsWire.withSender]. */
     private fun putSelf(o: JSONObject) {
         val bundle = identities.get()?.publicBundle() ?: return
-        val clash = SELF_FIELDS.filter { o.has(it) }
-        check(clash.isEmpty()) { "payload field(s) ${clash.joinToString()} are reserved for the sender's identity" }
-        o.put("from", config.number).put("name", config.displayName)
-            .put("k", bundle.ed25519).put("c", bundle.curve25519).put("s", bundle.sealing).put("g", bundle.signature)
+        val number = config.number ?: return
+        CommsWire.withSender(
+            o, CommsWire.Sender(number, config.displayName, bundle.ed25519, bundle.curve25519, bundle.sealing, bundle.signature)
+        )
     }
-
-    private val SELF_FIELDS = listOf("from", "name", "k", "c", "s", "g")
 
     /**
      * Sends a call signal (offer, answer, ICE, end) to [contact] through the
@@ -521,11 +511,10 @@ object CommsRepository {
     suspend fun sendCallSignal(contact: Contact, payload: JSONObject): Boolean = withContext(Dispatchers.IO) {
         if (!config.isRegistered) return@withContext false
         lock.withLock {
-            payload.put("v", 1).put("t", "call")
             putSelf(payload)
-            val kind = payload.optString("ck")
+            val kind = CommsWire.callKind(payload)
             when (val r = deliver(contact, payload)) {
-                Deliver.Sent -> { if (kind != "ice") CommsLog.add("Call $kind sent to ${formatAegisNumber(contact.number)}"); true }
+                Deliver.Sent -> { if (kind != CommsWire.CALL_ICE) CommsLog.add("Call $kind sent to ${formatAegisNumber(contact.number)}"); true }
                 is Deliver.Failed -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} failed: ${r.reason}"); false }
                 is Deliver.Offline -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} not sent: ${r.reason}"); false }
             }
@@ -553,8 +542,8 @@ object CommsRepository {
         putSelf(payload)
         when (val r = deliver(contact, payload)) {
             Deliver.Sent -> Unit
-            is Deliver.Failed -> CommsLog.add("${payload.optString("t")} to ${formatAegisNumber(contact.number)} failed: ${r.reason}")
-            is Deliver.Offline -> CommsLog.add("${payload.optString("t")} to ${formatAegisNumber(contact.number)} not sent: ${r.reason}")
+            is Deliver.Failed -> CommsLog.add("${CommsWire.type(payload)} to ${formatAegisNumber(contact.number)} failed: ${r.reason}")
+            is Deliver.Offline -> CommsLog.add("${CommsWire.type(payload)} to ${formatAegisNumber(contact.number)} not sent: ${r.reason}")
         }
     }
 
@@ -604,8 +593,8 @@ object CommsRepository {
         }
         if (!store.markEnvelopeSeen(envelope.id, envelope.ts)) return true
         val text = String(decrypted.plaintext, Charsets.UTF_8)
-        val json = runCatching { JSONObject(text) }.getOrNull()
-        if (json == null || json.optInt("v", 0) != 1) {
+        val json = CommsWire.parse(text)
+        if (json == null) {
             CommsLog.add("Envelope ${shortId(envelope.id)} decrypted but is not an Aegis payload; dropped")
             return true
         }
@@ -642,7 +631,7 @@ object CommsRepository {
         }
         lastResync[contact.number] = now
         CommsLog.add("$what from $label; session reset, asking them to start a new one")
-        sendControl(contact, JSONObject().put("v", 1).put("t", "resync"))
+        sendControl(contact, CommsWire.resync())
     }
 
     /** Retries payloads whose sender could not be confirmed earlier. Caller holds [lock]. */
@@ -660,35 +649,35 @@ object CommsRepository {
 
     /** Acts on a decrypted payload from a known contact. Caller holds [lock]. */
     private fun processPayload(contact: Contact, envelopeTs: Long, json: JSONObject) {
-        when (json.optString("t")) {
-            "msg" -> {
-                val id = json.optString("id").takeIf { it.isNotBlank() } ?: return
-                val body = json.optString("body").take(MAX_BODY)
+        when (CommsWire.type(json)) {
+            CommsWire.T_MSG -> {
+                val id = json.optString(CommsWire.F_ID).takeIf { it.isNotBlank() } ?: return
+                val body = json.optString(CommsWire.F_BODY).take(MAX_BODY)
                 if (store.hasMessage(id)) return
-                val ts = json.optLong("ts", envelopeTs).coerceIn(envelopeTs - 7L * 24 * 3600_000L, System.currentTimeMillis() + 60_000L)
+                val ts = json.optLong(CommsWire.F_TS, envelopeTs).coerceIn(envelopeTs - 7L * 24 * 3600_000L, System.currentTimeMillis() + 60_000L)
                 val onScreen = openPeer == contact.number
                 store.insertMessage(ChatMessage(id, contact.number, Direction.IN, body, ts, "received", read = onScreen))
-                sendControl(contact, JSONObject().put("v", 1).put("t", "receipt").put("status", if (onScreen) "read" else "delivered").put("ids", JSONArray(listOf(id))))
+                sendControl(contact, CommsWire.receipt(listOf(id), if (onScreen) CommsWire.STATUS_READ else CommsWire.STATUS_DELIVERED))
                 if (!onScreen) {
                     val fresh = store.messages(contact.number).filter { it.direction == Direction.IN && !it.read }
                     CommsNotifications.notifyInbound(appContext, contact, fresh)
                 }
             }
-            "receipt" -> {
-                val ids = json.optJSONArray("ids")?.let { arr -> (0 until arr.length()).map { arr.getString(it) } } ?: emptyList()
-                val status = json.optString("status")
-                if (status == "delivered" || status == "read") {
+            CommsWire.T_RECEIPT -> {
+                val ids = CommsWire.receiptIds(json)
+                val status = json.optString(CommsWire.F_STATUS)
+                if (status == CommsWire.STATUS_DELIVERED || status == CommsWire.STATUS_READ) {
                     // Only our own messages to this contact can be receipted by them.
                     val mine = store.messages(contact.number).filter { it.direction == Direction.OUT }.map { it.id }.toSet()
                     store.advanceStatus(ids.filter { it in mine }, status)
                 }
             }
-            "resync" -> {
+            CommsWire.T_RESYNC -> {
                 // Their pre-key message has already created a fresh session on our
                 // side; anything still queued for them goes through it next flush.
                 CommsLog.add("${contact.name.ifBlank { formatAegisNumber(contact.number) }} could not read something from this phone and started a new session")
             }
-            "call" -> CallManager.onSignal(contact, json, envelopeTs)
+            CommsWire.T_CALL -> CallManager.onSignal(contact, json, envelopeTs)
         }
     }
 
@@ -708,9 +697,10 @@ object CommsRepository {
      */
     private fun resolveSender(senderCurve: String, json: JSONObject): Resolution {
         store.contactByCurve(senderCurve)?.let { return Resolution.Found(it) }
-        val from = parseAegisNumber(json.optString("from"))
+        val from = parseAegisNumber(json.optString(CommsWire.F_FROM))
             ?: return Resolution.Rejected("sender is not a contact and gave no Aegis number")
-        val ed = json.optString("k"); val curve = json.optString("c"); val sealing = json.optString("s"); val sig = json.optString("g")
+        val ed = json.optString(CommsWire.F_ED25519); val curve = json.optString(CommsWire.F_CURVE25519)
+        val sealing = json.optString(CommsWire.F_SEALING); val sig = json.optString(CommsWire.F_SIGNATURE)
         if (curve != senderCurve || ed.isBlank() || sealing.isBlank() || sig.isBlank()) {
             return Resolution.Rejected("keys claimed by ${formatAegisNumber(from)} do not match the sender")
         }
@@ -735,7 +725,7 @@ object CommsRepository {
             existing.copy(ed25519 = ed, curve25519 = curve, sealing = sealing, signature = sig, verified = false, keyChanged = true)
         } else {
             Contact(
-                number = from, name = json.optString("name").trim().take(40),
+                number = from, name = json.optString(CommsWire.F_NAME).trim().take(40),
                 ed25519 = ed, curve25519 = curve, sealing = sealing, signature = sig,
                 verified = false, addedTs = System.currentTimeMillis()
             )
@@ -798,7 +788,7 @@ object CommsRepository {
         bump()
         val contact = store.contact(peer) ?: return@withContext
         lock.withLock {
-            sendControl(contact, JSONObject().put("v", 1).put("t", "receipt").put("status", "read").put("ids", JSONArray(ids)))
+            sendControl(contact, CommsWire.receipt(ids, CommsWire.STATUS_READ))
         }
     }
 
