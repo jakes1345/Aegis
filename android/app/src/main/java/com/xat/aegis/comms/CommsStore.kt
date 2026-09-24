@@ -219,6 +219,9 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
 
     // ── Envelope bookkeeping ─────────────────────────────────────────────
 
+    fun isEnvelopeSeen(id: String): Boolean =
+        readableDatabase.rawQuery("SELECT 1 FROM seen_envelopes WHERE id = ?", arrayOf(id)).use { it.moveToFirst() }
+
     /** Records an envelope id; false when it was already processed. */
     fun markEnvelopeSeen(id: String, ts: Long): Boolean {
         val values = ContentValues().apply { put("id", id); put("ts", ts) }

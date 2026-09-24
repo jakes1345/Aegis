@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
+import com.xat.aegis.comms.CommsRepository
 
 /**
  * Brings scanning back after a reboot — but only for someone who actually had it
@@ -25,6 +26,11 @@ import androidx.core.content.ContextCompat
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+
+        // Encrypted calls and messages: an owner who keeps comms online gets the
+        // relay connection back after a reboot, instead of missing every call
+        // until they happen to open Aegis. init() starts it only in that case.
+        runCatching { CommsRepository.init(context.applicationContext) }
 
         AppSettings.load(context)
         if (!AppSettings.scanEnabled || !AppSettings.resumeAfterReboot) return

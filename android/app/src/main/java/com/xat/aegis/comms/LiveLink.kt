@@ -2,6 +2,7 @@ package com.xat.aegis.comms
 
 import android.util.Log
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -41,7 +42,11 @@ object LiveLink {
     private const val BACKOFF_MIN_MS = 2_000L
     private const val BACKOFF_MAX_MS = 60_000L
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val crashGuard = CoroutineExceptionHandler { _, e ->
+        Log.e(TAG, "relay connection failed", e)
+        CommsLog.add("Relay connection error: ${e.javaClass.simpleName}: ${e.message}")
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + crashGuard)
     private val holders = HashSet<String>()
     private var loop: Job? = null
     private var stopper: Job? = null
@@ -54,6 +59,9 @@ object LiveLink {
 
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected.asStateFlow()
+
+    /** What is keeping the socket open, for the log: the screen, the background service, a call. */
+    private fun holdersText(): String = synchronized(this) { holders.sorted().joinToString(", ").ifBlank { "no hold" } }
 
     /** Keeps the socket open until [release] is called with the same tag. */
     fun hold(tag: String) {
@@ -115,7 +123,7 @@ object LiveLink {
                 val ws = try {
                     CommsRepository.relayClient().openSocket(listener(closed))
                 } catch (e: Exception) {
-                    Log.w(TAG, "socket open failed: ${e.message}")
+                    CommsLog.add("Could not open the relay connection: ${e.message}")
                     null
                 }
                 socket = ws
@@ -129,7 +137,7 @@ object LiveLink {
                     }
                     socket = null
                     setConnected(false)
-                    Log.i(TAG, "socket closed: $reason")
+                    CommsLog.add("Relay connection lost (${reason.removePrefix("ready").ifBlank { "dropped" }}); reconnecting")
                     if (reason == "ready") backoffMs = BACKOFF_MIN_MS
                 }
                 // A new hold cuts the wait short; a socket that never became ready backs off.
@@ -146,6 +154,8 @@ object LiveLink {
         private var wasReady = false
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            CommsRepository.relayClient().noteServerTime(response)
+            CommsLog.add("Connected to the relay (${holdersText()})")
             setConnected(true)
         }
 
@@ -153,7 +163,11 @@ object LiveLink {
             val json = runCatching { JSONObject(text) }.getOrNull() ?: return
             when (json.optString("type")) {
                 "envelope" -> {
-                    val envelope = runCatching { CommsRepository.relayClient().parseEnvelope(json.getJSONObject("envelope")) }.getOrNull() ?: return
+                    val envelope = runCatching { CommsRepository.relayClient().parseEnvelope(json.getJSONObject("envelope")) }.getOrNull()
+                    if (envelope == null) {
+                        CommsLog.add("Relay sent an envelope this app could not parse")
+                        return
+                    }
                     scope.launch {
                         if (CommsRepository.handleEnvelope(envelope)) {
                             webSocket.send(JSONObject().put("type", "ack").put("ids", JSONArray(listOf(envelope.id))).toString())

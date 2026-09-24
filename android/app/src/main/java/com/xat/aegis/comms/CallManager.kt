@@ -11,6 +11,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -73,8 +74,21 @@ object CallManager {
 
     private lateinit var appContext: Context
 
+    /**
+     * A failure inside call handling used to kill the coroutine without a trace,
+     * leaving a call that never rang or a screen stuck on "Calling". It is now
+     * recorded and the call is ended cleanly.
+     */
+    private val crashGuard = CoroutineExceptionHandler { _, e -> onCrash(e) }
+
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    private val serial = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1))
+    private val serial = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1) + crashGuard)
+
+    private fun onCrash(e: Throwable) {
+        Log.e(TAG, "call handling failed", e)
+        CommsLog.add("Call error: ${e.javaClass.simpleName}: ${e.message}")
+        serial.launch { endLocked("error: ${e.message ?: e.javaClass.simpleName}", signal = "hangup") }
+    }
 
     private val _call = MutableStateFlow<ActiveCall?>(null)
     val call: StateFlow<ActiveCall?> = _call.asStateFlow()
@@ -227,28 +241,44 @@ object CallManager {
         val current = _call.value
         when (kind) {
             "offer" -> {
-                val sdp = json.optString("sdp").takeIf { it.isNotBlank() } ?: return
+                val sdp = json.optString("sdp").takeIf { it.isNotBlank() } ?: run {
+                    CommsLog.add("Call offer from ${label(contact)} had no session description; ignored")
+                    return
+                }
                 if (current != null && current.phase != CallPhase.ENDED) {
                     if (current.id != cid) {
                         // Already on a call: tell them, and note the attempt.
+                        CommsLog.add("Call from ${label(contact)} while already on a call; answered busy")
                         CommsRepository.sendCallSignal(contact, JSONObject().put("k", "end").put("cid", cid).put("reason", "busy"))
                         CommsRepository.logCall(contact, Direction.IN, "Missed call (busy)", unread = true)
                         CommsNotifications.missedCall(appContext, contact)
                     }
                     return
                 }
-                if (System.currentTimeMillis() - envelopeTs > OFFER_MAX_AGE_MS) {
+                // Both timestamps are the relay's, so a phone whose own clock is off
+                // does not mistake a live call for an old one.
+                val age = CommsRepository.relayNow() - envelopeTs
+                if (age > OFFER_MAX_AGE_MS) {
                     // Sat on the relay too long (phone was offline): the caller has given up.
+                    CommsLog.add("Call from ${label(contact)} reached this phone ${age / 1000}s late; logged as missed")
                     CommsRepository.logCall(contact, Direction.IN, "Missed call", unread = true)
                     CommsNotifications.missedCall(appContext, contact)
                     return
                 }
+                CommsLog.add("Incoming call from ${label(contact)}")
                 pendingOffer = SessionDescription(SessionDescription.Type.OFFER, sdp)
                 pendingRemoteCandidates.clear()
                 val incoming = ActiveCall(cid, contact, Direction.IN, CallPhase.INCOMING, System.currentTimeMillis())
                 _call.value = incoming
-                CommsNotifications.incomingCall(appContext, incoming)
-                startRinging()
+                // The in-app call screen is already up; a refused notification or a
+                // silent ringtone must not stop the call from being answerable.
+                runCatching { CommsNotifications.incomingCall(appContext, incoming) }
+                    .onFailure { CommsLog.add("Incoming-call notification refused: ${it.message}") }
+                if (!CommsNotifications.canPost(appContext)) {
+                    CommsLog.add("Notifications are off, so the incoming call shows only inside Aegis")
+                }
+                runCatching { startRinging() }
+                    .onFailure { CommsLog.add("Ringtone could not play: ${it.message}") }
                 armTimeout(RING_TIMEOUT_MS) { if (it.phase == CallPhase.INCOMING) endLocked("missed", signal = null, missed = true) }
             }
             "answer" -> {
@@ -279,6 +309,7 @@ object CallManager {
             }
             "end" -> {
                 if (current == null || current.id != cid) return
+                CommsLog.add("${label(contact)} ended the call (${json.optString("reason").ifBlank { "hangup" }})")
                 when (json.optString("reason")) {
                     "reject" -> endLocked("declined", signal = null)
                     "busy" -> endLocked("busy", signal = null)
@@ -290,6 +321,8 @@ object CallManager {
     }
 
     // ── WebRTC plumbing ───────────────────────────────────────────────────
+
+    private fun label(contact: Contact) = contact.name.ifBlank { formatAegisNumber(contact.number) }
 
     private fun ensureFactory(): PeerConnectionFactory {
         factory?.let { return it }
@@ -432,6 +465,7 @@ object CallManager {
         // suspension: a hang-up and the peer's "end" can arrive together, and
         // the relay round trip below may take the full network timeout.
         _call.value = c.copy(phase = CallPhase.ENDED, endReason = reason)
+        CommsLog.add("Call ${if (c.direction == Direction.OUT) "to" else "from"} ${label(c.peer)} ended: $reason")
         timeout?.cancel()
         candidateFlush?.cancel()
         outgoingCandidates.clear()
