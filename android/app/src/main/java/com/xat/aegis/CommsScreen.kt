@@ -303,7 +303,8 @@ private fun SetupScreen() {
             Text(
                 "Deploy comms-worker from the Aegis repository to Cloudflare, then enter its URL and the enrollment " +
                     "secret you set. This phone generates its keys here, never shares the private half, and the relay " +
-                    "hands it a random nine-digit Aegis number.",
+                    "hands it a random nine-digit Aegis number. Aegis then keeps a quiet background connection to the " +
+                    "relay so messages arrive and calls ring while it is closed; SETTINGS → Online switches that off.",
                 color = CMuted, fontSize = 12.sp, lineHeight = 17.sp
             )
             OutlinedTextField(
@@ -385,21 +386,24 @@ private fun ThreadListScreen(onOpen: (String) -> Unit, onMyCode: () -> Unit, onS
             SmallButton("SETTINGS", CMuted, onClick = onSettings)
         }
         Spacer(Modifier.height(6.dp))
+        // The socket is held open whenever this screen is up, so "Live" is the
+        // normal state; what differs is whether anything reaches the phone once
+        // Aegis is closed.
         val statusLine = buildString {
+            append(if (state.connected) "Live" else "Connecting…")
             append(
                 when {
-                    state.connected -> "Live"
-                    state.online -> "Reconnecting"
-                    state.pushRegistered -> "Push wake-ups on"
-                    else -> "Delivery only while open"
+                    state.online -> " · background on"
+                    state.pushRegistered -> " · push wake-ups"
+                    else -> " · nothing arrives while closed"
                 }
             )
             if (!state.listed) append(" · unlisted")
             if (state.lastSync > 0L) append(" · synced ${agoText(now, state.lastSync)}")
         }
         val statusColour = when {
-            state.connected -> CClear
-            state.online || state.pushRegistered -> CMuted
+            !state.connected -> CCaution
+            state.online || state.pushRegistered -> CClear
             else -> CCaution
         }
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -659,8 +663,9 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
                 shape = CShape, modifier = Modifier.height(56.dp)
             ) { Text("SEND", fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
         }
-        if (!state.connected && !state.pushRegistered && !state.online) {
-            Text("Replies arrive when Aegis is open, on sync. Turn on Online or push in SETTINGS for instant delivery.", color = CCaution, fontSize = 10.sp, modifier = Modifier.padding(bottom = 8.dp))
+        when {
+            !state.connected -> Text("Connecting to the relay… messages you send are queued until it is back.", color = CCaution, fontSize = 10.sp, modifier = Modifier.padding(bottom = 8.dp))
+            !state.online && !state.pushRegistered -> Text("Live while Aegis is open. Nothing arrives, and calls cannot ring, once it is closed: turn on Online or push in SETTINGS.", color = CCaution, fontSize = 10.sp, modifier = Modifier.padding(bottom = 8.dp))
         }
     }
 }
@@ -1021,7 +1026,7 @@ private fun CommsSettingsScreen(onBack: () -> Unit) {
             Text("Delivery", color = CInk, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             ToggleRow(
                 "Online",
-                "Keeps a connection to the relay open in the background, with a quiet notification, so messages arrive instantly. Uses some battery.",
+                "Keeps a connection to the relay open in the background, with a quiet notification, so messages arrive and calls ring while Aegis is closed. Uses some battery. While Aegis is on screen it is connected either way.",
                 state.online
             ) { CommsRepository.setOnline(it) }
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {

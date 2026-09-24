@@ -300,6 +300,9 @@ class MainActivity : AppCompatActivity() {
         refreshDeviceHealth()
         // Envelopes that arrived while the app was closed are pulled on every
         // return to the foreground; the push endpoint is renewed if it was lost.
+        // While the app stays on screen the relay socket is held open, so what
+        // arrives after this sync lands live instead of waiting for the next one.
+        CommsRepository.onAppVisible(true)
         CommsRepository.registerPushIfPossible()
         CommsRepository.syncInBackground()
     }
@@ -307,6 +310,7 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         resumed = false
         super.onPause()
+        CommsRepository.onAppVisible(false)
         nfcAdapter?.let { adapter ->
             if (readerModeOn) runCatching { adapter.disableReaderMode(this) }
         }

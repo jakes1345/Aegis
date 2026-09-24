@@ -12,34 +12,23 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import org.json.JSONArray
-import org.json.JSONObject
 
 /**
- * Keeps the WebSocket to the relay open while the owner has comms "online",
- * so envelopes arrive the moment they are queued, and acknowledges each one
- * only after the repository has stored it.
+ * Keeps the app alive in the background while the owner has comms "online",
+ * so [LiveLink] can hold the relay socket open and envelopes (and call offers)
+ * arrive the moment they are queued.
  *
  * It is a foreground service of the remote-messaging type: Android would
- * otherwise kill the socket within minutes of the app leaving the screen.
- * When it is not running, delivery falls back to the UnifiedPush wake-up
- * ([CommsPushReceiver]) and to syncing when the app opens.
+ * otherwise kill the process within minutes of the app leaving the screen.
+ * The socket itself belongs to [LiveLink]; this service only takes a hold on
+ * it and mirrors its state in the notification.
  */
 class CommsService : Service() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var loop: Job? = null
-
-    @Volatile
-    private var socket: WebSocket? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var watcher: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -58,8 +47,11 @@ class CommsService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        promote(connected = false)
-        if (loop?.isActive != true) loop = scope.launch { connectLoop() }
+        promote(LiveLink.connected.value)
+        LiveLink.hold(HOLD)
+        if (watcher?.isActive != true) {
+            watcher = scope.launch { LiveLink.connected.collect { promote(it) } }
+        }
         return START_STICKY
     }
 
@@ -72,83 +64,16 @@ class CommsService : Service() {
         }
     }
 
-    /** Connects, serves the socket until it drops, then reconnects with backoff. */
-    private suspend fun connectLoop() {
-        var backoffMs = 2_000L
-        while (scope.isActive) {
-            val closed = Channel<String>(Channel.CONFLATED)
-            val ws = try {
-                CommsRepository.relayClient().openSocket(listener(closed))
-            } catch (e: Exception) {
-                Log.w(TAG, "socket open failed: ${e.message}")
-                null
-            }
-            socket = ws
-            if (ws != null) {
-                val reason = closed.receive()
-                socket = null
-                CommsRepository.setConnected(false)
-                promote(connected = false)
-                Log.i(TAG, "socket closed: $reason")
-                if (reason == "ready") backoffMs = 2_000L
-            }
-            if (!scope.isActive) return
-            delay(backoffMs)
-            backoffMs = (backoffMs * 2).coerceAtMost(60_000L)
-        }
-    }
-
-    private fun listener(closed: Channel<String>) = object : WebSocketListener() {
-        private var wasReady = false
-
-        override fun onOpen(webSocket: WebSocket, response: Response) {
-            CommsRepository.setConnected(true)
-            promote(connected = true)
-        }
-
-        override fun onMessage(webSocket: WebSocket, text: String) {
-            val json = runCatching { JSONObject(text) }.getOrNull() ?: return
-            when (json.optString("type")) {
-                "envelope" -> {
-                    val envelope = runCatching { CommsRepository.relayClient().parseEnvelope(json.getJSONObject("envelope")) }.getOrNull() ?: return
-                    scope.launch {
-                        if (CommsRepository.handleEnvelope(envelope)) {
-                            webSocket.send(JSONObject().put("type", "ack").put("ids", JSONArray(listOf(envelope.id))).toString())
-                        }
-                    }
-                }
-                "ready" -> {
-                    wasReady = true
-                    // The backlog has been replayed; now send what queued up while offline.
-                    scope.launch { CommsRepository.flushOutbox() }
-                }
-            }
-        }
-
-        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-            webSocket.close(1000, null)
-        }
-
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            closed.trySend(if (wasReady) "ready" else "closed:$code")
-        }
-
-        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            closed.trySend(if (wasReady) "ready" else "failure:${t.message}")
-        }
-    }
-
     override fun onDestroy() {
-        loop?.cancel()
-        socket?.close(1000, "service stopped")
-        socket = null
+        watcher?.cancel()
         scope.cancel()
-        CommsRepository.setConnected(false)
+        LiveLink.release(HOLD)
         super.onDestroy()
     }
 
     companion object {
         private const val TAG = "CommsService"
+        private const val HOLD = "service"
         const val ACTION_STOP = "com.xat.aegis.comms.STOP"
 
         /**
