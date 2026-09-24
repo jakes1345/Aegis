@@ -50,6 +50,8 @@ object CommsRepository {
     private const val ONE_TIME_KEYS_LOW = 20
     private const val ONE_TIME_KEYS_BATCH = 50
     private const val MAX_BODY = 4000
+    private const val HOLD_FOREGROUND = "foreground"
+    private const val HOLD_CALL = "call"
 
     private lateinit var appContext: Context
     private lateinit var config: CommsConfig
@@ -127,8 +129,19 @@ object CommsRepository {
 
     fun clearError() { _state.update { it.copy(error = null) } }
 
-    /** Called by [CommsService] as the live socket comes and goes. */
+    /** Called by [LiveLink] as the live socket comes and goes. */
     fun setConnected(connected: Boolean) { _state.update { it.copy(connected = connected) } }
+
+    /**
+     * The app's screen came up or went away. While it is visible the relay
+     * socket is held open, so messages and call offers land in the open
+     * conversation instead of waiting for the next sync; a registered identity
+     * is not needed to take the hold, the link checks that itself.
+     */
+    fun onAppVisible(visible: Boolean) {
+        if (!initialised) return
+        if (visible) LiveLink.hold(HOLD_FOREGROUND) else LiveLink.release(HOLD_FOREGROUND)
+    }
 
     // ── Registration ──────────────────────────────────────────────────────
 
@@ -152,8 +165,13 @@ object CommsRepository {
                     identity.markKeysPublished()
                     identities.persist()
                     config.saveRegistration(url, registered.number, name.trim().take(40), listed)
+                    // Reachable from the start: the background connection is on until
+                    // the owner switches it off, so calls ring with the app closed.
+                    config.setOnline(true)
                     publishConfig()
                     setBusy(false)
+                    CommsService.start(appContext)
+                    LiveLink.refresh()
                     Result.success(registered.number)
                 } catch (e: Exception) {
                     // Registration failed: keep no half-made identity around.
@@ -172,6 +190,7 @@ object CommsRepository {
             runCatching { relay.wipe() }.onFailure { Log.w(TAG, "relay wipe failed: ${it.message}") }
             runCatching { UnifiedPush.unregister(appContext) }
             CommsService.stop(appContext)
+            LiveLink.disconnect()
             store.clearAll()
             identities.destroy()
             config.clear()
@@ -484,12 +503,12 @@ object CommsRepository {
     }
 
     /**
-     * Keeps the relay socket open for a call's signalling even when the owner
-     * has comms offline; released when the call ends. Called from the app's
-     * own screen, so the foreground service start is permitted.
+     * Keeps the relay socket open for a call's signalling even when the app
+     * leaves the screen and the owner has comms offline; released when the
+     * call ends. The call's own microphone service keeps the process alive.
      */
-    fun holdLiveLink() { if (initialised && config.isRegistered && !config.online) CommsService.start(appContext) }
-    fun releaseLiveLink() { if (initialised && !config.online) CommsService.stop(appContext) }
+    fun holdLiveLink() { if (initialised) LiveLink.hold(HOLD_CALL) }
+    fun releaseLiveLink() { if (initialised) LiveLink.release(HOLD_CALL) }
 
     /** Sends a control message that is not stored locally (receipts, resync). Caller holds [lock]. */
     private fun sendControl(contact: Contact, payload: JSONObject) {
