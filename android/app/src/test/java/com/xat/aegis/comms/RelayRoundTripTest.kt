@@ -366,4 +366,29 @@ class RelayRoundTripTest {
         assumeTrue("set AEGIS_SLOW_TESTS to wait for a relay heartbeat", System.getenv("AEGIS_SLOW_TESTS") != null)
         assertTrue("no heartbeat within 150 s", alice.awaitControl("hb", 150))
     }
+
+    @Test
+    fun anInviteRegistersExactlyOnePhone() {
+        val invite = alice.relay.createInvite()
+        assertEquals(22, invite.code.length)
+        assertTrue(invite.expiresAt > System.currentTimeMillis() + 6L * 24 * 3600_000L)
+
+        // A new phone registers with the invite and no enrollment secret.
+        val carol = Identity.create().also { it.generateOneTimeKeys(5u) }
+        var carolNumber: String? = null
+        val carolRelay = RelayClient({ carol }, { relayUrl }, { carolNumber })
+        carolNumber = carolRelay.register(relayUrl!!, carol, null, listed = false, invite = invite.code).number
+        try {
+            assertNotNull(carolNumber)
+            // The invite is spent: a second phone cannot use it.
+            val dave = Identity.create()
+            val refused = runCatching { RelayClient({ dave }, { relayUrl }, { null }).register(relayUrl!!, dave, null, false, invite.code) }
+            assertEquals(403, (refused.exceptionOrNull() as? RelayException)?.code)
+            // Nor can a made-up code.
+            val made = runCatching { RelayClient({ dave }, { relayUrl }, { null }).register(relayUrl!!, dave, null, false, "AAAAAAAAAAAAAAAAAAAAAA") }
+            assertEquals(403, (made.exceptionOrNull() as? RelayException)?.code)
+        } finally {
+            runCatching { carolRelay.wipe() }
+        }
+    }
 }

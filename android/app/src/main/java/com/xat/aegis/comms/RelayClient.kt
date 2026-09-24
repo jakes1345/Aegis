@@ -94,11 +94,15 @@ class RelayClient(
 
     // ── Registration ──────────────────────────────────────────────────────
 
-    /** Registers a fresh identity and returns the Aegis number the relay allocated. */
-    fun register(relayUrl: String, identity: Identity, secret: String, listed: Boolean): Registered {
+    /**
+     * Registers a fresh identity and returns the Aegis number the relay
+     * allocated. Admission is either the relay's enrollment [secret] or a
+     * one-time [invite] code from someone already registered.
+     */
+    fun register(relayUrl: String, identity: Identity, secret: String?, listed: Boolean, invite: String? = null): Registered {
         val bundle = identity.publicBundle()
         val body = JSONObject()
-            .put("secret", secret)
+            .apply { if (invite != null) put("invite", invite) else put("secret", secret ?: "") }
             .put("ed25519", bundle.ed25519)
             .put("curve25519", bundle.curve25519)
             .put("sealing", bundle.sealing)
@@ -129,6 +133,14 @@ class RelayClient(
             .put("oneTimeKeys", JSONArray(bundle.oneTimeKeys.map { signedKeyJson(it) }))
             .put("fallback", bundle.fallback?.let { signedKeyJson(it) } ?: JSONObject.NULL)
         return signed("PUT", "/v1/keys", body).optInt("oneTimeKeys", 0)
+    }
+
+    data class Invite(val code: String, val expiresAt: Long)
+
+    /** A one-time invite: lets one person register on this relay without the enrollment secret, for a week. */
+    fun createInvite(): Invite {
+        val json = signed("POST", "/v1/invites")
+        return parsed { Invite(json.getString("code"), json.getLong("expiresAt")) }
     }
 
     fun setListed(listed: Boolean) { signed("PUT", "/v1/listed", JSONObject().put("listed", listed)) }

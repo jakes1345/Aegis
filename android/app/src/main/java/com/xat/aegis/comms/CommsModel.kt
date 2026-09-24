@@ -100,6 +100,10 @@ data class CommsState(
 /**
  * The pairing payload carried by a QR code: the relay, the Aegis number and the
  * full public key set, so a scan pins the identity with no trust in the relay.
+ *
+ * With [invite] set it is also an invitation: someone without an Aegis number
+ * registers on [relayUrl] with that one-time code instead of the relay's
+ * enrollment secret, and starts out with the inviter as a contact.
  */
 data class PairingCode(
     val relayUrl: String,
@@ -108,15 +112,23 @@ data class PairingCode(
     val curve25519: String,
     val sealing: String,
     val signature: String,
-    val name: String
+    val name: String,
+    val invite: String? = null
 ) {
     fun encode(): String {
-        val q = listOf(
+        val q = (listOf(
             "r" to relayUrl, "n" to number, "k" to ed25519, "c" to curve25519,
             "s" to sealing, "g" to signature, "d" to name
-        ).joinToString("&") { (k, v) -> "$k=${java.net.URLEncoder.encode(v, "UTF-8")}" }
+        ) + listOfNotNull(invite?.let { "i" to it }))
+            .joinToString("&") { (k, v) -> "$k=${java.net.URLEncoder.encode(v, "UTF-8")}" }
         return "aegis:v1?$q"
     }
+
+    /**
+     * The link to send someone: the relay's invite page, with this payload in
+     * the fragment, which the browser keeps to itself.
+     */
+    fun inviteLink(): String = "$relayUrl/i#" + java.net.URLEncoder.encode(encode(), "UTF-8")
 
     companion object {
         fun decode(text: String): PairingCode? {
@@ -138,8 +150,30 @@ data class PairingCode(
                 curve25519 = params["c"] ?: return null,
                 sealing = params["s"] ?: return null,
                 signature = params["g"] ?: return null,
-                name = params["d"] ?: ""
+                name = params["d"] ?: "",
+                invite = params["i"]?.takeIf { INVITE_CODE.matches(it) }
             )
+        }
+
+        private val INVITE_CODE = Regex("^[A-Za-z0-9_-]{22}$")
+
+        /**
+         * An invite or pairing code from whatever the owner pasted: the code
+         * text itself, the invite link (payload in the fragment), or the
+         * aegis://invite link the invite page opens the app with.
+         */
+        fun fromText(text: String): PairingCode? {
+            val t = text.trim()
+            decode(t)?.let { return it }
+            val candidates = listOfNotNull(
+                t.substringAfter('#', "").takeIf { it.isNotEmpty() },
+                t.substringAfter("c=", "").substringBefore('&').takeIf { it.isNotEmpty() }
+            )
+            for (c in candidates) {
+                val decoded = runCatching { java.net.URLDecoder.decode(c.replace("+", "%2B"), "UTF-8") }.getOrNull() ?: continue
+                decode(decoded)?.let { return it }
+            }
+            return null
         }
     }
 }

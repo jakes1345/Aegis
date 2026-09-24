@@ -1,6 +1,7 @@
 import { parseSigned, verifyEd25519 } from "./auth";
 import { HttpError, json, normaliseNumber, randomNumber, requireSecret, timingSafeEqual, type Env } from "./env";
-import { Mailbox, type Profile, type SignedKey } from "./mailbox";
+import { INVITE_TTL_MS, Mailbox, type Profile, type SignedKey } from "./mailbox";
+import { invitePage } from "./invite-page";
 
 export { Mailbox };
 
@@ -12,14 +13,17 @@ export { Mailbox };
  * relay hands out at registration, and it works only between Aegis apps
  * paired with this relay.
  *
- *   POST   /v1/register        {secret, ed25519, curve25519, sealing, signature, fallback, oneTimeKeys, listed}
+ *   POST   /v1/register        {secret | invite, ed25519, curve25519, sealing, signature, fallback, oneTimeKeys, listed}
  *                              signed by ed25519 (X-Aegis-Sig over the body) → {number}
+ *   GET    /i                                              → invite page; the invite itself is in the URL fragment,
+ *                                                            which browsers never send to the relay
  * Signed (see auth.ts):
  *   GET    /v1/me                                          → profile + key counts
  *   PUT    /v1/keys            {oneTimeKeys, fallback?}    → replenish
  *   PUT    /v1/listed          {listed}
  *   PUT    /v1/push            {endpoint|null}             → UnifiedPush endpoint to wake this device
  *   DELETE /v1/me                                          → wipe the mailbox
+ *   POST   /v1/invites                                     → {code, expiresAt}: one registration, no secret, 7 days
  *   GET    /v1/bundle/:number                              → a contact's keys + one session key (listed only)
  *   GET    /v1/bundle/:number?pin=<ed25519 fingerprint>    → also unlisted, when the caller has the key from a QR
  *   GET    /v1/identity/:number[?pin=]                     → the same keys without claiming a one-time key
@@ -62,6 +66,17 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   const bodyText = request.method === "GET" || request.method === "HEAD" ? "" : await request.text();
 
+  if (request.method === "GET" && path === "/i") {
+    return new Response(invitePage(), {
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "public, max-age=3600",
+        "referrer-policy": "no-referrer",
+        "x-content-type-options": "nosniff",
+      },
+    });
+  }
+
   if (path === "/v1/register") {
     if (request.method !== "POST") throw new HttpError(405, "POST only");
     // A few attempts a minute per address: the enrollment secret cannot be guessed by brute force.
@@ -86,6 +101,15 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (path === "/v1/me" && request.method === "DELETE") {
     await me.wipe();
     return json({ ok: true });
+  }
+
+  if (path === "/v1/invites" && request.method === "POST") {
+    const allowed = await me.rateOk("invite", Mailbox.INVITE_LIMIT, Mailbox.INVITE_BURST);
+    if (!allowed.ok) throw new HttpError(429, "Too many invites today; try again later", allowed.retryAfter);
+    const code = randomInviteCode();
+    const expiresAt = Date.now() + INVITE_TTL_MS;
+    await env.MAILBOX.get(env.MAILBOX.idFromName(`invite:${code}`)).createInvite(profile.number, expiresAt);
+    return json({ code, expiresAt }, 201);
   }
 
   if (path === "/v1/keys" && request.method === "PUT") {
@@ -208,9 +232,9 @@ async function route(request: Request, env: Env): Promise<Response> {
  * a bundle a contact would reject.
  */
 async function register(env: Env, request: Request, bodyText: string): Promise<Response> {
-  const secret = requireSecret(env, "ENROLL_SECRET");
   const body = parseJson<{
     secret?: unknown;
+    invite?: unknown;
     ed25519?: unknown;
     curve25519?: unknown;
     sealing?: unknown;
@@ -219,7 +243,14 @@ async function register(env: Env, request: Request, bodyText: string): Promise<R
     oneTimeKeys?: unknown;
     listed?: unknown;
   }>(bodyText);
-  if (typeof body.secret !== "string" || !timingSafeEqual(body.secret, secret)) throw new HttpError(403, "Enrollment code rejected");
+  // Either the relay's enrollment secret, or an invite a registered phone made.
+  const invite = typeof body.invite === "string" ? body.invite : null;
+  if (invite !== null) {
+    if (!INVITE_CODE_RE.test(invite)) throw new HttpError(403, "That invite code is not valid");
+  } else {
+    const secret = requireSecret(env, "ENROLL_SECRET");
+    if (typeof body.secret !== "string" || !timingSafeEqual(body.secret, secret)) throw new HttpError(403, "Enrollment code rejected");
+  }
   for (const field of ["ed25519", "curve25519", "sealing", "signature"] as const) {
     if (typeof body[field] !== "string" || (body[field] as string).length === 0) throw new HttpError(400, `${field} required`);
   }
@@ -235,6 +266,13 @@ async function register(env: Env, request: Request, bodyText: string): Promise<R
   const oneTimeKeys = await checkedKeys(ed25519, body.oneTimeKeys ?? []);
   const listed = body.listed !== false;
 
+  // Used up only once everything else about the request has checked out.
+  const inviteBox = invite === null ? null : env.MAILBOX.get(env.MAILBOX.idFromName(`invite:${invite}`));
+  if (inviteBox) {
+    const redeemed = await inviteBox.redeemInvite();
+    if (!redeemed.ok) throw new HttpError(403, redeemed.reason);
+  }
+
   for (let attempt = 0; attempt < 8; attempt++) {
     const number = randomNumber();
     const mailbox = env.MAILBOX.get(env.MAILBOX.idFromName(number));
@@ -244,7 +282,18 @@ async function register(env: Env, request: Request, bodyText: string): Promise<R
       return json({ number, profile: publicProfile(profile), oneTimeKeys: oneTimeKeys.length }, 201);
     }
   }
+  if (inviteBox) await inviteBox.releaseInvite();
   throw new HttpError(503, "Could not allocate a number; try again");
+}
+
+/** 128 random bits, base64url: 22 characters. */
+const INVITE_CODE_RE = /^[A-Za-z0-9_-]{22}$/;
+
+function randomInviteCode(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 /** Validates a list of signed keys against the owner's Ed25519 key. */

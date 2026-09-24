@@ -42,6 +42,19 @@ The app generates its identity on the phone, registers it, and shows the Aegis
 number it was given. Two people pair by scanning each other's QR code in
 person, or by typing a listed Aegis number and then comparing safety numbers.
 
+### Inviting people
+
+Only the relay's owner needs the URL and the enrollment secret. Everyone else
+joins by invite: in Aegis, COMMS → INVITE makes a one-time invite. Someone
+standing next to you scans its QR code from COMMS setup (SCAN INVITE); someone
+far away gets a link, `https://<relay>/i#…`, which opens a page with the Aegis
+download and an OPEN IN AEGIS button. The invite registers exactly one phone,
+expires after seven days, and never reveals the enrollment secret. The new
+phone starts with the inviter as a verified contact, since the invite carries
+the inviter's keys, and sends them a first message. The part after `#` never
+reaches the relay; the page reads it in the browser. Each identity can make
+20 invites a day.
+
 ### Calls (optional TURN)
 
 Calls are WebRTC audio between the two phones, keyed by DTLS fingerprints that
@@ -67,7 +80,9 @@ Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| POST | `/v1/register` | Body signed by the new identity's key; allocates an Aegis number |
+| POST | `/v1/register` | Body signed by the new identity's key, with `secret` or a one-time `invite`; allocates an Aegis number |
+| POST | `/v1/invites` | Makes a one-time invite: `{code, expiresAt}` (seven days) |
+| GET | `/i` | Invite landing page (unsigned); the invite is in the URL fragment |
 | GET | `/v1/me` | Own profile and one-time-key count |
 | DELETE | `/v1/me` | Wipe the mailbox |
 | PUT | `/v1/keys` | Replenish one-time keys; rotate the fallback key |

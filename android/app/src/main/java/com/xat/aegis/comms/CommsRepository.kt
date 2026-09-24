@@ -241,18 +241,19 @@ object CommsRepository {
      * allocates the Aegis number. The enrollment secret is used once and never
      * stored; from then on every request is signed by the identity key.
      */
-    suspend fun register(relayUrl: String, secret: String, name: String, listed: Boolean): Result<String> =
+    suspend fun register(relayUrl: String, secret: String, name: String, listed: Boolean, invite: PairingCode? = null): Result<String> =
         withContext(Dispatchers.IO) {
-            lock.withLock {
-                val url = relayUrl.trim().trimEnd('/')
+            val result = lock.withLock {
+                val url = (invite?.relayUrl ?: relayUrl).trim().trimEnd('/')
                 if (!url.startsWith("https://")) return@withLock Result.failure(RelayException("The relay URL must start with https://"))
-                if (secret.isBlank()) return@withLock Result.failure(RelayException("Enter the enrollment secret"))
+                if (invite == null && secret.isBlank()) return@withLock Result.failure(RelayException("Enter the enrollment secret"))
+                if (invite != null && invite.invite == null) return@withLock Result.failure(RelayException("That code is not an invite"))
                 setBusy(true)
                 try {
                     val identity = identities.create()
                     identity.generateOneTimeKeys(ONE_TIME_KEYS_BATCH.toUInt())
                     identities.persist()
-                    val registered = relay.register(url, identity, secret, listed)
+                    val registered = relay.register(url, identity, secret.takeIf { invite == null }, listed, invite?.invite)
                     identity.markKeysPublished()
                     identities.persist()
                     config.saveRegistration(url, registered.number, name.trim().take(40), listed)
@@ -262,7 +263,7 @@ object CommsRepository {
                     config.markOnlineDefaultApplied()
                     publishConfig()
                     setBusy(false)
-                    CommsLog.add("Registered as ${formatAegisNumber(registered.number)} on $url")
+                    CommsLog.add("Registered as ${formatAegisNumber(registered.number)} on $url" + if (invite != null) " with ${formatAegisNumber(invite.number)}'s invite" else "")
                     CommsService.start(appContext)
                     LiveLink.refresh()
                     Result.success(registered.number)
@@ -274,7 +275,26 @@ object CommsRepository {
                     Result.failure(e)
                 }
             }
+            // The inviter's keys came in the invite itself, so they are pinned as a
+            // verified contact, and a first message tells them who joined; their
+            // phone adds this number when it arrives.
+            if (invite != null && result.isSuccess) {
+                addContactFromCode(invite.copy(invite = null))
+                    .onSuccess { contact -> send(contact.number, "Joined Aegis with your invite.") }
+                    .onFailure { CommsLog.add("Could not add ${formatAegisNumber(invite.number)} from the invite: ${it.message}") }
+            }
+            result
         }
+
+    /** A shareable invite from this phone: one registration on this relay, valid for a week. */
+    suspend fun createInvite(): Result<Pair<PairingCode, Long>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val code = pairingCode() ?: throw RelayException("Not registered")
+            val invite = relay.createInvite()
+            CommsLog.add("Invite made; it works once until ${java.text.DateFormat.getDateInstance().format(java.util.Date(invite.expiresAt))}")
+            code.copy(invite = invite.code) to invite.expiresAt
+        }
+    }
 
     /** Deletes the mailbox on the relay (best effort) and everything local. */
     suspend fun unpair() = withContext(Dispatchers.IO) {

@@ -80,6 +80,15 @@ const UNACKED_WAKE_MS = 8_000;
 const HEARTBEAT_MS = 120_000;
 /** Durable Object storage deletes at most this many keys per call. */
 const DELETE_BATCH = 128;
+/** How long an invite can be used. */
+export const INVITE_TTL_MS = 7 * 24 * 60 * 60_000;
+
+/** An invite: one registration without the enrollment secret. Stored in its own object, named after its code. */
+interface Invite {
+  inviter: string;
+  expiresAt: number;
+  used: boolean;
+}
 
 interface NonceRecord {
   [nonce: string]: number;
@@ -112,6 +121,33 @@ export class Mailbox extends DurableObject<Env> {
     await this.ctx.storage.put("cleanupAt", Date.now() + CLEANUP_INTERVAL_MS);
     await this.scheduleAlarm();
     return true;
+  }
+
+  // ── Invites (in an object of their own, named "invite:<code>") ────────
+
+  async createInvite(inviter: string, expiresAt: number): Promise<void> {
+    await this.ctx.storage.put<Invite>("invite", { inviter, expiresAt, used: false });
+    // Deleted once expired, used or not.
+    await this.ctx.storage.setAlarm(expiresAt);
+  }
+
+  /**
+   * Uses the invite up. One object handles one call at a time, so two
+   * registrations racing for the same code cannot both succeed.
+   */
+  async redeemInvite(): Promise<{ ok: true; inviter: string } | { ok: false; reason: string }> {
+    const invite = await this.ctx.storage.get<Invite>("invite");
+    if (!invite) return { ok: false, reason: "This invite does not exist or has expired" };
+    if (invite.used) return { ok: false, reason: "This invite has already been used; ask for a new one" };
+    if (invite.expiresAt <= Date.now()) return { ok: false, reason: "This invite has expired; ask for a new one" };
+    await this.ctx.storage.put<Invite>("invite", { ...invite, used: true });
+    return { ok: true, inviter: invite.inviter };
+  }
+
+  /** Gives the invite back when the registration it was redeemed for did not go through. */
+  async releaseInvite(): Promise<void> {
+    const invite = await this.ctx.storage.get<Invite>("invite");
+    if (invite) await this.ctx.storage.put<Invite>("invite", { ...invite, used: false });
   }
 
   async profile(): Promise<Profile | null> {
@@ -228,6 +264,9 @@ export class Mailbox extends DurableObject<Env> {
   static readonly SEND_LIMIT = SEND_LIMIT_PER_MINUTE;
   static readonly SEND_BURST = SEND_BURST;
   static readonly REGISTER_LIMIT = REGISTER_LIMIT_PER_MINUTE;
+  /** Invites per identity: twenty a day, refilled over the day. */
+  static readonly INVITE_LIMIT = 20 / (24 * 60);
+  static readonly INVITE_BURST = 20;
   static readonly TURN_LIMIT = 20;
 
   /** storage.delete() takes at most 128 keys; larger sets go in batches. */
@@ -348,6 +387,12 @@ export class Mailbox extends DurableObject<Env> {
    */
   override async alarm(): Promise<void> {
     const now = Date.now();
+    const invite = await this.ctx.storage.get<Invite>("invite");
+    if (invite) {
+      if (invite.expiresAt <= now) await this.ctx.storage.deleteAll();
+      else await this.ctx.storage.setAlarm(invite.expiresAt);
+      return;
+    }
     for (const ws of this.ctx.getWebSockets()) {
       try {
         ws.send(JSON.stringify({ type: "hb", ts: now }));

@@ -175,7 +175,9 @@ jobs:
             echo "keeping COMMS \"Online\" makes incoming calls ring reliably."
             echo
             echo "To use COMMS you (or someone you trust) deploy the relay in \`comms-worker/\`"
-            echo "to Cloudflare once; the README there has the three commands. Camera is asked"
+            echo "to Cloudflare once; the README there has the three commands. Everyone else joins"
+            echo "by invite: COMMS → INVITE makes a one-time QR code or link, so nobody else needs"
+            echo "the relay URL or its enrollment secret. Camera is asked"
             echo "for when scanning a contact's code; Microphone as soon as you have a number, so"
             echo "a call can be answered straight from the lock screen. On Android 14+, allow"
             echo "full-screen calls when COMMS settings asks, and set Aegis's battery use to"
