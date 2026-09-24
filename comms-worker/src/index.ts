@@ -22,6 +22,7 @@ export { Mailbox };
  *   DELETE /v1/me                                          → wipe the mailbox
  *   GET    /v1/bundle/:number                              → a contact's keys + one session key (listed only)
  *   GET    /v1/bundle/:number?pin=<ed25519 fingerprint>    → also unlisted, when the caller has the key from a QR
+ *   GET    /v1/identity/:number[?pin=]                     → the same keys without claiming a one-time key
  *   POST   /v1/send            {to, envelope}              → queue for a contact
  *   GET    /v1/inbox                                       → waiting envelopes
  *   POST   /v1/ack             {ids}
@@ -32,7 +33,19 @@ export default {
     try {
       return await route(request, env);
     } catch (e) {
-      if (e instanceof HttpError) return json({ error: e.message }, e.status);
+      if (e instanceof HttpError) {
+        const res = json({ error: e.message }, e.status);
+        if (e.retryAfter !== undefined) res.headers.set("retry-after", String(e.retryAfter));
+        return res;
+      }
+      // A Durable Object being restarted (a deploy, an overloaded object) is
+      // temporary: tell the client to try again rather than fail for good.
+      const err = e as { retryable?: boolean; overloaded?: boolean };
+      if (err?.retryable || err?.overloaded) {
+        const res = json({ error: "Relay busy; try again" }, 503);
+        res.headers.set("retry-after", "2");
+        return res;
+      }
       console.error(e);
       return json({ error: "Internal error" }, 500);
     }
@@ -51,6 +64,10 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (path === "/v1/register") {
     if (request.method !== "POST") throw new HttpError(405, "POST only");
+    // A few attempts a minute per address: the enrollment secret cannot be guessed by brute force.
+    const guard = env.MAILBOX.get(env.MAILBOX.idFromName(`register-guard:${request.headers.get("cf-connecting-ip") ?? "unknown"}`));
+    const allowed = await guard.rateOk("register", Mailbox.REGISTER_LIMIT);
+    if (!allowed.ok) throw new HttpError(429, "Too many registration attempts; try again in a minute", allowed.retryAfter);
     return register(env, request, bodyText);
   }
 
@@ -99,7 +116,8 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   const bundleMatch = /^\/v1\/bundle\/([0-9]{9})$/.exec(path);
   if (bundleMatch && bundleMatch[1] && request.method === "GET") {
-    if (!(await me.rateOk("lookup", Mailbox.LOOKUP_LIMIT))) throw new HttpError(429, "Too many lookups; try again in a minute");
+    const allowed = await me.rateOk("lookup", Mailbox.LOOKUP_LIMIT);
+    if (!allowed.ok) throw new HttpError(429, "Too many lookups; try again in a minute", allowed.retryAfter);
     const target = normaliseNumber(bundleMatch[1]);
     if (!target) throw new HttpError(400, "Bad number");
     const pin = url.searchParams.get("pin");
@@ -119,9 +137,31 @@ async function route(request: Request, env: Env): Promise<Response> {
     return json({ bundle });
   }
 
+  const identityMatch = /^\/v1\/identity\/([0-9]{9})$/.exec(path);
+  if (identityMatch && identityMatch[1] && request.method === "GET") {
+    // Who holds a number, without claiming one of their one-time keys: used to
+    // confirm the sender of a first message. Same listed/pin rules as bundles.
+    const allowed = await me.rateOk("lookup", Mailbox.LOOKUP_LIMIT);
+    if (!allowed.ok) throw new HttpError(429, "Too many lookups; try again in a minute", allowed.retryAfter);
+    const target = normaliseNumber(identityMatch[1]);
+    if (!target) throw new HttpError(400, "Bad number");
+    const pin = url.searchParams.get("pin");
+    const them = env.MAILBOX.get(env.MAILBOX.idFromName(target));
+    let identity = null;
+    if (pin === null) {
+      identity = await them.identity(true);
+    } else {
+      const p = await them.profile();
+      if (p && timingSafeEqual(await fingerprint(p.ed25519), pin)) identity = await them.identity(false);
+    }
+    if (!identity) throw new HttpError(404, "No such Aegis number, or it is unlisted");
+    return json({ identity });
+  }
+
   if (path === "/v1/send" && request.method === "POST") {
     // Per-sender cap, so one registered identity cannot fill another's mailbox.
-    if (!(await me.rateOk("send", Mailbox.SEND_LIMIT))) throw new HttpError(429, "Too many messages; try again in a minute");
+    const allowed = await me.rateOk("send", Mailbox.SEND_LIMIT, Mailbox.SEND_BURST);
+    if (!allowed.ok) throw new HttpError(429, "Too many messages; try again shortly", allowed.retryAfter);
     const body = parseJson<{ to?: unknown; envelope?: unknown }>(bodyText);
     const to = typeof body.to === "string" ? normaliseNumber(body.to) : null;
     if (!to) throw new HttpError(400, "to must be an Aegis number");
@@ -150,8 +190,11 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
 
   if (path === "/v1/turn" && request.method === "GET") {
-    if (!(await me.rateOk("turn", Mailbox.TURN_LIMIT))) throw new HttpError(429, "Too many requests; try again in a minute");
-    return json({ iceServers: await iceServers(env) });
+    const allowed = await me.rateOk("turn", Mailbox.TURN_LIMIT);
+    if (!allowed.ok) throw new HttpError(429, "Too many requests; try again in a minute", allowed.retryAfter);
+    const servers = await iceServers(env);
+    // "turn" tells the app whether calls can be relayed when the phones cannot reach each other directly.
+    return json({ iceServers: servers, turn: servers.some((s) => s.urls.some((u) => u.startsWith("turn"))) });
   }
 
   throw new HttpError(404, "Not found");
@@ -256,11 +299,17 @@ let turnCache: { servers: IceServer[]; expires: number } | null = null;
 async function iceServers(env: Env): Promise<IceServer[]> {
   if (!env.TURN_KEY_ID || !env.TURN_KEY_API_TOKEN) return STUN_ONLY;
   if (turnCache && turnCache.expires > Date.now()) return turnCache.servers;
-  const res = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${env.TURN_KEY_API_TOKEN}`, "content-type": "application/json" },
-    body: JSON.stringify({ ttl: TURN_TTL_S }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.TURN_KEY_API_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({ ttl: TURN_TTL_S }),
+    });
+  } catch (e) {
+    console.error("TURN credential request threw", e);
+    return turnCache?.servers ?? STUN_ONLY;
+  }
   if (!res.ok) {
     console.error("TURN credential request failed", res.status, await res.text());
     return turnCache?.servers ?? STUN_ONLY;

@@ -47,9 +47,10 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
                 ts INTEGER NOT NULL
             )"""
         )
-        // Decrypted payloads whose sender could not be confirmed with the relay
-        // yet (it was unreachable). The ratchet has moved on, so the plaintext
-        // is kept here, encrypted, until the next sync resolves the sender.
+        // Every decrypted payload is staged here, in the same transaction that
+        // marks its envelope seen, before anything that can fail acts on it.
+        // The ratchet has moved on, so this copy is the only one; a row stays
+        // until the payload has been processed (or its sender refused).
         db.execSQL(
             """CREATE TABLE pending_inbound (
                 id TEXT PRIMARY KEY,
@@ -58,11 +59,26 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
                 payload_enc BLOB NOT NULL
             )"""
         )
+        createVersion2(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Version 1 is the first schema for the end-to-end module. The Twilio-era
+        // Version 1 was the first schema for the end-to-end module. The Twilio-era
         // database (comms.db) is deleted by CommsRepository.init on first run.
+        if (oldVersion < 2) createVersion2(db)
+    }
+
+    /** Receipts owed to contacts (sent, and retried, outside the repository lock) and an index for purging. */
+    private fun createVersion2(db: SQLiteDatabase) {
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS receipts (
+                peer TEXT NOT NULL,
+                id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY (peer, id)
+            )"""
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS seen_envelopes_ts ON seen_envelopes (ts)")
     }
 
     // ── Contacts ─────────────────────────────────────────────────────────
@@ -117,6 +133,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         val db = writableDatabase
         db.beginTransaction()
         try {
+            db.delete("receipts", "peer = ?", arrayOf(number))
             db.delete("messages", "peer = ?", arrayOf(number))
             db.delete("contacts", "number = ?", arrayOf(number))
             db.setTransactionSuccessful()
@@ -144,13 +161,29 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
     fun hasMessage(id: String): Boolean =
         readableDatabase.rawQuery("SELECT 1 FROM messages WHERE id = ?", arrayOf(id)).use { it.moveToFirst() }
 
+    /** Whether the inbound message [id] has been read; null when there is no such message. */
+    fun isRead(id: String): Boolean? =
+        readableDatabase.rawQuery("SELECT read FROM messages WHERE id = ?", arrayOf(id)).use { c ->
+            if (c.moveToFirst()) c.getInt(0) != 0 else null
+        }
+
+    /** A message's status and error, without decrypting its body. */
+    fun statusOf(id: String): Pair<String, String?>? =
+        readableDatabase.rawQuery("SELECT status, error FROM messages WHERE id = ?", arrayOf(id)).use { c ->
+            if (c.moveToFirst()) c.getString(0) to (if (c.isNull(1)) null else c.getString(1)) else null
+        }
+
     fun setStatus(id: String, status: String, error: String? = null) {
         val values = ContentValues().apply { put("status", status); put("error", error) }
         writableDatabase.update("messages", values, "id = ?", arrayOf(id))
     }
 
-    /** Advances outbound statuses, never backwards (a late "delivered" after "read"). */
-    fun advanceStatus(ids: List<String>, status: String) {
+    /**
+     * Advances the status of our messages to [peer], never backwards (a late
+     * "delivered" after "read"). Only messages sent to that contact can be
+     * receipted by them; nothing is decrypted.
+     */
+    fun advanceStatus(peer: String, ids: List<String>, status: String) {
         if (ids.isEmpty()) return
         val rank = mapOf("queued" to 0, "sent" to 1, "delivered" to 2, "read" to 3)
         val target = rank[status] ?: return
@@ -158,7 +191,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         db.beginTransaction()
         try {
             for (id in ids) {
-                val current = db.rawQuery("SELECT status FROM messages WHERE id = ? AND direction = 'OUT'", arrayOf(id)).use { c ->
+                val current = db.rawQuery("SELECT status FROM messages WHERE id = ? AND peer = ? AND direction = 'OUT'", arrayOf(id, peer)).use { c ->
                     if (c.moveToFirst()) c.getString(0) else null
                 } ?: continue
                 if ((rank[current] ?: -1) < target) {
@@ -177,6 +210,21 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             while (c.moveToNext()) readMessage(c)?.let { out += it }
             out
         }
+
+    /**
+     * Puts messages to [peer] that the relay took but [peer] never confirmed
+     * back in the send queue; returns how many. Used when [peer] reports it
+     * could not read something from this phone: whatever that was is gone from
+     * the relay, and resending is safe because the receiver drops a message
+     * id it already has.
+     */
+    fun requeueUndelivered(peer: String, sinceTs: Long): Int {
+        val values = ContentValues().apply { put("status", "queued"); putNull("error") }
+        return writableDatabase.update(
+            "messages", values,
+            "peer = ? AND direction = 'OUT' AND status = 'sent' AND ts > ?", arrayOf(peer, sinceTs.toString())
+        )
+    }
 
     /** Outbound messages still waiting to be sent, oldest first. */
     fun queued(): List<ChatMessage> =
@@ -200,17 +248,39 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         }.sortedByDescending { it.lastMessage?.ts ?: it.contact.addedTs }
     }
 
-    /** Marks a conversation read and returns the ids that were unread, for read receipts. */
+    /**
+     * Marks a conversation read and returns the ids that were unread, for read
+     * receipts. Only those ids are updated, so a message arriving in between is
+     * neither marked read unseen nor left out of the receipt.
+     */
     fun markRead(peer: String): List<String> {
         val db = writableDatabase
-        val ids = db.rawQuery("SELECT id FROM messages WHERE peer = ? AND direction = 'IN' AND read = 0", arrayOf(peer)).use { c ->
-            val out = ArrayList<String>()
-            while (c.moveToNext()) out += c.getString(0)
-            out
+        db.beginTransaction()
+        try {
+            val ids = db.rawQuery("SELECT id FROM messages WHERE peer = ? AND direction = 'IN' AND read = 0 AND status != ?", arrayOf(peer, STATUS_CALL)).use { c ->
+                val out = ArrayList<String>()
+                while (c.moveToNext()) out += c.getString(0)
+                out
+            }
+            for (id in ids) db.execSQL("UPDATE messages SET read = 1 WHERE id = ?", arrayOf(id))
+            // Missed-call entries are read too, but are not messages to receipt.
+            db.execSQL("UPDATE messages SET read = 1 WHERE peer = ? AND direction = 'IN' AND read = 0", arrayOf(peer))
+            db.setTransactionSuccessful()
+            return ids
+        } finally {
+            db.endTransaction()
         }
-        if (ids.isNotEmpty()) db.execSQL("UPDATE messages SET read = 1 WHERE peer = ? AND direction = 'IN' AND read = 0", arrayOf(peer))
-        return ids
     }
+
+    /** The newest unread inbound messages from [peer], for the notification; only these are decrypted. */
+    fun unreadInbound(peer: String, limit: Int): List<ChatMessage> =
+        readableDatabase.query(
+            "messages", null, "peer = ? AND direction = 'IN' AND read = 0", arrayOf(peer), null, null, "ts DESC", limit.toString()
+        ).use { c ->
+            val out = ArrayList<ChatMessage>()
+            while (c.moveToNext()) readMessage(c)?.let { out += it }
+            out.reversed()
+        }
 
     fun unreadCount(): Int =
         readableDatabase.rawQuery("SELECT COUNT(*) FROM messages WHERE direction = 'IN' AND read = 0", null).use { c ->
@@ -219,17 +289,103 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
 
     // ── Envelope bookkeeping ─────────────────────────────────────────────
 
-    fun isEnvelopeSeen(id: String): Boolean =
-        readableDatabase.rawQuery("SELECT 1 FROM seen_envelopes WHERE id = ?", arrayOf(id)).use { it.moveToFirst() }
+    fun isEnvelopeSeen(key: String): Boolean =
+        readableDatabase.rawQuery("SELECT 1 FROM seen_envelopes WHERE id = ?", arrayOf(key)).use { it.moveToFirst() }
 
-    /** Records an envelope id; false when it was already processed. */
-    fun markEnvelopeSeen(id: String, ts: Long): Boolean {
-        val values = ContentValues().apply { put("id", id); put("ts", ts) }
+    /** Records an envelope; false when it was already processed. [key] is a digest of its content. */
+    fun markEnvelopeSeen(key: String, ts: Long): Boolean {
+        val values = ContentValues().apply { put("id", key); put("ts", ts) }
         val row = writableDatabase.insertWithOnConflict("seen_envelopes", null, values, SQLiteDatabase.CONFLICT_IGNORE)
-        if (row != -1L) {
-            writableDatabase.execSQL("DELETE FROM seen_envelopes WHERE ts < ?", arrayOf(System.currentTimeMillis() - 45L * 24 * 3600_000L))
-        }
+        if (row != -1L) purgeSeen()
         return row != -1L
+    }
+
+    /**
+     * Marks the envelope [key] seen and stages its decrypted [payload] in one
+     * transaction, so a crash or an error afterwards can never leave it seen
+     * but unprocessed. False when it was already seen.
+     */
+    fun markSeenAndStage(key: String, ts: Long, senderCurve25519: String, payload: String): Boolean {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val seen = ContentValues().apply { put("id", key); put("ts", ts) }
+            if (db.insertWithOnConflict("seen_envelopes", null, seen, SQLiteDatabase.CONFLICT_IGNORE) == -1L) return false
+            val staged = ContentValues().apply {
+                put("id", key)
+                put("ts", ts)
+                put("sender", senderCurve25519)
+                put("payload_enc", KeystoreBox.encryptString(payload))
+            }
+            db.insertWithOnConflict("pending_inbound", null, staged, SQLiteDatabase.CONFLICT_REPLACE)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        purgeSeen()
+        return true
+    }
+
+    @Volatile
+    private var lastSeenPurge = 0L
+
+    /** Envelopes older than the relay keeps them (30 days) can never come back; forget them hourly. */
+    private fun purgeSeen() {
+        val now = System.currentTimeMillis()
+        if (now - lastSeenPurge < 3_600_000L) return
+        lastSeenPurge = now
+        writableDatabase.execSQL("DELETE FROM seen_envelopes WHERE ts < ?", arrayOf(now - 45L * 24 * 3600_000L))
+    }
+
+    // ── Receipts owed ────────────────────────────────────────────────────
+
+    /** Records that [peer] is owed a receipt for [ids]; "read" replaces "delivered", never the reverse. */
+    fun queueReceipt(peer: String, ids: List<String>, status: String) {
+        if (ids.isEmpty()) return
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            for (id in ids) {
+                db.execSQL(
+                    "INSERT INTO receipts (peer, id, status) VALUES (?, ?, ?) " +
+                        "ON CONFLICT(peer, id) DO UPDATE SET status = excluded.status WHERE receipts.status != 'read'",
+                    arrayOf(peer, id, status)
+                )
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    fun hasPendingReceipts(): Boolean =
+        readableDatabase.rawQuery("SELECT 1 FROM receipts LIMIT 1", null).use { it.moveToFirst() }
+
+    /** Receipts owed, by contact and then status. */
+    fun pendingReceipts(): Map<String, Map<String, List<String>>> {
+        val out = LinkedHashMap<String, MutableMap<String, MutableList<String>>>()
+        readableDatabase.rawQuery("SELECT peer, id, status FROM receipts", null).use { c ->
+            while (c.moveToNext()) {
+                out.getOrPut(c.getString(0)) { LinkedHashMap() }.getOrPut(c.getString(2)) { ArrayList() } += c.getString(1)
+            }
+        }
+        return out
+    }
+
+    /** Forgets receipts that went out (or can never go); a receipt upgraded to "read" meanwhile stays. */
+    fun clearReceipts(peer: String, ids: List<String>, status: String) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            for (id in ids) db.delete("receipts", "peer = ? AND id = ? AND status = ?", arrayOf(peer, id, status))
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    fun clearReceiptsFor(peer: String) {
+        writableDatabase.delete("receipts", "peer = ?", arrayOf(peer))
     }
 
     // ── Inbound payloads awaiting sender confirmation ────────────────────
@@ -262,6 +418,9 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             out
         }
 
+    fun hasPending(): Boolean =
+        readableDatabase.rawQuery("SELECT 1 FROM pending_inbound LIMIT 1", null).use { it.moveToFirst() }
+
     fun deletePending(id: String) {
         writableDatabase.delete("pending_inbound", "id = ?", arrayOf(id))
     }
@@ -272,6 +431,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         db.delete("contacts", null, null)
         db.delete("seen_envelopes", null, null)
         db.delete("pending_inbound", null, null)
+        db.delete("receipts", null, null)
     }
 
     private fun readContact(c: Cursor) = Contact(
@@ -304,6 +464,6 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
 
     private companion object {
         const val DB_NAME = "comms_e2ee.db"
-        const val DB_VERSION = 1
+        const val DB_VERSION = 2
     }
 }

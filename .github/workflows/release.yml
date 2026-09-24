@@ -176,7 +176,10 @@ jobs:
             echo
             echo "To use COMMS you (or someone you trust) deploy the relay in \`comms-worker/\`"
             echo "to Cloudflare once; the README there has the three commands. Camera is asked"
-            echo "for when scanning a contact's code, Microphone when placing or answering a call."
+            echo "for when scanning a contact's code; Microphone as soon as you have a number, so"
+            echo "a call can be answered straight from the lock screen. On Android 14+, allow"
+            echo "full-screen calls when COMMS settings asks, and set Aegis's battery use to"
+            echo "Unrestricted so the background connection survives the screen being off."
             echo
             echo "**Install**"
             echo

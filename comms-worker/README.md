@@ -77,7 +77,7 @@ Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
 | POST | `/v1/send` | `{to, envelope}`: queue a sealed envelope for a contact |
 | GET | `/v1/inbox` | Waiting envelopes |
 | POST | `/v1/ack` | Delete envelopes the app has stored |
-| GET | `/v1/ws` | Live delivery over a hibernatable WebSocket |
+| GET | `/v1/ws` | Live delivery over a hibernatable WebSocket: `envelope` frames (acked with `{"type":"ack","ids":[…]}`), a `ready` frame after the backlog, a `hb` heartbeat every two minutes, and `pong` for a client's `{"type":"ping"}` |
 | GET | `/v1/turn` | ICE servers for a call: STUN, plus short-lived TURN credentials when a TURN key is configured |
 
 Each Aegis number is a Durable Object holding the keys, the queue (up to 2000

@@ -25,12 +25,15 @@ import com.xat.aegis.comms.CommsRepository
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        val action = intent.action
+        if (action != Intent.ACTION_BOOT_COMPLETED && action != Intent.ACTION_MY_PACKAGE_REPLACED) return
 
         // Encrypted calls and messages: an owner who keeps comms online gets the
-        // relay connection back after a reboot, instead of missing every call
-        // until they happen to open Aegis. init() starts it only in that case.
+        // relay connection back after a reboot, or after installing an update
+        // (which stops it), instead of missing every call until they happen to
+        // open Aegis. init() starts it only in that case.
         runCatching { CommsRepository.init(context.applicationContext) }
+        if (action != Intent.ACTION_BOOT_COMPLETED) return
 
         AppSettings.load(context)
         if (!AppSettings.scanEnabled || !AppSettings.resumeAfterReboot) return

@@ -30,6 +30,8 @@
          many phones (Samsung especially) otherwise cuts the background relay
          connection so incoming calls never ring. Asked for from COMMS settings. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- COMMS calls: the proximity sensor switches the screen off at the ear. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Wi-Fi anomaly scan reads the system's cached scan results only -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -50,6 +52,7 @@
 
     <application
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
@@ -88,6 +91,25 @@
                 android:resource="@xml/nfc_tech_filter" />
         </activity>
 
+        <!--
+            The call screen incoming-call and ongoing-call notifications open. It
+            alone shows over the lock screen and turns the display on (declared
+            here as well, so the system opens it from a locked phone without asking
+            for the PIN first), and runs in its own task so ending the call returns
+            to wherever the owner was. Not exported: only Aegis's own notifications
+            can open it, so no other app can make Aegis answer a call.
+        -->
+        <activity
+            android:name=".CallActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:taskAffinity="com.xat.aegis.call"
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.Aegis" />
+
         <service
             android:name=".ScanService"
             android:exported="false"
@@ -98,6 +120,8 @@
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- An update stops the COMMS connection; bring it back. -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 
@@ -146,13 +170,18 @@
 
         <!--
             An encrypted call in progress: holds the microphone and the WebRTC
-            connection while the owner talks. Started only from the app's own
-            screen (placing a call, or accepting one from its notification).
+            connection while the owner talks. Started only from an Aegis screen
+            (placing a call, or answering one on the call screen).
         -->
         <service
             android:name=".comms.CallService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+
+        <!-- Periodic check that the background relay connection is still alive. -->
+        <receiver
+            android:name=".comms.LinkWatchdog"
+            android:exported="false" />
 
         <!-- Decline / hang-up buttons on call notifications. -->
         <receiver

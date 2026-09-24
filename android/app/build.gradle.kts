@@ -80,6 +80,28 @@ val uniffiBindgen by tasks.registering(Exec::class) {
 
 tasks.named("preBuild") { dependsOn(uniffiBindgen) }
 
+// The JVM unit tests load the same crate built for this machine, so the relay
+// round-trip tests exercise the real Olm and sealing code rather than a stand-in.
+val rustHostLib = rustCrate.resolve("target/release")
+val cargoHostBuild by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Builds comms-crypto for the build machine, for the JVM unit tests"
+    workingDir = rustCrate
+    inputs.dir(rustCrate.resolve("src"))
+    inputs.files(rustCrate.resolve("Cargo.toml"), rustCrate.resolve("Cargo.lock"))
+    outputs.dir(rustHostLib)
+    commandLine("cargo", "build", "--release", "--lib")
+}
+
+tasks.withType<Test>().configureEach {
+    dependsOn(cargoHostBuild)
+    systemProperty("jna.library.path", rustHostLib.absolutePath)
+    // The relay round-trip tests run only when a relay and enrollment secret are
+    // given in the environment (AEGIS_RELAY_URL, AEGIS_ENROLL_SECRET); they are
+    // forwarded from the build's own environment and never stored in the repo.
+    testLogging { events("passed", "skipped", "failed"); showStandardStreams = true; exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL }
+}
+
 android {
     namespace = "com.xat.aegis"
     compileSdk = 35
@@ -88,8 +110,8 @@ android {
         applicationId = "com.xat.aegis"
         minSdk = 31
         targetSdk = 35
-        versionCode = 14
-        versionName = "2.2.2"
+        versionCode = 16
+        versionName = "2.3.0"
     }
 
     buildTypes {
@@ -114,6 +136,11 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    testOptions {
+        // android.util.Log and friends return defaults on the JVM instead of throwing.
+        unitTests.isReturnDefaultValues = true
     }
 
     sourceSets {
@@ -166,4 +193,10 @@ dependencies {
     implementation("org.unifiedpush.android:connector:3.3.5")
     // Calls: prebuilt libwebrtc (audio over DTLS-SRTP, signalled through the encrypted envelopes).
     implementation("io.getstream:stream-webrtc-android:1.3.10")
+
+    testImplementation("junit:junit:4.13.2")
+    // The real org.json: android.jar only carries stubs of it.
+    testImplementation("org.json:json:20240303")
+    // The desktop JNA jar carries the native dispatch library for the build machine.
+    testImplementation("net.java.dev.jna:jna:5.19.1")
 }

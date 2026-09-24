@@ -1,5 +1,6 @@
 package com.xat.aegis.comms
 
+import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -47,27 +48,52 @@ class CommsService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        promote(LiveLink.connected.value)
+        if (!promote(LiveLink.connected.value)) return START_NOT_STICKY
         LiveLink.hold(HOLD)
+        LinkWatchdog.schedule(this)
         if (watcher?.isActive != true) {
-            watcher = scope.launch { LiveLink.connected.collect { promote(it) } }
+            // Later changes only update the notification; going foreground again
+            // could be refused from the background and would gain nothing.
+            watcher = scope.launch {
+                LiveLink.connected.collect { connected ->
+                    runCatching {
+                        getSystemService(NotificationManager::class.java)?.notify(
+                            CommsNotifications.LINK_NOTIFICATION_ID,
+                            CommsNotifications.linkNotification(this@CommsService, connected, CommsRepository.number())
+                        )
+                    }
+                }
+            }
         }
         return START_STICKY
     }
 
-    private fun promote(connected: Boolean) {
+    /**
+     * Goes foreground. Android can refuse (a sticky restart while the app is in
+     * the background, for one); an uncaught refusal used to crash the whole
+     * process, taking a call being rung or a sync with it. A refusal now stops
+     * the service; the app starts it again the next time it is opened.
+     */
+    private fun promote(connected: Boolean): Boolean = try {
         val notification = CommsNotifications.linkNotification(this, connected, CommsRepository.number())
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(CommsNotifications.LINK_NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
         } else {
             startForeground(CommsNotifications.LINK_NOTIFICATION_ID, notification)
         }
+        true
+    } catch (e: Exception) {
+        Log.w(TAG, "could not go foreground", e)
+        CommsLog.add("Android refused the background connection (${e.javaClass.simpleName}); it restarts when Aegis is opened")
+        stopSelf()
+        false
     }
 
     override fun onDestroy() {
         watcher?.cancel()
         scope.cancel()
         LiveLink.release(HOLD)
+        if (!CommsRepository.state.value.online) LinkWatchdog.cancel(this)
         super.onDestroy()
     }
 
@@ -78,8 +104,10 @@ class CommsService : Service() {
 
         /**
          * Starts the connection service. Android refuses a foreground start from
-         * a background process (a push wake, for example); that case is logged
-         * and the next time the app opens it starts normally.
+         * a background process (a push wake, for example) unless Aegis is exempt
+         * from battery optimisation; opening the app starts it again
+         * ([CommsRepository.onAppVisible]), and so does the connection watchdog
+         * when Android allows it.
          */
         fun start(context: Context) {
             runCatching { context.startForegroundCompat(Intent(context, CommsService::class.java)) }

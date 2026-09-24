@@ -30,6 +30,11 @@ class CommsConfig(context: Context) {
 
     fun markOnlineDefaultApplied() { prefs.edit().putBoolean(KEY_ONLINE_DEFAULT, true).apply() }
 
+    /** When this identity last published a new fallback key; 0 before the first rotation. */
+    val fallbackRotatedAt: Long get() = prefs.getLong(KEY_FALLBACK_ROTATED, 0L)
+
+    fun setFallbackRotatedAt(ts: Long) { prefs.edit().putLong(KEY_FALLBACK_ROTATED, ts).apply() }
+
     fun saveRegistration(relayUrl: String, number: String, name: String, listed: Boolean) {
         prefs.edit()
             .putString(KEY_RELAY, relayUrl.trimEnd('/'))
@@ -67,6 +72,7 @@ class CommsConfig(context: Context) {
         const val KEY_ONLINE = "online"
         const val KEY_PUSH = "push_endpoint"
         const val KEY_ONLINE_DEFAULT = "online_default_applied"
+        const val KEY_FALLBACK_ROTATED = "fallback_rotated_at"
         val LEGACY_KEYS = listOf(
             "worker_url", "device_id", "token_enc", "sync_seq", "sync_updated",
             "push_token", "sync_calls", "voice_token", "voice_at"

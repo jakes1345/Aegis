@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Keys held by the Android Keystore never leave the phone, so anything
+    encrypted with them is useless on another device. A "copy apps & data"
+    transfer used to carry the COMMS identity and its wrapped key across
+    without the Keystore key: the new phone looked registered under the old
+    Aegis number but could not send, receive or unpair. These stay behind;
+    the new phone registers its own identity. The card vault is sealed the
+    same way. Cloud backup is off entirely (allowBackup="false").
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="comms_identity.pickle" />
+        <exclude domain="sharedpref" path="comms_identity.xml" />
+        <exclude domain="sharedpref" path="comms.xml" />
+        <exclude domain="sharedpref" path="comms_log.xml" />
+        <exclude domain="sharedpref" path="card_vault.xml" />
+        <exclude domain="database" path="comms_e2ee.db" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="comms_identity.pickle" />
+        <exclude domain="sharedpref" path="comms_identity.xml" />
+        <exclude domain="sharedpref" path="comms.xml" />
+        <exclude domain="sharedpref" path="comms_log.xml" />
+        <exclude domain="sharedpref" path="card_vault.xml" />
+        <exclude domain="database" path="comms_e2ee.db" />
+    </device-transfer>
+</data-extraction-rules>
