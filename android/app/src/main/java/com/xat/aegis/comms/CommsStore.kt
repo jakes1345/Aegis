@@ -427,11 +427,17 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
 
     fun clearAll() {
         val db = writableDatabase
-        db.delete("messages", null, null)
-        db.delete("contacts", null, null)
-        db.delete("seen_envelopes", null, null)
-        db.delete("pending_inbound", null, null)
-        db.delete("receipts", null, null)
+        db.beginTransaction()
+        try {
+            db.delete("messages", null, null)
+            db.delete("contacts", null, null)
+            db.delete("seen_envelopes", null, null)
+            db.delete("pending_inbound", null, null)
+            db.delete("receipts", null, null)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
     private fun readContact(c: Cursor) = Contact(

@@ -558,23 +558,54 @@ object CommsRepository {
         class Ready(val envelope: ByteArray) : Prepared()
         class Failed(val reason: String) : Prepared()
         class Offline(val reason: String) : Prepared()
+        // No Olm session exists yet; caller must fetch a bundle outside the lock, then retry.
+        object NeedBundle : Prepared()
     }
 
-    /** Encrypts under the lock, then hands the envelope to the relay without holding it. */
-    private suspend fun deliver(contact: Contact, payload: JSONObject): Deliver =
-        when (val p = lock.withLock { prepareLocked(contact, payload) }) {
+    /**
+     * Encrypts under the lock, then hands the envelope to the relay without holding it.
+     * If no Olm session exists for this contact the bundle fetch is done outside the lock
+     * to avoid blocking unrelated envelope processing (including ICE candidates) for up
+     * to 25 seconds while a network call completes.
+     */
+    private suspend fun deliver(contact: Contact, payload: JSONObject): Deliver {
+        // Phase 1: attempt encryption; if a fresh bundle is needed, surface that before
+        // touching the network so the lock is held only for in-memory crypto work.
+        val firstPass = lock.withLock { prepareLocked(contact, payload, null) }
+        if (firstPass !is Prepared.NeedBundle) {
+            return when (firstPass) {
+                is Prepared.Ready -> transmit(contact, firstPass.envelope)
+                is Prepared.Failed -> Deliver.Failed(firstPass.reason)
+                is Prepared.Offline -> Deliver.Offline(firstPass.reason)
+                else -> Deliver.Failed("Unexpected state")
+            }
+        }
+        // Phase 2: fetch the bundle without holding the ratchet lock.
+        val bundle = try {
+            relay.bundle(contact.number, fingerprint(contact.ed25519))
+        } catch (e: RelayException) {
+            return relayOutcome(e)
+        }
+        // Phase 3: encrypt with the pre-fetched bundle.
+        return when (val p = lock.withLock { prepareLocked(contact, payload, bundle) }) {
             is Prepared.Ready -> transmit(contact, p.envelope)
             is Prepared.Failed -> Deliver.Failed(p.reason)
             is Prepared.Offline -> Deliver.Offline(p.reason)
+            else -> Deliver.Failed("Unexpected state")
         }
+    }
 
     /**
      * Adds this identity to [payload] and encrypts it for [contact], starting a
      * session first if there is none. The ratchet step is saved before this
      * returns, so the envelope can go out after the lock is released and in any
      * order relative to others. Caller holds [lock].
+     *
+     * Pass [bundle] when a new session is needed (returned [Prepared.NeedBundle] on a
+     * previous call); if [bundle] is null and no session exists, returns [Prepared.NeedBundle]
+     * immediately so the caller can fetch it without the lock.
      */
-    private fun prepareLocked(contact: Contact, payload: JSONObject): Prepared {
+    private fun prepareLocked(contact: Contact, payload: JSONObject, bundle: RelayClient.Bundle?): Prepared {
         val label = contact.name.ifBlank { formatAegisNumber(contact.number) }
         // Nothing goes to keys the owner has not looked at since they changed.
         if (contact.keyChanged) return Prepared.Failed("$label's keys have changed. Scan their code or compare safety numbers before messaging them.")
@@ -583,7 +614,7 @@ object CommsRepository {
             putSelf(payload)
             val identity = identities.get() ?: return Prepared.Failed("No identity on this device")
             if (!identity.hasSession(contact.curve25519)) {
-                val bundle = relay.bundle(contact.number, fingerprint(contact.ed25519))
+                if (bundle == null) return Prepared.NeedBundle
                 if (bundle.ed25519 != contact.ed25519 || bundle.curve25519 != contact.curve25519 || bundle.sealing != contact.sealing) {
                     store.upsertContact(contact.copy(keyChanged = true, verified = false))
                     return Prepared.Failed("$label's keys have changed. Scan their code again before messaging them.")
@@ -839,7 +870,11 @@ object CommsRepository {
      * them is kept, since envelopes already on their way may still need one;
      * instead a fresh session is started (it goes first, so the resync and
      * everything after it use it) and they are asked to switch to it. At most
-     * once a minute per contact. Caller holds [lock].
+     * once a minute per contact.
+     *
+     * Caller holds [lock]. The bundle fetch is launched in a new coroutine so
+     * the network call does NOT block the lock — holding it for up to 25 s
+     * would starve ICE candidate processing during an active call.
      */
     private fun recoverSession(senderCurve: String, what: String) {
         val contact = store.contactByCurve(senderCurve)
@@ -857,21 +892,35 @@ object CommsRepository {
             CommsLog.add("$what from $label, whose keys changed; verify them before anything is sent")
             return
         }
+        // Mark rate-limit timestamp now (inside the lock) so concurrent envelopes from
+        // the same sender don't each spawn a bundle fetch.
         lastResync[contact.number] = now
-        try {
-            val bundle = relay.bundle(contact.number, fingerprint(contact.ed25519))
-            if (bundle.ed25519 != contact.ed25519 || bundle.curve25519 != contact.curve25519 || bundle.sealing != contact.sealing) {
-                CommsLog.add("$what from $label, but the relay now holds different keys for them; nothing sent")
-                return
+        CommsLog.add("$what from $label; fetching a new session bundle")
+        // Network fetch happens outside the lock in a new coroutine; this coroutine
+        // suspends at lock.withLock below until the current holder releases it.
+        scope.launch {
+            try {
+                val bundle = relay.bundle(contact.number, fingerprint(contact.ed25519))
+                lock.withLock {
+                    val fresh = store.contactByCurve(senderCurve) ?: return@withLock
+                    if (bundle.ed25519 != fresh.ed25519 || bundle.curve25519 != fresh.curve25519 || bundle.sealing != fresh.sealing) {
+                        CommsLog.add("$what from $label, but the relay now holds different keys for them; nothing sent")
+                        return@withLock
+                    }
+                    identities.update {
+                        it.startSession(
+                            PeerKeys(fresh.ed25519, fresh.curve25519, fresh.sealing, fresh.signature),
+                            bundle.sessionKey
+                        )
+                    }
+                    CommsLog.add("$what from $label; started a new session and asked them to use it")
+                    sendControlLocked(fresh, CommsWire.resync())
+                }
+            } catch (e: RelayException) {
+                lastResync.remove(contact.number)
+                CommsLog.add("$what from $label; could not start a new session yet (${e.message})")
             }
-            identities.update { it.startSession(PeerKeys(contact.ed25519, contact.curve25519, contact.sealing, contact.signature), bundle.sessionKey) }
-        } catch (e: RelayException) {
-            lastResync.remove(contact.number)
-            CommsLog.add("$what from $label; could not start a new session yet (${e.message})")
-            return
         }
-        CommsLog.add("$what from $label; started a new session and asked them to use it")
-        sendControlLocked(contact, CommsWire.resync())
     }
 
     /** Processes staged payloads that were held for a retry. Caller holds [lock]. */

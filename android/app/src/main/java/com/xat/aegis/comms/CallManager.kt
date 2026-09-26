@@ -301,7 +301,7 @@ object CallManager {
     private suspend fun acceptLocked(callId: String? = null) {
         val c = _call.value ?: return
         if (c.phase != CallPhase.INCOMING || (callId != null && c.id != callId)) return
-        val offer = pendingOffer ?: run { endLocked("offer lost", signal = CommsWire.END_REJECT); return }
+        val offer = pendingOffer ?: run { endLocked("offer lost", signal = CommsWire.END_HANGUP); return }
         stopRinging()
         CommsNotifications.cancelIncomingCall(appContext)
         _call.value = c.copy(phase = CallPhase.CONNECTING)
@@ -615,6 +615,10 @@ object CallManager {
                         while (outgoingCandidates.isNotEmpty() && stillLive(callId) && failures < CANDIDATE_SEND_ATTEMPTS) {
                             if (flushOutgoingCandidates(callId)) failures = 0
                             else { failures++; delay(1_000L) }
+                        }
+                        if (failures >= CANDIDATE_SEND_ATTEMPTS && stillLive(callId)) {
+                            CommsLog.add("Could not send ICE candidates after $CANDIDATE_SEND_ATTEMPTS attempts; ending call")
+                            endLocked("could not reach the other phone", signal = CommsWire.END_HANGUP)
                         }
                     }
                 }
