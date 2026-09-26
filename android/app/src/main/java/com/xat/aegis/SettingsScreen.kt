@@ -29,6 +29,10 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xat.aegis.analysis.Report
+import com.xat.aegis.security.AppLock
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 // ── AppSettings singleton ──────────────────────────────────────────────────────
 
@@ -147,6 +151,12 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
     var followThreshold by remember { mutableFloatStateOf(AppSettings.followThresholdM) }
     var persistenceThreshold by remember { mutableFloatStateOf(AppSettings.persistenceThresholdMin) }
     var showClearDialog by remember { mutableStateOf(false) }
+
+    // ── Passcode state ───────────────────────────────────────────────────────
+    val lockEnabled by AppLock.enabled.collectAsStateWithLifecycle()
+    var showPasscodeSetup by remember { mutableStateOf(false) }
+    var showPasscodeDisable by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     // ── Resume after reboot ─────────────────────────────────────────────────
     //
@@ -581,6 +591,91 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
             }
         }
 
+        // ── Passcode lock ────────────────────────────────────────────────────
+
+        item(key = "§lock-hdr") { SSettingsSectionLabel("APP PASSCODE") }
+
+        item(key = "§lock-controls") {
+            Column(
+                Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            if (lockEnabled) "App passcode is ON" else "App passcode is OFF",
+                            color = SInkClr, fontSize = 14.sp, fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            if (lockEnabled)
+                                "Aegis locks when you leave. Wrong passcode after ${AppLock.wipeAfter(context)} attempts wipes everything."
+                            else
+                                "Set a 6–12 digit passcode. All app data is wiped after too many wrong guesses.",
+                            color = SMutedClr, fontSize = 12.sp, lineHeight = 16.sp
+                        )
+                    }
+                }
+                if (lockEnabled) {
+                    Button(
+                        onClick = { showPasscodeSetup = true },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = SAccentClr.copy(alpha = 0.15f),
+                            contentColor = SAccentClr
+                        ),
+                        shape = SCardShape, modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("CHANGE PASSCODE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                    }
+                    Button(
+                        onClick = { showPasscodeDisable = true },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = SCriticalClr.copy(alpha = 0.10f),
+                            contentColor = SCriticalClr
+                        ),
+                        shape = SCardShape, modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("TURN OFF PASSCODE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                    }
+                } else {
+                    Button(
+                        onClick = { showPasscodeSetup = true },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = SAccentClr,
+                            contentColor = Color(0xFF12161D)
+                        ),
+                        shape = SCardShape, modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("SET PASSCODE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                    }
+                }
+            }
+        }
+
+        if (showPasscodeSetup) {
+            item(key = "§lock-setup") {
+                PasscodeSetupPanel(
+                    context = context,
+                    isChanging = lockEnabled,
+                    onDone = { showPasscodeSetup = false },
+                    onCancel = { showPasscodeSetup = false }
+                )
+            }
+        }
+
+        if (showPasscodeDisable) {
+            item(key = "§lock-disable") {
+                PasscodeDisablePanel(
+                    context = context,
+                    onDone = { showPasscodeDisable = false },
+                    onCancel = { showPasscodeDisable = false }
+                )
+            }
+        }
+
         // ── Data management ──────────────────────────────────────────────────
 
         item(key = "§data-hdr") { SSettingsSectionLabel("DATA") }
@@ -685,5 +780,168 @@ private fun SSettingsKv(label: String, value: String) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(label, color = SMutedClr, fontSize = 12.sp)
         Text(value, color = SInkDimClr, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+    }
+}
+
+@Composable
+private fun PasscodeSetupPanel(
+    context: Context,
+    isChanging: Boolean,
+    onDone: () -> Unit,
+    onCancel: () -> Unit
+) {
+    var step by remember { mutableIntStateOf(if (isChanging) 0 else 1) }
+    // step 0 = confirm current, step 1 = enter new, step 2 = confirm new
+    var code1 by remember { mutableStateOf("") }
+    var code2 by remember { mutableStateOf("") }
+    var currentCode by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+
+    Column(
+        Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        val title = when {
+            isChanging && step == 0 -> "Enter your current passcode"
+            step == 1 -> "Choose a new passcode (6–12 digits)"
+            else -> "Confirm the new passcode"
+        }
+        Text(title, color = SInkClr, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        if (error.isNotEmpty()) {
+            Text(error, color = SCriticalClr, fontSize = 12.sp)
+        }
+        OutlinedTextField(
+            value = when (step) { 0 -> currentCode; 1 -> code1; else -> code2 },
+            onValueChange = { v ->
+                val digits = v.filter { it.isDigit() }.take(AppLock.MAX_LENGTH)
+                when (step) { 0 -> currentCode = digits; 1 -> code1 = digits; else -> code2 = digits }
+                error = ""
+            },
+            label = { Text("Digits", color = SMutedClr) },
+            singleLine = true,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = SInkClr,
+                unfocusedTextColor = SInkClr,
+                focusedBorderColor = SAccentClr,
+                unfocusedBorderColor = SRuleClr
+            ),
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword
+            ),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = onCancel) {
+                Text("CANCEL", color = SMutedClr, letterSpacing = 1.sp)
+            }
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = {
+                    scope.launch {
+                        error = ""
+                        when (step) {
+                            0 -> {
+                                val v = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    AppLock.attempt(context, currentCode, unlockOnSuccess = false)
+                                }
+                                when (v) {
+                                    AppLock.Verdict.Accepted -> step = 1
+                                    is AppLock.Verdict.Rejected -> error = "Wrong passcode"
+                                    is AppLock.Verdict.LockedOut -> error = "Too many attempts — try later"
+                                    AppLock.Verdict.Wiping -> onCancel()
+                                    is AppLock.Verdict.Unavailable -> error = "Keystore unavailable"
+                                }
+                            }
+                            1 -> {
+                                AppLock.problem(code1)?.let { error = it; return@launch }
+                                step = 2
+                            }
+                            2 -> {
+                                if (code1 != code2) { error = "Passcodes do not match"; return@launch }
+                                val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    AppLock.setPasscode(context, code1)
+                                }
+                                r.onSuccess { onDone() }.onFailure { error = it.message ?: "Failed" }
+                            }
+                        }
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = SAccentClr, contentColor = Color(0xFF12161D)),
+                shape = SCardShape
+            ) {
+                Text(if (step < 2) "NEXT" else "SAVE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PasscodeDisablePanel(
+    context: Context,
+    onDone: () -> Unit,
+    onCancel: () -> Unit
+) {
+    var code by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+
+    Column(
+        Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Text("Enter your passcode to turn off the lock", color = SInkClr, fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold)
+        if (error.isNotEmpty()) Text(error, color = SCriticalClr, fontSize = 12.sp)
+        OutlinedTextField(
+            value = code,
+            onValueChange = { v -> code = v.filter { it.isDigit() }.take(AppLock.MAX_LENGTH); error = "" },
+            label = { Text("Current passcode", color = SMutedClr) },
+            singleLine = true,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = SInkClr,
+                unfocusedTextColor = SInkClr,
+                focusedBorderColor = SAccentClr,
+                unfocusedBorderColor = SRuleClr
+            ),
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword
+            ),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = onCancel) {
+                Text("CANCEL", color = SMutedClr, letterSpacing = 1.sp)
+            }
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = {
+                    scope.launch {
+                        val v = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            AppLock.attempt(context, code, unlockOnSuccess = false)
+                        }
+                        when (v) {
+                            AppLock.Verdict.Accepted -> {
+                                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    AppLock.disable(context)
+                                }
+                                onDone()
+                            }
+                            is AppLock.Verdict.Rejected -> error = "Wrong passcode"
+                            is AppLock.Verdict.LockedOut -> error = "Too many attempts — try later"
+                            AppLock.Verdict.Wiping -> onCancel()
+                            is AppLock.Verdict.Unavailable -> error = "Keystore unavailable"
+                        }
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = SCriticalClr.copy(alpha = 0.15f),
+                    contentColor = SCriticalClr
+                ),
+                shape = SCardShape
+            ) {
+                Text("TURN OFF", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+            }
+        }
     }
 }

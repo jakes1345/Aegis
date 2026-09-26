@@ -72,6 +72,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.xat.aegis.CatcherFinding
 import com.xat.aegis.analysis.CardVault
 import com.xat.aegis.analysis.NfcScanner
+import com.xat.aegis.security.AppLock
+import com.xat.aegis.security.LockScreen
 import com.xat.aegis.analysis.PhoneHealthMonitor
 import com.xat.aegis.analysis.Report
 import com.xat.aegis.comms.CallManager
@@ -188,6 +190,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         AppSettings.load(this)
+        AppLock.init(this)
         Registry.bindTrustStore(this)
         nfcAdapter = runCatching { NfcAdapter.getDefaultAdapter(this) }.getOrNull()
         cardEmulation = nfcAdapter?.let { runCatching { CardEmulation.getInstance(it) }.getOrNull() }
@@ -223,6 +226,12 @@ class MainActivity : AppCompatActivity() {
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(background = Ground, surface = Panel)) {
                 Surface(color = Ground, modifier = Modifier.fillMaxSize()) {
+                    val locked by AppLock.locked.collectAsStateWithLifecycle()
+                    if (locked) {
+                        LockScreen()
+                        return@Surface
+                    }
+
                     var onboardingDone by remember { mutableStateOf(onboardingAlreadyDone) }
 
                     val onboardingPermissions = rememberLauncherForActivityResult(
@@ -289,6 +298,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         resumed = true
+        AppLock.onForeground(this)
         applyNfcMode()
         refreshDeviceHealth()
         // Envelopes that arrived while the app was closed are pulled on every
@@ -303,6 +313,7 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         resumed = false
         super.onPause()
+        AppLock.onBackground(this)
         CommsRepository.onAppVisible(false)
         nfcAdapter?.let { adapter ->
             if (readerModeOn) runCatching { adapter.disableReaderMode(this) }
