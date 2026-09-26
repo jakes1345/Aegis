@@ -166,11 +166,14 @@ object NfcScanner {
 
             val sw = ppseResp.takeLast(2)
             if (sw.size < 2 || sw[0] != 0x90.toByte() || sw[1] != 0x00.toByte()) {
+                // PPSE rejected — probe common access-control AIDs so the vault has
+                // something useful to replay when the user tries to emulate.
+                probeAccessAids(iso, pairs)
                 iso.close()
                 return IsoResult(false, null, pairs)
             }
 
-            // Parse PPSE FCI for AIDs, identify payment network
+            // Parse PPSE FCI for AIDs and identify payment network
             val aids = parsePpseAids(ppseResp)
             val network = aids.firstNotNullOfOrNull { aid ->
                 PAYMENT_AIDS.firstOrNull { (prefix, _) ->
@@ -178,22 +181,76 @@ object NfcScanner {
                 }?.second
             }
 
-            // SELECT the first AID and record the response
-            if (aids.isNotEmpty()) {
-                val aidBytes = aids.first().hexToBytes()
+            // SELECT each discovered AID (cap at 3) and capture follow-up exchanges
+            for (aid in aids.take(3)) {
+                val aidBytes = aid.hexToBytes()
                 val selCmd = byteArrayOf(0x00, 0xA4.toByte(), 0x04, 0x00,
                     aidBytes.size.toByte()) + aidBytes + byteArrayOf(0x00)
                 runCatching {
                     val selResp = iso.transceive(selCmd)
                     pairs += selCmd.hex() to selResp.hex()
+                    // If SELECT returned SW 9000, try standard EMV follow-ups
+                    val selSw = selResp.takeLast(2)
+                    if (selSw.size == 2 && selSw[0] == 0x90.toByte() && selSw[1] == 0x00.toByte()) {
+                        captureEMVFollowUp(iso, pairs)
+                    }
                 }
             }
 
+            // isPayment is only true when we found a recognised payment network.
+            // An access-control card that answers PPSE but has no payment AID must
+            // not be marked as a payment card — that blocks the user from saving it.
             iso.close()
-            IsoResult(true, network, pairs)
+            IsoResult(network != null, network, pairs)
         } catch (_: Exception) {
             runCatching { iso.close() }
             IsoResult(false, null, emptyList())
+        }
+    }
+
+    // After a successful AID SELECT, try the standard EMV follow-ups so we record as
+    // much of the real conversation as possible for later replay during emulation.
+    private fun captureEMVFollowUp(iso: IsoDep, pairs: MutableList<Pair<String, String>>) {
+        // GET PROCESSING OPTIONS with empty PDOL
+        val gpoCmd = byteArrayOf(0x80.toByte(), 0xA8.toByte(), 0x00, 0x00, 0x02, 0x83.toByte(), 0x00, 0x00)
+        runCatching {
+            val resp = iso.transceive(gpoCmd)
+            pairs += gpoCmd.hex() to resp.hex()
+        }
+        // READ RECORD — SFI 1, record 1 (standard first EMV record location)
+        val readCmd = byteArrayOf(0x00, 0xB2.toByte(), 0x01, 0x0C, 0x00)
+        runCatching {
+            val resp = iso.transceive(readCmd)
+            pairs += readCmd.hex() to resp.hex()
+        }
+    }
+
+    // When PPSE is rejected the card might still be an access-control card with a
+    // well-known AID.  Probing these gives the vault usable pairs for emulation.
+    private fun probeAccessAids(iso: IsoDep, pairs: MutableList<Pair<String, String>>) {
+        // PIV (U.S. federal / gov contractor badge): NIST SP 800-73
+        // CEPAS (Singapore transit/ID)
+        // ISO 7816 basic card-management AID
+        val probes = listOf(
+            "A0000003080000100001" ,  // PIV card application
+            "A00000000101",            // MIFARE Application
+            "A0000000620001",          // NIST PIV
+            "D2760000850100"           // CIPURSE
+        )
+        for (aidHex in probes) {
+            runCatching {
+                val aidBytes = aidHex.hexToBytes()
+                val selCmd = byteArrayOf(0x00, 0xA4.toByte(), 0x04, 0x00,
+                    aidBytes.size.toByte()) + aidBytes + byteArrayOf(0x00)
+                val resp = iso.transceive(selCmd)
+                pairs += selCmd.hex() to resp.hex()
+                val sw = resp.takeLast(2)
+                if (sw.size == 2 && sw[0] == 0x90.toByte() && sw[1] == 0x00.toByte()) {
+                    // Found a responding AID — capture follow-up and stop probing
+                    captureEMVFollowUp(iso, pairs)
+                    return
+                }
+            }
         }
     }
 
