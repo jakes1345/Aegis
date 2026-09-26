@@ -9,6 +9,7 @@ import android.net.Uri
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.biometric.BiometricManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -154,9 +155,17 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
 
     // ── Passcode state ───────────────────────────────────────────────────────
     val lockEnabled by AppLock.enabled.collectAsStateWithLifecycle()
+    val biometricEnabled by AppLock.biometricEnabled.collectAsStateWithLifecycle()
     var showPasscodeSetup by remember { mutableStateOf(false) }
     var showPasscodeDisable by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val canUseBiometric = remember(context) {
+        val result = BiometricManager.from(context).canAuthenticate(
+            BiometricManager.Authenticators.BIOMETRIC_STRONG or
+            BiometricManager.Authenticators.BIOMETRIC_WEAK
+        )
+        result == BiometricManager.BIOMETRIC_SUCCESS || result == BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED
+    }
 
     // ── Resume after reboot ─────────────────────────────────────────────────
     //
@@ -639,6 +648,33 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                         shape = SCardShape, modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("TURN OFF PASSCODE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                    }
+                    if (canUseBiometric) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "Biometric unlock",
+                                    color = SInkClr, fontSize = 14.sp, fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    "Use fingerprint or face to unlock instead of typing your passcode",
+                                    color = SMutedClr, fontSize = 12.sp, lineHeight = 16.sp
+                                )
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Switch(
+                                checked = biometricEnabled,
+                                onCheckedChange = { on ->
+                                    scope.launch(Dispatchers.IO) {
+                                        AppLock.setBiometricEnabled(context, on)
+                                    }
+                                }
+                            )
+                        }
                     }
                 } else {
                     Button(

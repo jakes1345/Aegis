@@ -1,5 +1,6 @@
 package com.xat.aegis.security
 
+import androidx.biometric.BiometricPrompt
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -27,6 +28,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -48,8 +52,9 @@ private val LkCrit    = Color(0xFFF2545B)
  */
 @Composable
 fun LockScreen() {
-    val context = LocalContext.current
-    val scope   = rememberCoroutineScope()
+    val context  = LocalContext.current
+    val activity = context as? FragmentActivity
+    val scope    = rememberCoroutineScope()
 
     var code        by remember { mutableStateOf("") }
     var checking    by remember { mutableStateOf(false) }
@@ -58,6 +63,7 @@ fun LockScreen() {
     var lockoutMs   by remember { mutableLongStateOf(0L) }
     var countdown   by remember { mutableLongStateOf(0L) }
     val maxLen = AppLock.MAX_LENGTH
+    val biometricEnabled by AppLock.biometricEnabled.collectAsStateWithLifecycle()
 
     // Countdown ticker for the lockout display.
     LaunchedEffect(lockoutMs) {
@@ -68,6 +74,13 @@ fun LockScreen() {
             if (remaining <= 0L) { countdown = 0L; break }
             countdown = remaining
             delay(500L)
+        }
+    }
+
+    // Auto-show the biometric prompt when the lock screen first appears.
+    LaunchedEffect(biometricEnabled) {
+        if (biometricEnabled && activity != null) {
+            showBiometricPrompt(activity) { AppLock.unlockWithBiometric() }
         }
     }
 
@@ -228,8 +241,43 @@ fun LockScreen() {
                         .padding(horizontal = 24.dp, vertical = 10.dp)
                 )
             }
+
+            // ── Biometric unlock button ────────────────────────────────
+            if (biometricEnabled && activity != null && code.isEmpty()) {
+                Text(
+                    "USE BIOMETRICS",
+                    color = if (active) LkInkDim else LkMuted,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = 1.5.sp,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .clickable(enabled = active) {
+                            showBiometricPrompt(activity) { AppLock.unlockWithBiometric() }
+                        }
+                        .padding(horizontal = 20.dp, vertical = 9.dp)
+                )
+            }
         }
     }
+}
+
+private fun showBiometricPrompt(activity: FragmentActivity, onSuccess: () -> Unit) {
+    val executor = ContextCompat.getMainExecutor(activity)
+    val callback = object : BiometricPrompt.AuthenticationCallback() {
+        override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+            onSuccess()
+        }
+        override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {}
+        override fun onAuthenticationFailed() {}
+    }
+    val prompt = BiometricPrompt(activity, executor, callback)
+    val info = BiometricPrompt.PromptInfo.Builder()
+        .setTitle("Unlock Aegis")
+        .setSubtitle("Confirm your identity to continue")
+        .setNegativeButtonText("Use passcode")
+        .build()
+    prompt.authenticate(info)
 }
 
 @Composable

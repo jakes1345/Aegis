@@ -69,6 +69,7 @@ object AppLock {
     private const val K_LAST_FAIL = "last_fail_at"
     private const val K_WIPE_AFTER = "wipe_after"
     private const val K_RELOCK_MS = "relock_ms"
+    private const val K_BIOMETRIC = "biometric_enabled"
 
     private const val SALT_LEN = 16
     private val DOMAIN = "aegis-applock-v1".toByteArray(Charsets.UTF_8)
@@ -103,6 +104,10 @@ object AppLock {
     /** Whether the app is behind the lock screen right now. */
     val locked: StateFlow<Boolean> = _locked.asStateFlow()
 
+    private val _biometricEnabled = MutableStateFlow(false)
+    /** Whether biometric unlock is enabled (requires a passcode to be set). */
+    val biometricEnabled: StateFlow<Boolean> = _biometricEnabled.asStateFlow()
+
     @Volatile private var initialised = false
 
     /** When the app last left the screen ([SystemClock.elapsedRealtime]); 0 while it is on screen. */
@@ -115,6 +120,7 @@ object AppLock {
             val on = isEnabled(context)
             _enabled.value = on
             _locked.value = on
+            _biometricEnabled.value = on && isBiometricEnabled(context)
             initialised = true
         }
     }
@@ -125,6 +131,24 @@ object AppLock {
 
     fun hasDuress(context: Context): Boolean =
         runCatching { prefs(context).contains(K_DURESS_VERIFIER) }.getOrDefault(false)
+
+    fun isBiometricEnabled(context: Context): Boolean =
+        runCatching { prefs(context).getBoolean(K_BIOMETRIC, false) }.getOrDefault(false)
+
+    fun setBiometricEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(K_BIOMETRIC, enabled).commit()
+        _biometricEnabled.value = enabled && _enabled.value
+    }
+
+    /**
+     * Unlocks the app after a successful biometric authentication.
+     * Does not touch the attempt counter; the OS biometric stack is
+     * responsible for ratelimiting and lockout on the sensor side.
+     */
+    fun unlockWithBiometric() {
+        if (Wiper.isActive) return
+        _locked.value = false
+    }
 
     fun wipeAfter(context: Context): Int = prefs(context).getInt(K_WIPE_AFTER, DEFAULT_WIPE_AFTER)
 
@@ -363,6 +387,7 @@ object AppLock {
             }
             _enabled.value = false
             _locked.value = false
+            _biometricEnabled.value = false
             backgroundedAt = 0L
         }
     }
