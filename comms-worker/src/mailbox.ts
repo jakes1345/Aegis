@@ -82,6 +82,10 @@ const HEARTBEAT_MS = 120_000;
 const DELETE_BATCH = 128;
 /** How long an invite can be used. */
 export const INVITE_TTL_MS = 7 * 24 * 60 * 60_000;
+/** AegisCoin: transactions kept per mailbox, newest first. */
+const MAX_TX_HISTORY = 100;
+/** AegisCoin: the most one transfer may move. */
+const MAX_SINGLE_TRANSFER = 1_000_000;
 
 /** An invite: one registration without the enrollment secret. Stored in its own object, named after its code. */
 interface Invite {
@@ -98,6 +102,24 @@ interface NonceRecord {
 interface WakeCheck {
   due: number;
   ids: string[];
+}
+
+/**
+ * One AegisCoin transfer as this mailbox's owner saw it. Every relay is its
+ * own coin community: a balance lives in the owner's mailbox and moves only
+ * through requests signed by the owner's identity key. The relay learns who
+ * paid whom and how much; the note the payer wrote travels end-to-end
+ * encrypted, so what is kept here is only the note the payer chose to give the
+ * relay (the app sends none).
+ */
+export interface CoinTx {
+  id: string;
+  from: string;
+  to: string;
+  amount: number;
+  ts: number;
+  direction: "in" | "out";
+  note?: string;
 }
 
 /** A contact's public identity, without claiming a one-time key. */
@@ -276,6 +298,76 @@ export class Mailbox extends DurableObject<Env> {
       removed += await this.ctx.storage.delete(keys.slice(i, i + DELETE_BATCH));
     }
     return removed;
+  }
+
+  // ── AegisCoin ───────────────────────────────────────────────────────
+
+  static readonly MAX_SINGLE_TRANSFER = MAX_SINGLE_TRANSFER;
+  /** Payments per minute per payer: plenty for a person, a brake on a script. */
+  static readonly PAY_LIMIT = 30;
+
+  async getBalance(): Promise<number> {
+    return (await this.ctx.storage.get<number>("balance")) ?? 0;
+  }
+
+  /**
+   * The coins a new registration starts with. Only ever sets a balance that
+   * does not exist yet, so a repeat (a retried registration, a redeploy) can
+   * never mint twice.
+   */
+  async setInitialBalance(amount: number): Promise<void> {
+    if (!Number.isInteger(amount) || amount <= 0) return;
+    const existing = await this.ctx.storage.get<number>("balance");
+    if (existing !== undefined) return;
+    await this.ctx.storage.put("balance", amount);
+  }
+
+  /**
+   * Takes [amount] off the owner's balance for a payment to [to]. The check
+   * and the write happen in one call on the one object that holds this
+   * balance, so two payments racing each other cannot both spend the same
+   * coins.
+   */
+  async debit(to: string, amount: number, txid: string, note: string): Promise<{ ok: boolean; balance: number; reason?: string }> {
+    const balance = (await this.ctx.storage.get<number>("balance")) ?? 0;
+    if (!Number.isInteger(amount) || amount <= 0 || amount > MAX_SINGLE_TRANSFER) {
+      return { ok: false, balance, reason: "Invalid amount" };
+    }
+    if (balance < amount) return { ok: false, balance, reason: "Insufficient balance" };
+    const profile = await this.ctx.storage.get<Profile>("profile");
+    const from = profile?.number ?? "";
+    const next = balance - amount;
+    const history = await this.appendTx({ id: txid, from, to, amount, ts: Date.now(), direction: "out", note });
+    await this.ctx.storage.put({ balance: next, txHistory: history });
+    return { ok: true, balance: next };
+  }
+
+  /** Adds [amount] to the owner's balance, for a payment from [from]; returns the new balance. */
+  async credit(from: string, amount: number, txid: string, note: string): Promise<number> {
+    if (!Number.isInteger(amount) || amount <= 0 || amount > MAX_SINGLE_TRANSFER) throw new Error("Invalid amount");
+    const balance = (await this.ctx.storage.get<number>("balance")) ?? 0;
+    const profile = await this.ctx.storage.get<Profile>("profile");
+    const to = profile?.number ?? "";
+    const next = balance + amount;
+    const history = await this.appendTx({ id: txid, from, to, amount, ts: Date.now(), direction: "in", note });
+    await this.ctx.storage.put({ balance: next, txHistory: history });
+    return next;
+  }
+
+  /** The last [limit] transactions, newest first. */
+  async txHistory(limit: number): Promise<CoinTx[]> {
+    const history = (await this.ctx.storage.get<CoinTx[]>("txHistory")) ?? [];
+    const n = Math.max(0, Math.min(MAX_TX_HISTORY, Math.floor(limit)));
+    return history.slice(0, n);
+  }
+
+  /** The history with [tx] at the front, trimmed to MAX_TX_HISTORY; not yet written. */
+  private async appendTx(tx: CoinTx): Promise<CoinTx[]> {
+    const history = (await this.ctx.storage.get<CoinTx[]>("txHistory")) ?? [];
+    const entry: CoinTx = { id: tx.id, from: tx.from, to: tx.to, amount: tx.amount, ts: tx.ts, direction: tx.direction };
+    if (tx.note) entry.note = tx.note;
+    history.unshift(entry);
+    return history.slice(0, MAX_TX_HISTORY);
   }
 
   /** Deletes everything about this number. */

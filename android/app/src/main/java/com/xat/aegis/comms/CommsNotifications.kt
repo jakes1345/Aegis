@@ -301,13 +301,13 @@ object CommsNotifications {
 
         val newest = messages.maxBy { it.ts }
         val style = NotificationCompat.InboxStyle()
-        messages.sortedBy { it.ts }.takeLast(5).forEach { style.addLine(it.body) }
+        messages.sortedBy { it.ts }.takeLast(5).forEach { style.addLine(it.preview()) }
         val title = contact.name.ifBlank { formatAegisNumber(contact.number) }
 
         val notification = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setContentTitle(if (contact.verified) title else "$title (unverified)")
-            .setContentText(newest.body)
+            .setContentText(newest.preview())
             .setStyle(style)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setPriority(NotificationCompat.PRIORITY_HIGH)

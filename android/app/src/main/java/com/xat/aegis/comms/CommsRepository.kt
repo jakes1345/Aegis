@@ -45,6 +45,8 @@ import java.util.UUID
  *   {"v":1,"t":"receipt","ids":[...],"status":"delivered"|"read","from":number}
  *   {"v":1,"t":"resync","from":number}   — sent when a message could not be read;
  *                                         it starts a fresh session by itself.
+ *   {"v":1,"t":"payment","id":uuid,"txid":relay id,"ts":ms,"amt":coins,"note":text,...}
+ *   {"v":1,"t":"voicemail","id":uuid,"ts":ms,"audio":base64 AMR-NB,"dur":ms,...}
  * The sender's keys ride along so a first message from someone who has our
  * number pins their identity without trusting the relay for it; the relay's
  * record for that number must still match before the message is accepted.
@@ -55,6 +57,9 @@ object CommsRepository {
     private const val ONE_TIME_KEYS_LOW = 20
     private const val ONE_TIME_KEYS_BATCH = 50
     private const val MAX_BODY = 4000
+    /** A voicemail's base64 audio: 30 s of AMR-NB at 4.75 kbit/s is under 25 KB; anything far past that is not one. */
+    private const val MAX_VOICEMAIL_B64 = 96_000
+    private const val MAX_COIN_NOTE = 140
     private const val HOLD_FOREGROUND = "foreground"
     private const val HOLD_CALL = "call"
 
@@ -309,7 +314,7 @@ object CommsRepository {
             config.clear()
             KeystoreBox.destroy()
             publishConfig()
-            _state.update { it.copy(connected = false, lastSync = 0L, relayOneTimeKeys = -1) }
+            _state.update { it.copy(connected = false, lastSync = 0L, relayOneTimeKeys = -1, balance = -1L) }
             setBusy(false)
             bump()
         }
@@ -377,6 +382,8 @@ object CommsRepository {
     fun contact(number: String): Contact? = store.contact(number)
     fun threads(): List<ChatThread> = store.threads()
     fun messages(peer: String): List<ChatMessage> = store.messages(peer)
+    fun transactions(peer: String): List<CoinTx> = store.transactions(peer)
+    fun allTransactions(): List<CoinTx> = store.allTransactions()
 
     /** This identity's pairing payload, for the QR code others scan. */
     fun pairingCode(): PairingCode? {
@@ -718,6 +725,88 @@ object CommsRepository {
         bump()
     }
 
+    // ── Voicemail ─────────────────────────────────────────────────────────
+
+    /**
+     * Sends a recording to [contact] as an encrypted envelope, the way a
+     * message goes, and keeps a copy in the conversation. Unlike a message it
+     * is not queued: a voicemail is left right after a call that did not
+     * connect, and the owner is told there and then whether it went.
+     */
+    suspend fun sendVoicemail(contact: Contact, audioB64: String, durationMs: Long): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!config.isRegistered) throw RelayException("Not registered with a relay")
+            if (audioB64.isBlank()) throw IllegalArgumentException("The recording is empty")
+            if (audioB64.length > MAX_VOICEMAIL_B64) throw IllegalArgumentException("The recording is too long to send")
+            val id = UUID.randomUUID().toString()
+            val ts = System.currentTimeMillis()
+            when (val result = deliver(contact, CommsWire.voicemail(id, ts, audioB64, durationMs))) {
+                Deliver.Sent -> Unit
+                is Deliver.Failed -> throw RelayException(result.reason)
+                is Deliver.Offline -> throw RelayException(result.reason)
+            }
+            val body = VoicemailBody(audioB64, durationMs).encode()
+            lock.withLock {
+                store.insertMessage(ChatMessage(id, contact.number, Direction.OUT, body, ts, STATUS_VOICEMAIL, read = true))
+            }
+            CommsLog.add("Voicemail (${durationLabel(durationMs)}) sent to ${formatAegisNumber(contact.number)}")
+            bump()
+        }.onFailure { CommsLog.add("Voicemail to ${formatAegisNumber(contact.number)} not sent: ${it.message}") }
+    }
+
+    // ── AegisCoin ─────────────────────────────────────────────────────────
+
+    /** This identity's coins on the relay, or -1 when the relay could not say. */
+    suspend fun getBalance(): Long = withContext(Dispatchers.IO) {
+        if (!config.isRegistered) return@withContext -1L
+        runCatching { relay.balance().balance }
+            .onFailure { CommsLog.add("Could not read the coin balance: ${it.message}") }
+            .getOrDefault(-1L)
+    }
+
+    /** Asks the relay for the balance and publishes it; leaves the last known one when the relay is unreachable. */
+    suspend fun refreshBalance() {
+        val b = getBalance()
+        if (b >= 0) _state.update { it.copy(balance = b) }
+    }
+
+    /**
+     * Pays [contact] [amount] AegisCoin. The relay moves the coins (it holds
+     * both balances) on this identity's signed request; the recipient then
+     * hears about it, with the note, through an encrypted envelope the relay
+     * cannot read. Returns the balance left afterwards.
+     */
+    suspend fun sendPayment(contact: Contact, amount: Long, note: String?): Result<Long> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!config.isRegistered) throw RelayException("Not registered with a relay")
+            if (amount <= 0L) throw IllegalArgumentException("The amount must be at least 1 $COIN_SYMBOL")
+            if (contact.number == config.number) throw IllegalArgumentException("That is your own Aegis number")
+            val text = note?.trim()?.take(MAX_COIN_NOTE)?.takeIf { it.isNotEmpty() }
+            val result = relay.pay(contact.number, amount, null)
+            val id = UUID.randomUUID().toString()
+            val ts = System.currentTimeMillis()
+            // The coins have moved: recorded before anything else can fail.
+            lock.withLock {
+                store.insertTransaction(CoinTx(id, contact.number, Direction.OUT, amount, ts, text ?: "", result.txid))
+                store.insertMessage(ChatMessage(id, contact.number, Direction.OUT, paymentLine(amount, text, sent = true), ts, STATUS_PAYMENT, read = true))
+            }
+            _state.update { it.copy(balance = result.balance) }
+            bump()
+            CommsLog.add("Paid $amount $COIN_SYMBOL to ${formatAegisNumber(contact.number)}")
+            // The notice is what carries the note; only the amount reached the relay.
+            when (val d = deliver(contact, CommsWire.payment(id, result.txid, ts, amount, text))) {
+                Deliver.Sent -> Unit
+                is Deliver.Failed -> CommsLog.add("Payment notice to ${formatAegisNumber(contact.number)} failed: ${d.reason}; the coins have been transferred")
+                is Deliver.Offline -> CommsLog.add("Payment notice to ${formatAegisNumber(contact.number)} not sent: ${d.reason}; the coins have been transferred")
+            }
+            result.balance
+        }.onFailure { CommsLog.add("Payment to ${formatAegisNumber(contact.number)} failed: ${it.message}") }
+    }
+
+    /** The line a payment shows as in the conversation. */
+    private fun paymentLine(amount: Long, note: String?, sent: Boolean): String =
+        "$amount $COIN_SYMBOL ${if (sent) "sent" else "received"}" + (if (!note.isNullOrBlank()) " · $note" else "")
+
     /**
      * Keeps the relay socket open for a call's signalling even when the app
      * leaves the screen and the owner has comms offline; released when the
@@ -728,12 +817,14 @@ object CommsRepository {
 
     /**
      * Encrypts a control message now and sends it once the lock is released.
-     * Caller holds [lock]. Used for the resync; receipts go through the
-     * receipts table so a failed one is retried.
+     * Caller holds [lock]. Used for the resync, which is sent on a session the
+     * caller has just started, so no bundle is fetched here; receipts go
+     * through the receipts table so a failed one is retried.
      */
     private fun sendControlLocked(contact: Contact, payload: JSONObject) {
         val type = CommsWire.type(payload)
-        when (val p = prepareLocked(contact, payload)) {
+        when (val p = prepareLocked(contact, payload, null)) {
+            Prepared.NeedBundle -> CommsLog.add("$type to ${formatAegisNumber(contact.number)} not sent: no session with them")
             is Prepared.Ready -> scope.launch {
                 when (val d = transmit(contact, p.envelope)) {
                     Deliver.Sent -> Unit
@@ -941,10 +1032,7 @@ object CommsRepository {
                     return
                 }
                 val body = json.optString(CommsWire.F_BODY).take(MAX_BODY)
-                val earliest = envelopeTs - 7L * 24 * 3600_000L
-                val latest = System.currentTimeMillis() + 60_000L
-                val claimed = json.optLong(CommsWire.F_TS, envelopeTs)
-                val ts = if (latest >= earliest) claimed.coerceIn(earliest, latest) else envelopeTs
+                val ts = claimedTs(envelopeTs, json.optLong(CommsWire.F_TS, envelopeTs))
                 val onScreen = openPeer == contact.number
                 store.insertMessage(ChatMessage(id, contact.number, Direction.IN, body, ts, "received", read = onScreen))
                 store.queueReceipt(contact.number, listOf(id), if (onScreen) CommsWire.STATUS_READ else CommsWire.STATUS_DELIVERED)
@@ -976,8 +1064,69 @@ object CommsRepository {
                 CallManager.onPeerResync(contact)
             }
             CommsWire.T_CALL -> CallManager.onSignal(contact, json, envelopeTs)
+            CommsWire.T_PAYMENT -> {
+                // The coins were moved by the relay when the payer paid; this is
+                // the payer telling us, with the note only we can read.
+                val id = json.optString(CommsWire.F_ID).takeIf { it.isNotBlank() } ?: return
+                val txid = json.optString(CommsWire.F_TXID).takeIf { it.isNotBlank() } ?: return
+                val amount = json.optLong(CommsWire.F_AMOUNT, 0L).takeIf { it > 0 } ?: return
+                val alreadyRead = store.isRead(id)
+                if (alreadyRead != null || store.hasTransaction(id)) {
+                    // A re-sent notice: receipt it again, count nothing twice.
+                    store.queueReceipt(contact.number, listOf(id), if (alreadyRead == true) CommsWire.STATUS_READ else CommsWire.STATUS_DELIVERED)
+                    return
+                }
+                val ts = claimedTs(envelopeTs, json.optLong(CommsWire.F_TS, envelopeTs))
+                val note = json.optString(CommsWire.F_NOTE, "").take(MAX_COIN_NOTE)
+                store.insertTransaction(CoinTx(id, contact.number, Direction.IN, amount, ts, note, txid))
+                val onScreen = openPeer == contact.number
+                store.insertMessage(ChatMessage(id, contact.number, Direction.IN, paymentLine(amount, note, sent = false), ts, STATUS_PAYMENT, read = onScreen))
+                store.queueReceipt(contact.number, listOf(id), if (onScreen) CommsWire.STATUS_READ else CommsWire.STATUS_DELIVERED)
+                if (!onScreen) {
+                    CommsNotifications.notifyInbound(appContext, contact, store.unreadInbound(contact.number, 5))
+                }
+                CommsLog.add("Received $amount $COIN_SYMBOL from ${formatAegisNumber(contact.number)}")
+                // Shown at once; the relay's figure replaces it as soon as it answers.
+                _state.update { if (it.balance >= 0) it.copy(balance = it.balance + amount) else it }
+                scope.launch { refreshBalance() }
+            }
+            CommsWire.T_VOICEMAIL -> {
+                val id = json.optString(CommsWire.F_ID).takeIf { it.isNotBlank() } ?: return
+                val audioB64 = json.optString(CommsWire.F_AUDIO).takeIf { it.isNotBlank() } ?: return
+                if (audioB64.length > MAX_VOICEMAIL_B64) {
+                    CommsLog.add("Voicemail from ${formatAegisNumber(contact.number)} dropped: too large")
+                    return
+                }
+                val alreadyRead = store.isRead(id)
+                if (alreadyRead != null) {
+                    store.queueReceipt(contact.number, listOf(id), if (alreadyRead) CommsWire.STATUS_READ else CommsWire.STATUS_DELIVERED)
+                    return
+                }
+                val durationMs = json.optLong(CommsWire.F_DURATION, 0L).coerceAtLeast(0L)
+                val ts = claimedTs(envelopeTs, json.optLong(CommsWire.F_TS, envelopeTs))
+                // Arrives unread even to an open conversation: it is audio, and the
+                // owner has not heard it; the conversation marks it read as usual.
+                val onScreen = openPeer == contact.number
+                store.insertMessage(ChatMessage(id, contact.number, Direction.IN, VoicemailBody(audioB64, durationMs).encode(), ts, STATUS_VOICEMAIL, read = false))
+                store.queueReceipt(contact.number, listOf(id), CommsWire.STATUS_DELIVERED)
+                if (!onScreen) {
+                    CommsNotifications.notifyInbound(appContext, contact, store.unreadInbound(contact.number, 5))
+                }
+                CommsLog.add("Voicemail (${durationLabel(durationMs)}) from ${formatAegisNumber(contact.number)}")
+            }
             else -> CommsLog.add("Payload of type \"${CommsWire.type(json)}\" from ${formatAegisNumber(contact.number)} not understood; ignored")
         }
+    }
+
+    /**
+     * The timestamp a payload claims, kept within a week before the relay
+     * took it and a minute past now: a phone whose clock is wrong should not
+     * put its message at the top or the bottom of the conversation.
+     */
+    private fun claimedTs(envelopeTs: Long, claimed: Long): Long {
+        val earliest = envelopeTs - 7L * 24 * 3600_000L
+        val latest = System.currentTimeMillis() + 60_000L
+        return if (latest >= earliest) claimed.coerceIn(earliest, latest) else envelopeTs
     }
 
     private sealed class Resolution {
@@ -1063,6 +1212,7 @@ object CommsRepository {
             flushOutbox()
             flushReceipts()
             replenishKeys()
+            refreshBalance()
             _state.update { it.copy(busy = false, error = null, lastSync = System.currentTimeMillis()) }
             bump()
             Result.success(Unit)

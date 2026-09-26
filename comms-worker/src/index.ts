@@ -1,6 +1,6 @@
 import { parseSigned, verifyEd25519 } from "./auth";
 import { HttpError, json, normaliseNumber, randomNumber, requireSecret, timingSafeEqual, type Env } from "./env";
-import { INVITE_TTL_MS, Mailbox, type Profile, type SignedKey } from "./mailbox";
+import { INVITE_TTL_MS, Mailbox, type CoinTx, type Profile, type SignedKey } from "./mailbox";
 import { invitePage } from "./invite-page";
 
 export { Mailbox };
@@ -31,6 +31,12 @@ export { Mailbox };
  *   GET    /v1/inbox                                       → waiting envelopes
  *   POST   /v1/ack             {ids}
  *   GET    /v1/ws                                          → live delivery (hibernatable WebSocket)
+ *   GET    /v1/turn                                        → ICE servers for a call
+ * AegisCoin (each relay is its own coin community; balances live in the mailboxes):
+ *   GET    /v1/coin/balance                                → {balance, symbol: "AC"}
+ *   POST   /v1/coin/pay        {to, amount, note?}         → {txid, balance, ok}: moves coins to a contact
+ *   GET    /v1/coin/history                                → {txs: [...]}, newest first
+ *   POST   /v1/admin/coin/mint {to, amount}                → {ok, balance}; X-Admin-Secret must match ADMIN_SECRET
  */
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -221,7 +227,82 @@ async function route(request: Request, env: Env): Promise<Response> {
     return json({ iceServers: servers, turn: servers.some((s) => s.urls.some((u) => u.startsWith("turn"))) });
   }
 
+  // ── AegisCoin ─────────────────────────────────────────────────────────
+  if (path === "/v1/coin/balance" && request.method === "GET") {
+    return json({ balance: await me.getBalance(), symbol: COIN_SYMBOL });
+  }
+
+  if (path === "/v1/coin/pay" && request.method === "POST") {
+    const allowed = await me.rateOk("pay", Mailbox.PAY_LIMIT);
+    if (!allowed.ok) throw new HttpError(429, "Too many payments; try again in a minute", allowed.retryAfter);
+    const body = parseJson<{ to?: unknown; amount?: unknown; note?: unknown }>(bodyText);
+    const to = typeof body.to === "string" ? normaliseNumber(body.to) : null;
+    if (!to) throw new HttpError(400, "to must be an Aegis number");
+    if (to === profile.number) throw new HttpError(400, "You cannot pay yourself");
+    const amount = coinAmount(body.amount);
+    const note = coinNote(body.note);
+    const them = env.MAILBOX.get(env.MAILBOX.idFromName(to));
+    if (!(await them.profile())) throw new HttpError(404, "No such Aegis number on this relay");
+    const txid = crypto.randomUUID();
+    const debited = await me.debit(to, amount, txid, note);
+    if (!debited.ok) throw new HttpError(400, debited.reason ?? "Payment refused");
+    try {
+      await them.credit(profile.number, amount, txid, note);
+    } catch (e) {
+      // The sender has paid and the recipient has not been credited: give the
+      // coins back. If even that fails the error is logged with the txid, so
+      // the operator can put it right by hand.
+      try {
+        await me.credit(to, amount, `${txid}:refund`, "Refund: payment could not be delivered");
+      } catch (refund) {
+        console.error(`coin payment ${txid} from ${profile.number} to ${to} for ${amount}: credit failed and so did the refund`, e, refund);
+      }
+      throw e;
+    }
+    return json({ txid, balance: debited.balance, ok: true });
+  }
+
+  if (path === "/v1/coin/history" && request.method === "GET") {
+    const raw = Number(url.searchParams.get("limit") ?? "");
+    const limit = Number.isFinite(raw) && raw > 0 ? Math.min(100, Math.floor(raw)) : 50;
+    const txs: CoinTx[] = await me.txHistory(limit);
+    return json({ txs });
+  }
+
+  if (path === "/v1/admin/coin/mint" && request.method === "POST") {
+    const secret = requireSecret(env, "ADMIN_SECRET");
+    const given = request.headers.get("x-admin-secret") ?? "";
+    if (!timingSafeEqual(given, secret)) throw new HttpError(403, "Admin secret rejected");
+    const body = parseJson<{ to?: unknown; amount?: unknown }>(bodyText);
+    const to = typeof body.to === "string" ? normaliseNumber(body.to) : null;
+    if (!to) throw new HttpError(400, "to must be an Aegis number");
+    const amount = coinAmount(body.amount);
+    const them = env.MAILBOX.get(env.MAILBOX.idFromName(to));
+    if (!(await them.profile())) throw new HttpError(404, "No such Aegis number on this relay");
+    const balance = await them.credit("mint", amount, crypto.randomUUID(), `Minted by ${profile.number}`);
+    return json({ ok: true, balance });
+  }
+
   throw new HttpError(404, "Not found");
+}
+
+const COIN_SYMBOL = "AC";
+const COIN_NOTE_MAX = 140;
+
+/** A whole number of coins between 1 and the single-transfer cap, or a 400. */
+function coinAmount(raw: unknown): number {
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > Mailbox.MAX_SINGLE_TRANSFER) {
+    throw new HttpError(400, `amount must be a whole number from 1 to ${Mailbox.MAX_SINGLE_TRANSFER}`);
+  }
+  return raw;
+}
+
+/** The optional note on a payment: a short string, or nothing. */
+function coinNote(raw: unknown): string {
+  if (raw === undefined || raw === null) return "";
+  if (typeof raw !== "string") throw new HttpError(400, "note must be a string");
+  if (raw.length > COIN_NOTE_MAX) throw new HttpError(400, `note must be at most ${COIN_NOTE_MAX} characters`);
+  return raw;
 }
 
 /**
@@ -279,6 +360,10 @@ async function register(env: Env, request: Request, bodyText: string): Promise<R
     const now = Date.now();
     const profile: Profile = { number, ed25519, curve25519, sealing, signature, fallback, listed, createdAt: now, lastSeen: now };
     if (await mailbox.claim(profile, oneTimeKeys)) {
+      // A new member of this relay's coin community starts with what the
+      // operator set; nothing when they set nothing.
+      const initial = parseInt(env.COIN_INITIAL_BALANCE ?? "0", 10);
+      if (Number.isInteger(initial) && initial > 0) await mailbox.setInitialBalance(initial);
       return json({ number, profile: publicProfile(profile), oneTimeKeys: oneTimeKeys.length }, 201);
     }
   }

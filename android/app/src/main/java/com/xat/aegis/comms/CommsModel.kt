@@ -51,6 +51,55 @@ data class ChatMessage(
 
 /** Status value of a [ChatMessage] that records a call in the conversation. */
 const val STATUS_CALL = "call"
+/** Status value of a [ChatMessage] that records an AegisCoin payment; its body is the line to show. */
+const val STATUS_PAYMENT = "payment"
+/** Status value of a [ChatMessage] that carries a voicemail; its body is [VoicemailBody] JSON. */
+const val STATUS_VOICEMAIL = "voicemail"
+
+/** The ticker every relay's coin community uses. */
+const val COIN_SYMBOL = "AC"
+
+/** An AegisCoin transfer with a contact, as this phone recorded it. */
+data class CoinTx(
+    /** UUID chosen by the payer's phone; also the id of the message that shows it in the conversation. */
+    val id: String,
+    /** The other party's Aegis number. */
+    val peer: String,
+    val direction: Direction,
+    val amount: Long,
+    val ts: Long,
+    val note: String,
+    /** The relay's transaction id. */
+    val txid: String
+)
+
+/** What a [STATUS_VOICEMAIL] message's body holds: the recording, base64 AMR-NB, and its length. */
+data class VoicemailBody(val audioB64: String, val durationMs: Long) {
+    fun encode(): String = org.json.JSONObject().put("audio", audioB64).put("dur", durationMs).toString()
+
+    companion object {
+        fun decode(body: String): VoicemailBody? = runCatching {
+            val o = org.json.JSONObject(body)
+            val audio = o.optString("audio").takeIf { it.isNotBlank() } ?: return null
+            VoicemailBody(audio, o.optLong("dur", 0L))
+        }.getOrNull()
+    }
+}
+
+/** "0:07" for seven seconds. */
+fun durationLabel(ms: Long): String {
+    val s = (ms / 1000L).coerceAtLeast(0L)
+    return "${s / 60}:${(s % 60).toString().padStart(2, '0')}"
+}
+
+/**
+ * A message's body as a line of text: what the notification and the
+ * conversation list show. A voicemail's body is audio, not text.
+ */
+fun ChatMessage.preview(): String = when (status) {
+    STATUS_VOICEMAIL -> "Voicemail · " + durationLabel(VoicemailBody.decode(body)?.durationMs ?: 0L)
+    else -> body
+}
 
 enum class CallPhase { INCOMING, DIALING, CONNECTING, CONNECTED, RECONNECTING, ENDED }
 
@@ -94,7 +143,9 @@ data class CommsState(
     val error: String? = null,
     val lastSync: Long = 0L,
     /** One-time keys the relay still holds for us. */
-    val relayOneTimeKeys: Int = -1
+    val relayOneTimeKeys: Int = -1,
+    /** AegisCoin on this relay, or -1 until the relay has said. */
+    val balance: Long = -1L
 )
 
 /**

@@ -7,6 +7,10 @@ export interface Env {
   /** Optional: Cloudflare Realtime TURN key id + API token, for calls. */
   TURN_KEY_ID?: string;
   TURN_KEY_API_TOKEN?: string;
+  /** Optional: AegisCoin minted for every new registration (a whole number, e.g. "100"). Unset or "0": none. */
+  COIN_INITIAL_BALANCE?: string;
+  /** Optional: protects POST /v1/admin/coin/mint. Unset: minting is off. */
+  ADMIN_SECRET?: string;
 }
 
 /** A JSON response with the headers every API reply carries. */
@@ -23,7 +27,7 @@ export class HttpError extends Error {
   }
 }
 
-export function requireSecret(env: Env, name: "ENROLL_SECRET"): string {
+export function requireSecret(env: Env, name: "ENROLL_SECRET" | "ADMIN_SECRET"): string {
   const value = env[name];
   if (typeof value !== "string" || value.length === 0) {
     throw new HttpError(503, `Relay secret ${name} is not configured`);

@@ -61,9 +61,16 @@ import com.journeyapps.barcodescanner.ScanOptions
 import com.xat.aegis.comms.ActiveCall
 import com.xat.aegis.comms.CallManager
 import com.xat.aegis.comms.CallPhase
+import com.xat.aegis.comms.COIN_SYMBOL
 import com.xat.aegis.comms.ChatMessage
 import com.xat.aegis.comms.ChatThread
 import com.xat.aegis.comms.STATUS_CALL
+import com.xat.aegis.comms.STATUS_PAYMENT
+import com.xat.aegis.comms.STATUS_VOICEMAIL
+import com.xat.aegis.comms.VoicemailBody
+import com.xat.aegis.comms.VoicemailPlayer
+import com.xat.aegis.comms.durationLabel
+import com.xat.aegis.comms.preview
 import com.xat.aegis.comms.CommsLog
 import com.xat.aegis.comms.CommsNotifications
 import com.xat.aegis.comms.CommsRepository
@@ -168,8 +175,14 @@ fun CommsScreen(
         askMicrophone.launch(Manifest.permission.RECORD_AUDIO)
     }
 
-    // A call, ringing or in progress, takes the whole tab.
+    // A call, ringing or in progress, takes the whole tab; so does the offer to
+    // leave a voicemail after a call this phone placed went unanswered.
     val call = activeCall
+    val voicemail = rememberVoicemailOffer(call)
+    if (voicemail != null && (call == null || call.phase == CallPhase.ENDED)) {
+        VoicemailScreen(voicemail.contact, call, onDone = voicemail.dismiss)
+        return
+    }
     if (call != null) {
         InCallScreen(call)
         return
@@ -523,6 +536,8 @@ private fun ThreadListScreen(onOpen: (String) -> Unit, onMyCode: () -> Unit, onI
     val now = rememberTick()
 
     if (addContact) AddContactDialog(onDismiss = { addContact = false }, onAdded = { addContact = false; onOpen(it) })
+    // The coin balance is the relay's figure; it is asked for when the list comes up.
+    LaunchedEffect(state.registered) { if (state.registered) CommsRepository.refreshBalance() }
 
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Spacer(Modifier.height(20.dp))
@@ -553,6 +568,7 @@ private fun ThreadListScreen(onOpen: (String) -> Unit, onMyCode: () -> Unit, onI
                 }
             )
             if (!state.listed) append(" · unlisted")
+            if (state.balance >= 0L) append(" · ${state.balance} $COIN_SYMBOL")
             if (state.lastSync > 0L) append(" · synced ${agoText(now, state.lastSync)}")
         }
         val statusColour = when {
@@ -643,7 +659,7 @@ private fun ThreadRow(t: ChatThread, onClick: () -> Unit) {
             )
             if (m != null) {
                 Text(
-                    (if (m.direction == Direction.OUT) "You: " else "") + m.body,
+                    (if (m.direction == Direction.OUT) "You: " else "") + m.preview(),
                     color = if (t.unread > 0) CInkDim else CMuted, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis
                 )
                 if (m.failed) Text(m.error ?: "Not sent", color = CCritical, fontSize = 11.sp)
@@ -733,7 +749,12 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
     }
     var draft by rememberSaveable(peer) { mutableStateOf("") }
     var sendError by remember(peer) { mutableStateOf<String?>(null) }
+    var paying by remember(peer) { mutableStateOf(false) }
     val listState = rememberLazyListState()
+    // Voicemails in this conversation play through one player, stopped when the screen goes.
+    val player = remember { VoicemailPlayer(context) }
+    var playing by remember { mutableStateOf<String?>(null) }
+    DisposableEffect(player) { onDispose { player.stop() } }
 
     // While this conversation is on screen and the app is in the foreground, its
     // messages are read on arrival and raise no notification. The composition
@@ -772,6 +793,7 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
 
     val c = contact
     val placeCall = rememberMicrophoneGate { c?.let { CallManager.place(it) } }
+    if (paying && c != null) PayDialog(c, onDismiss = { paying = false })
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Spacer(Modifier.height(20.dp))
         Header(c?.let { contactLabel(it) } ?: formatAegisNumber(peer), onBack = onBack) {
@@ -782,6 +804,7 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
                 else -> "UNVERIFIED" to CCaution
             }
             if (label.isNotEmpty()) SmallButton(label, colour, onClick = onVerify)
+            SmallButton("PAY", CAccent, enabled = c != null && !c.keyChanged) { paying = true }
             SmallButton("CALL", CClear, enabled = c != null && !c.keyChanged, onClick = placeCall)
         }
         Text(
@@ -806,7 +829,23 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
                     )
                 }
             }
-            items(messages, key = { it.id }) { m -> MessageBubble(m, onRetry = { scope.launch { CommsRepository.retry(m.id) } }) }
+            items(messages, key = { it.id }) { m ->
+                MessageBubble(
+                    m,
+                    onRetry = { scope.launch { CommsRepository.retry(m.id) } },
+                    playing = playing == m.id,
+                    onPlay = {
+                        if (playing == m.id) {
+                            player.stop()
+                            playing = null
+                        } else {
+                            val audio = VoicemailBody.decode(m.body)
+                            if (audio != null && player.play(m.id, audio.audioB64) { playing = null }) playing = m.id
+                            else Toast.makeText(context, "This voicemail cannot be played", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                )
+            }
             item(key = "§footer") { Spacer(Modifier.height(4.dp)) }
         }
 
@@ -841,17 +880,47 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
 }
 
 @Composable
-private fun MessageBubble(m: ChatMessage, onRetry: () -> Unit) {
+private fun MessageBubble(m: ChatMessage, onRetry: () -> Unit, playing: Boolean = false, onPlay: () -> Unit = {}) {
     val mine = m.direction == Direction.OUT
-    if (m.status == STATUS_CALL) {
-        // A call record: one quiet centred line in the conversation.
-        val missed = m.body.startsWith("Missed")
+    if (m.status == STATUS_CALL || m.status == STATUS_PAYMENT) {
+        // A call or payment record: one quiet centred line in the conversation.
+        val missed = m.status == STATUS_CALL && m.body.startsWith("Missed")
+        val colour = when {
+            missed -> CCritical
+            m.status == STATUS_PAYMENT -> CClear
+            else -> CMuted
+        }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
             Text(
                 (if (mine) "↗ " else "↙ ") + m.body + " · " + timeFmt.format(Date(m.ts)),
-                color = if (missed) CCritical else CMuted, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+                color = colour, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
                 modifier = Modifier.background(CPanel, RoundedCornerShape(10.dp)).padding(horizontal = 10.dp, vertical = 4.dp)
             )
+        }
+        return
+    }
+    if (m.status == STATUS_VOICEMAIL) {
+        val duration = VoicemailBody.decode(m.body)?.durationMs ?: 0L
+        Column(Modifier.fillMaxWidth(), horizontalAlignment = if (mine) Alignment.End else Alignment.Start) {
+            Row(
+                Modifier
+                    .widthIn(max = 300.dp)
+                    .background(if (mine) CPanelHi else CPanel, RoundedCornerShape(10.dp))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Button(
+                    onClick = onPlay,
+                    colors = ButtonDefaults.buttonColors(containerColor = if (playing) CCritical else CClear, contentColor = Color(0xFF12161D)),
+                    shape = RoundedCornerShape(20.dp), contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
+                    modifier = Modifier.height(36.dp)
+                ) { Text(if (playing) "■ STOP" else "▶ PLAY", fontWeight = FontWeight.Bold, fontSize = 12.sp, letterSpacing = 1.sp) }
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Voicemail · ${durationLabel(duration)}", color = CInk, fontSize = 13.sp)
+                    Text(timeFmt.format(Date(m.ts)), color = CMuted, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                }
+            }
         }
         return
     }
@@ -886,6 +955,78 @@ private fun MessageBubble(m: ChatMessage, onRetry: () -> Unit) {
             }
         }
     }
+}
+
+// ── AegisCoin ────────────────────────────────────────────────────────────────
+
+/**
+ * Pays a contact. The amount is a whole number of coins, the note goes to the
+ * contact inside the encrypted envelope and never to the relay. The balance
+ * shown is the relay's, refreshed when the dialog opens.
+ */
+@Composable
+private fun PayDialog(contact: Contact, onDismiss: () -> Unit) {
+    val state by CommsRepository.state.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    var amount by rememberSaveable { mutableStateOf("") }
+    var note by rememberSaveable { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var sending by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { CommsRepository.refreshBalance() }
+    val coins = amount.toLongOrNull()?.takeIf { it > 0L }
+    val canPay = coins != null && !sending && (state.balance < 0L || coins <= state.balance)
+
+    AlertDialog(
+        onDismissRequest = { if (!sending) onDismiss() },
+        containerColor = CPanel,
+        title = { Text("Pay ${contactLabel(contact)}", color = CInk, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    if (state.balance >= 0L) "Balance: ${state.balance} $COIN_SYMBOL on this relay" else "Balance: asking the relay…",
+                    color = if (coins != null && state.balance >= 0L && coins > state.balance) CCritical else CInkDim,
+                    fontSize = 12.sp, fontFamily = FontFamily.Monospace
+                )
+                OutlinedTextField(
+                    value = amount, onValueChange = { v -> amount = v.filter { it.isDigit() }.take(7); error = null },
+                    label = { Text("Amount ($COIN_SYMBOL)") }, singleLine = true, enabled = !sending,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), colors = fieldColors()
+                )
+                OutlinedTextField(
+                    value = note, onValueChange = { note = it.take(140) },
+                    label = { Text("Note (optional, encrypted)") }, maxLines = 3, enabled = !sending, colors = fieldColors()
+                )
+                Text(
+                    "AegisCoin is this relay's own currency. The relay moves the coins on your signed request; the note goes to ${contactLabel(contact)} end-to-end encrypted.",
+                    color = CMuted, fontSize = 11.sp, lineHeight = 15.sp
+                )
+                error?.let { Text(it, color = CCritical, fontSize = 12.sp) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = canPay,
+                onClick = {
+                    val value = coins ?: return@TextButton
+                    sending = true
+                    error = null
+                    scope.launch {
+                        CommsRepository.sendPayment(contact, value, note)
+                            .onSuccess {
+                                Toast.makeText(context, "Paid $value $COIN_SYMBOL to ${contactLabel(contact)}", Toast.LENGTH_SHORT).show()
+                                onDismiss()
+                            }
+                            .onFailure {
+                                sending = false
+                                error = it.message ?: "Payment failed"
+                            }
+                    }
+                }
+            ) { Text(if (sending) "PAYING…" else "PAY", color = if (canPay) CAccent else CMuted, fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !sending) { Text("CANCEL", color = CMuted, letterSpacing = 1.sp) } }
+    )
 }
 
 // ── In a call ────────────────────────────────────────────────────────────────

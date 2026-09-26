@@ -237,6 +237,48 @@ class RelayClient(
         return servers
     }
 
+    // ── AegisCoin ─────────────────────────────────────────────────────────
+
+    /** This identity's coins on this relay. Every relay is its own coin community. */
+    data class CoinBalance(val balance: Long, val symbol: String)
+
+    /** A payment the relay took: its id, and what is left afterwards. */
+    data class PayResult(val txid: String, val balance: Long)
+
+    /** One transfer as the relay recorded it; [direction] is "in" or "out" from this identity's side. */
+    data class CoinTx(val id: String, val from: String, val to: String, val amount: Long, val ts: Long, val direction: String, val note: String)
+
+    fun balance(): CoinBalance {
+        val json = signed("GET", "/v1/coin/balance")
+        return parsed { CoinBalance(json.getLong("balance"), json.optString("symbol", "AC")) }
+    }
+
+    /**
+     * Pays [amount] coins to [to]. Only the amount reaches the relay; the note
+     * the payer wrote travels to the recipient inside an encrypted envelope
+     * (see CommsWire.payment), never here.
+     */
+    fun pay(to: String, amount: Long, note: String?): PayResult {
+        val body = JSONObject().put("to", to).put("amount", amount)
+        if (!note.isNullOrBlank()) body.put("note", note)
+        val json = signed("POST", "/v1/coin/pay", body)
+        return parsed { PayResult(json.getString("txid"), json.getLong("balance")) }
+    }
+
+    fun coinHistory(): List<CoinTx> {
+        val json = signed("GET", "/v1/coin/history")
+        return parsed {
+            val arr = json.getJSONArray("txs")
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                CoinTx(
+                    o.getString("id"), o.getString("from"), o.getString("to"), o.getLong("amount"), o.getLong("ts"),
+                    o.optString("direction", "out"), o.optString("note", "")
+                )
+            }
+        }
+    }
+
     /** Opens the live-delivery socket. The caller owns the returned socket. */
     fun openSocket(listener: WebSocketListener): WebSocket {
         // OkHttp runs no network interceptors for a WebSocket upgrade, so it is

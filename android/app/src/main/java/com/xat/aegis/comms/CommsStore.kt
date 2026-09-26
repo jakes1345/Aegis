@@ -60,12 +60,14 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             )"""
         )
         createVersion2(db)
+        createVersion3(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         // Version 1 was the first schema for the end-to-end module. The Twilio-era
         // database (comms.db) is deleted by CommsRepository.init on first run.
         if (oldVersion < 2) createVersion2(db)
+        if (oldVersion < 3) createVersion3(db)
     }
 
     /** Receipts owed to contacts (sent, and retried, outside the repository lock) and an index for purging. */
@@ -79,6 +81,22 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             )"""
         )
         db.execSQL("CREATE INDEX IF NOT EXISTS seen_envelopes_ts ON seen_envelopes (ts)")
+    }
+
+    /** AegisCoin: the transfers this phone made and received, one row each. */
+    private fun createVersion3(db: SQLiteDatabase) {
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS transactions (
+                id TEXT PRIMARY KEY,
+                peer TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                ts INTEGER NOT NULL,
+                note TEXT NOT NULL,
+                txid TEXT NOT NULL
+            )"""
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS transactions_peer_ts ON transactions (peer, ts)")
     }
 
     // ── Contacts ─────────────────────────────────────────────────────────
@@ -135,6 +153,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         try {
             db.delete("receipts", "peer = ?", arrayOf(number))
             db.delete("messages", "peer = ?", arrayOf(number))
+            db.delete("transactions", "peer = ?", arrayOf(number))
             db.delete("contacts", "number = ?", arrayOf(number))
             db.setTransactionSuccessful()
         } finally {
@@ -287,6 +306,51 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             if (c.moveToFirst()) c.getInt(0) else 0
         }
 
+    // ── AegisCoin ────────────────────────────────────────────────────────
+
+    /** Records a transfer; a second copy of the same id (a re-sent payment notice) is ignored. */
+    fun insertTransaction(tx: CoinTx) {
+        val values = ContentValues().apply {
+            put("id", tx.id)
+            put("peer", tx.peer)
+            put("direction", tx.direction.name)
+            put("amount", tx.amount)
+            put("ts", tx.ts)
+            put("note", tx.note)
+            put("txid", tx.txid)
+        }
+        writableDatabase.insertWithOnConflict("transactions", null, values, SQLiteDatabase.CONFLICT_IGNORE)
+    }
+
+    fun hasTransaction(id: String): Boolean =
+        readableDatabase.rawQuery("SELECT 1 FROM transactions WHERE id = ?", arrayOf(id)).use { it.moveToFirst() }
+
+    /** Transfers with [peer], newest first. */
+    fun transactions(peer: String, limit: Int = 50): List<CoinTx> =
+        readableDatabase.query("transactions", null, "peer = ?", arrayOf(peer), null, null, "ts DESC", limit.toString()).use { c ->
+            val out = ArrayList<CoinTx>()
+            while (c.moveToNext()) out += readTransaction(c)
+            out
+        }
+
+    /** Every transfer, newest first. */
+    fun allTransactions(limit: Int = 100): List<CoinTx> =
+        readableDatabase.query("transactions", null, null, null, null, null, "ts DESC", limit.toString()).use { c ->
+            val out = ArrayList<CoinTx>()
+            while (c.moveToNext()) out += readTransaction(c)
+            out
+        }
+
+    private fun readTransaction(c: Cursor) = CoinTx(
+        id = c.getString(c.getColumnIndexOrThrow("id")),
+        peer = c.getString(c.getColumnIndexOrThrow("peer")),
+        direction = runCatching { Direction.valueOf(c.getString(c.getColumnIndexOrThrow("direction"))) }.getOrDefault(Direction.IN),
+        amount = c.getLong(c.getColumnIndexOrThrow("amount")),
+        ts = c.getLong(c.getColumnIndexOrThrow("ts")),
+        note = c.getString(c.getColumnIndexOrThrow("note")),
+        txid = c.getString(c.getColumnIndexOrThrow("txid"))
+    )
+
     // ── Envelope bookkeeping ─────────────────────────────────────────────
 
     fun isEnvelopeSeen(key: String): Boolean =
@@ -434,6 +498,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             db.delete("seen_envelopes", null, null)
             db.delete("pending_inbound", null, null)
             db.delete("receipts", null, null)
+            db.delete("transactions", null, null)
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
@@ -470,6 +535,6 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
 
     private companion object {
         const val DB_NAME = "comms_e2ee.db"
-        const val DB_VERSION = 2
+        const val DB_VERSION = 3
     }
 }

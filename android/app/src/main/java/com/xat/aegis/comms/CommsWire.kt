@@ -25,6 +25,9 @@ import org.json.JSONObject
  *   call     "ck": offer | ringing | answer | ice | reoffer | end, "cid": call id, and
  *            offer "ts", "sdp" · answer "sdp" · reoffer "sdp" · ice "cands": [{"m","i","c"}] · end "reason"
  *            (ringing carries nothing more: the callee's phone is ringing)
+ *   payment  "id", "txid" (the relay's transaction id), "ts", "amt" (AegisCoin), "note" (optional)
+ *            — the coins moved through the relay already; this tells the recipient, privately
+ *   voicemail "id", "ts", "audio" (base64 AMR-NB), "dur" (ms)
  *
  * Pure Kotlin and org.json, so the JVM tests use exactly this code.
  */
@@ -48,6 +51,8 @@ object CommsWire {
     const val T_RECEIPT = "receipt"
     const val T_RESYNC = "resync"
     const val T_CALL = "call"
+    const val T_PAYMENT = "payment"
+    const val T_VOICEMAIL = "voicemail"
 
     // msg
     const val F_ID = "id"
@@ -78,6 +83,17 @@ object CommsWire {
     const val END_CANCEL = "cancel"
     const val END_REJECT = "reject"
     const val END_BUSY = "busy"
+
+    // payment
+    const val F_TXID = "txid"
+    const val F_AMOUNT = "amt"
+    const val F_NOTE = "note"
+
+    // voicemail
+    /** Base64 of the AMR-NB recording. */
+    const val F_AUDIO = "audio"
+    /** Its length in milliseconds. */
+    const val F_DURATION = "dur"
 
     // One ICE candidate inside "cands".
     private const val C_MID = "m"
@@ -126,6 +142,16 @@ object CommsWire {
     fun callReoffer(cid: String, sdp: String): JSONObject = call(CALL_REOFFER, cid).put(F_SDP, sdp)
 
     fun callEnd(cid: String, reason: String): JSONObject = call(CALL_END, cid).put(F_REASON, reason)
+
+    /** Tells the recipient about coins already moved to them by the relay, with the note only they can read. */
+    fun payment(id: String, txid: String, ts: Long, amount: Long, note: String?): JSONObject {
+        val o = base(T_PAYMENT).put(F_ID, id).put(F_TXID, txid).put(F_TS, ts).put(F_AMOUNT, amount)
+        if (!note.isNullOrBlank()) o.put(F_NOTE, note)
+        return o
+    }
+
+    fun voicemail(id: String, ts: Long, audioB64: String, durationMs: Long): JSONObject =
+        base(T_VOICEMAIL).put(F_ID, id).put(F_TS, ts).put(F_AUDIO, audioB64).put(F_DURATION, durationMs)
 
     /**
      * Adds the sender's identity to [payload]. Throws [IllegalStateException]

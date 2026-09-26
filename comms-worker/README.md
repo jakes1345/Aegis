@@ -72,6 +72,33 @@ npx wrangler secret put TURN_KEY_API_TOKEN
 The Worker then mints short-lived TURN credentials for `GET /v1/turn`. A TURN
 server forwards encrypted packets it cannot decrypt.
 
+### AegisCoin (optional)
+
+Every relay is its own small currency community. Each Aegis number holds a
+balance of AegisCoin (`AC`) in its mailbox, and a phone pays another by a
+signed request; the relay moves the coins between the two mailboxes. The
+recipient then hears about the payment, with whatever note the payer wrote,
+inside an encrypted envelope: the relay records who paid whom how much, but
+never the note.
+
+Balances start at zero unless the relay mints. Two knobs, both optional:
+
+```toml
+# wrangler.toml
+[vars]
+COIN_INITIAL_BALANCE = "100"    # coins every new registration starts with
+```
+
+```sh
+npx wrangler secret put ADMIN_SECRET   # 16+ characters; lets the operator mint
+```
+
+Minting is `POST /v1/admin/coin/mint` with `{"to": "<Aegis number>", "amount": 50}`,
+signed like any request by a registered identity (the operator's own phone,
+say) and carrying `X-Admin-Secret`. Without `ADMIN_SECRET` the endpoint is off.
+A single transfer moves at most 1,000,000 AC; each mailbox keeps its last 100
+transactions.
+
 ## API
 
 Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
@@ -94,6 +121,10 @@ Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
 | POST | `/v1/ack` | Delete envelopes the app has stored |
 | GET | `/v1/ws` | Live delivery over a hibernatable WebSocket: `envelope` frames (acked with `{"type":"ack","ids":[…]}`), a `ready` frame after the backlog, a `hb` heartbeat every two minutes, and `pong` for a client's `{"type":"ping"}` |
 | GET | `/v1/turn` | ICE servers for a call: STUN, plus short-lived TURN credentials when a TURN key is configured |
+| GET | `/v1/coin/balance` | `{balance, symbol: "AC"}`: this identity's AegisCoin |
+| POST | `/v1/coin/pay` | `{to, amount, note?}` → `{txid, balance, ok}`: pays a contact; 30 a minute |
+| GET | `/v1/coin/history` | `{txs}`: the last transactions, newest first (`?limit=`, up to 100) |
+| POST | `/v1/admin/coin/mint` | `{to, amount}` with `X-Admin-Secret` → `{ok, balance}`; off unless `ADMIN_SECRET` is set |
 
 Each Aegis number is a Durable Object holding the keys, the queue (up to 2000
 envelopes of 64 KiB, kept 30 days) and the live sockets.

@@ -95,11 +95,39 @@ class CommsWireTest {
     }
 
     @Test
+    fun paymentRoundTrips() {
+        val got = roundTrip(CommsWire.payment("m-1", "tx-9", 1_700_000_000_000, 25L, "lunch"))
+        assertEquals(CommsWire.T_PAYMENT, CommsWire.type(got))
+        assertEquals("m-1", got.getString(CommsWire.F_ID))
+        assertEquals("tx-9", got.getString(CommsWire.F_TXID))
+        assertEquals(25L, got.getLong(CommsWire.F_AMOUNT))
+        assertEquals(1_700_000_000_000, got.getLong(CommsWire.F_TS))
+        assertEquals("lunch", got.getString(CommsWire.F_NOTE))
+        assertEquals(sender, CommsWire.senderOf(got))
+        // No note: the field is left out rather than sent empty.
+        val bare = roundTrip(CommsWire.payment("m-2", "tx-10", 1L, 1L, "  "))
+        assertTrue(!bare.has(CommsWire.F_NOTE))
+    }
+
+    @Test
+    fun voicemailRoundTrips() {
+        val audio = java.util.Base64.getEncoder().encodeToString(ByteArray(3_000) { (it % 251).toByte() })
+        val got = roundTrip(CommsWire.voicemail("v-1", 42L, audio, 12_345L))
+        assertEquals(CommsWire.T_VOICEMAIL, CommsWire.type(got))
+        assertEquals("v-1", got.getString(CommsWire.F_ID))
+        assertEquals(42L, got.getLong(CommsWire.F_TS))
+        assertEquals(audio, got.getString(CommsWire.F_AUDIO))
+        assertEquals(12_345L, got.getLong(CommsWire.F_DURATION))
+        assertEquals(sender, CommsWire.senderOf(got))
+    }
+
+    @Test
     fun noBuilderUsesAReservedField() {
         val all = listOf(
             CommsWire.message("i", 1, "b"), CommsWire.receipt(listOf("i"), "read"), CommsWire.resync(),
             CommsWire.callOffer("c", 1, "s"), CommsWire.callRinging("c"), CommsWire.callAnswer("c", "s"), CommsWire.callReoffer("c", "s"),
             CommsWire.callIce("c", listOf(CommsWire.Candidate("0", 0, "x"))), CommsWire.callEnd("c", "r"),
+            CommsWire.payment("i", "t", 1, 1, "n"), CommsWire.voicemail("i", 1, "QQ==", 1),
         )
         for (p in all) for (f in CommsWire.SENDER_FIELDS) assertTrue("${CommsWire.type(p)} uses $f", !p.has(f))
     }

@@ -5,6 +5,10 @@
 #   ENROLL_SECRET        One-time code typed into Aegis when it registers
 #   TURN_KEY_ID          Optional, for calls: Cloudflare Realtime TURN key id
 #   TURN_KEY_API_TOKEN   Optional, for calls: its API token
+#   ADMIN_SECRET         Optional, for AegisCoin: lets the operator mint coins (POST /v1/admin/coin/mint)
+#
+# Plain variables (may go in [vars] below):
+#   COIN_INITIAL_BALANCE AegisCoin every new registration starts with, e.g. "100"; unset: none
 
 name = "aegis-comms"
 main = "src/index.ts"
