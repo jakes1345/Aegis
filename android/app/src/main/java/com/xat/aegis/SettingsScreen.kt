@@ -156,8 +156,11 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
     // ── Passcode state ───────────────────────────────────────────────────────
     val lockEnabled by AppLock.enabled.collectAsStateWithLifecycle()
     val biometricEnabled by AppLock.biometricEnabled.collectAsStateWithLifecycle()
+    var hasDuress by remember { mutableStateOf(AppLock.hasDuress(context)) }
     var showPasscodeSetup by remember { mutableStateOf(false) }
     var showPasscodeDisable by remember { mutableStateOf(false) }
+    var showDuressSetup by remember { mutableStateOf(false) }
+    var showDuressRemove by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val canUseBiometric = remember(context) {
         val result = BiometricManager.from(context).canAuthenticate(
@@ -676,6 +679,58 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                             )
                         }
                     }
+                    HorizontalDivider(color = SRuleClr, thickness = 0.5.dp)
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    if (hasDuress) "Duress code is set" else "Duress code",
+                                    color = SInkClr, fontSize = 14.sp, fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    "A second code that silently wipes Aegis — looks like any wrong passcode",
+                                    color = SMutedClr, fontSize = 12.sp, lineHeight = 16.sp
+                                )
+                            }
+                        }
+                        if (hasDuress) {
+                            Button(
+                                onClick = { showDuressSetup = true },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = SAccentClr.copy(alpha = 0.12f),
+                                    contentColor = SAccentClr
+                                ),
+                                shape = SCardShape, modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("CHANGE DURESS CODE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                            }
+                            Button(
+                                onClick = { showDuressRemove = true },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = SCriticalClr.copy(alpha = 0.08f),
+                                    contentColor = SCriticalClr
+                                ),
+                                shape = SCardShape, modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("REMOVE DURESS CODE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                            }
+                        } else {
+                            Button(
+                                onClick = { showDuressSetup = true },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = SAccentClr.copy(alpha = 0.12f),
+                                    contentColor = SAccentClr
+                                ),
+                                shape = SCardShape, modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("SET DURESS CODE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                            }
+                        }
+                    }
                 } else {
                     Button(
                         onClick = { showPasscodeSetup = true },
@@ -708,6 +763,26 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                     context = context,
                     onDone = { showPasscodeDisable = false },
                     onCancel = { showPasscodeDisable = false }
+                )
+            }
+        }
+
+        if (showDuressSetup) {
+            item(key = "§duress-setup") {
+                DuressSetupPanel(
+                    context = context,
+                    onDone = { hasDuress = AppLock.hasDuress(context); showDuressSetup = false },
+                    onCancel = { showDuressSetup = false }
+                )
+            }
+        }
+
+        if (showDuressRemove) {
+            item(key = "§duress-remove") {
+                DuressRemovePanel(
+                    context = context,
+                    onDone = { hasDuress = AppLock.hasDuress(context); showDuressRemove = false },
+                    onCancel = { showDuressRemove = false }
                 )
             }
         }
@@ -977,6 +1052,153 @@ private fun PasscodeDisablePanel(
                 shape = SCardShape
             ) {
                 Text("TURN OFF", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DuressSetupPanel(
+    context: Context,
+    onDone: () -> Unit,
+    onCancel: () -> Unit
+) {
+    var step  by remember { mutableIntStateOf(0) }
+    var code1 by remember { mutableStateOf("") }
+    var code2 by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+
+    Column(
+        Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Text(
+            if (step == 0) "Choose a duress code (6–12 digits)" else "Confirm the duress code",
+            color = SInkClr, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
+        )
+        Text(
+            "Must differ from your main passcode. Entering it silently wipes Aegis.",
+            color = SMutedClr, fontSize = 12.sp, lineHeight = 16.sp
+        )
+        if (error.isNotEmpty()) Text(error, color = SCriticalClr, fontSize = 12.sp)
+        OutlinedTextField(
+            value = if (step == 0) code1 else code2,
+            onValueChange = { v ->
+                val digits = v.filter { it.isDigit() }.take(AppLock.MAX_LENGTH)
+                if (step == 0) code1 = digits else code2 = digits
+                error = ""
+            },
+            label = { Text("Digits", color = SMutedClr) },
+            singleLine = true,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = SInkClr,
+                unfocusedTextColor = SInkClr,
+                focusedBorderColor = SAccentClr,
+                unfocusedBorderColor = SRuleClr
+            ),
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword
+            ),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = onCancel) {
+                Text("CANCEL", color = SMutedClr, letterSpacing = 1.sp)
+            }
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = {
+                    scope.launch {
+                        error = ""
+                        if (step == 0) {
+                            AppLock.problem(code1)?.let { error = it; return@launch }
+                            step = 1
+                        } else {
+                            if (code1 != code2) { error = "Codes do not match"; return@launch }
+                            val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                AppLock.setDuress(context, code1)
+                            }
+                            r.onSuccess { onDone() }.onFailure { error = it.message ?: "Failed" }
+                        }
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = SAccentClr, contentColor = Color(0xFF12161D)
+                ),
+                shape = SCardShape
+            ) {
+                Text(if (step == 0) "NEXT" else "SAVE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DuressRemovePanel(
+    context: Context,
+    onDone: () -> Unit,
+    onCancel: () -> Unit
+) {
+    var code  by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+
+    Column(
+        Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Text("Enter your passcode to remove the duress code", color = SInkClr, fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold)
+        if (error.isNotEmpty()) Text(error, color = SCriticalClr, fontSize = 12.sp)
+        OutlinedTextField(
+            value = code,
+            onValueChange = { v -> code = v.filter { it.isDigit() }.take(AppLock.MAX_LENGTH); error = "" },
+            label = { Text("Passcode", color = SMutedClr) },
+            singleLine = true,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = SInkClr,
+                unfocusedTextColor = SInkClr,
+                focusedBorderColor = SAccentClr,
+                unfocusedBorderColor = SRuleClr
+            ),
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword
+            ),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = onCancel) {
+                Text("CANCEL", color = SMutedClr, letterSpacing = 1.sp)
+            }
+            Spacer(Modifier.weight(1f))
+            Button(
+                onClick = {
+                    scope.launch {
+                        val v = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            AppLock.attempt(context, code, unlockOnSuccess = false)
+                        }
+                        when (v) {
+                            AppLock.Verdict.Accepted -> {
+                                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    AppLock.setDuress(context, null)
+                                }
+                                onDone()
+                            }
+                            is AppLock.Verdict.Rejected -> error = "Wrong passcode"
+                            is AppLock.Verdict.LockedOut -> error = "Too many attempts — try later"
+                            AppLock.Verdict.Wiping -> onCancel()
+                            is AppLock.Verdict.Unavailable -> error = "Keystore unavailable"
+                        }
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = SCriticalClr.copy(alpha = 0.15f),
+                    contentColor = SCriticalClr
+                ),
+                shape = SCardShape
+            ) {
+                Text("REMOVE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
             }
         }
     }
