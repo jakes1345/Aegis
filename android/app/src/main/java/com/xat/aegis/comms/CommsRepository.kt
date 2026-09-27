@@ -556,7 +556,10 @@ object CommsRepository {
             store.insertMessage(ChatMessage(id, peer, Direction.OUT, body.encode(), System.currentTimeMillis(), "queued", read = true, kind = KIND_MEDIA))
             bump()
             CommsLog.add("${if (media.isVideo) "Video" else "Photo"} (${media.bytes.size / 1024} KB, $chunks envelope(s)) queued for ${formatAegisNumber(peer)}")
+            // On the repository's scope: a photo takes many envelopes, and leaving
+            // the conversation must not cancel it half-way.
             scope.launch { runCatching { flushOutbox() }.onFailure { CommsLog.add("Sending failed: ${it.message}") } }
+            Unit
         }
     }
 
@@ -591,6 +594,11 @@ object CommsRepository {
                     is Deliver.Failed -> {
                         CommsLog.add("Message to ${formatAegisNumber(contact.number)} failed: ${outcome.reason}")
                         store.setStatus(m.id, "failed", outcome.reason)
+                        if (m.isMedia) {
+                            // A retry starts from the header again.
+                            synchronized(mediaSent) { mediaSent.remove(m.id) }
+                            _mediaProgress.update { it - m.id }
+                        }
                     }
                     is Deliver.Offline -> {
                         _state.update { it.copy(error = outcome.reason) }

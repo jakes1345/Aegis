@@ -9,7 +9,6 @@ import android.net.NetworkCapabilities
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
-import android.os.Build
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import com.xat.aegis.Threat
@@ -351,8 +350,8 @@ object WifiScanner {
         }
     }
 
+    /** `currentSecurityType` exists from API 31, which is minSdk. */
     private fun securityOf(info: WifiInfo): WifiSecurity {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return WifiSecurity.UNKNOWN
         return when (info.currentSecurityType) {
             WifiInfo.SECURITY_TYPE_OPEN -> WifiSecurity.OPEN
             WifiInfo.SECURITY_TYPE_OWE -> WifiSecurity.OWE

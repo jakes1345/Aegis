@@ -12,10 +12,14 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import android.widget.MediaController
 import android.widget.Toast
+import android.widget.VideoView
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -33,8 +37,14 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -46,8 +56,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -64,12 +78,17 @@ import com.xat.aegis.comms.CallPhase
 import com.xat.aegis.comms.COIN_SYMBOL
 import com.xat.aegis.comms.ChatMessage
 import com.xat.aegis.comms.ChatThread
+import com.xat.aegis.comms.CommsMedia
+import com.xat.aegis.comms.CommsWire
+import com.xat.aegis.comms.MediaBody
 import com.xat.aegis.comms.STATUS_CALL
 import com.xat.aegis.comms.STATUS_PAYMENT
+import com.xat.aegis.comms.STATUS_RECEIVING
 import com.xat.aegis.comms.STATUS_VOICEMAIL
 import com.xat.aegis.comms.VoicemailBody
 import com.xat.aegis.comms.VoicemailPlayer
 import com.xat.aegis.comms.durationLabel
+import com.xat.aegis.comms.label
 import com.xat.aegis.comms.preview
 import com.xat.aegis.comms.CommsLog
 import com.xat.aegis.comms.CommsNotifications
@@ -83,6 +102,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -756,6 +776,77 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
     var playing by remember { mutableStateOf<String?>(null) }
     DisposableEffect(player) { onDispose { player.stop() } }
 
+    // A photo or video picked (or taken) and made ready to send, waiting for SEND;
+    // the text typed alongside goes with it as the caption.
+    val mediaProgress by CommsRepository.mediaProgress.collectAsStateWithLifecycle()
+    var attachment by remember(peer) { mutableStateOf<CommsMedia.Prepared?>(null) }
+    var preparing by remember(peer) { mutableStateOf(false) }
+    var attachMenu by remember { mutableStateOf(false) }
+    var viewing by remember { mutableStateOf<ChatMessage?>(null) }
+    // Where the camera writes; kept across the trip to the camera app.
+    var captureUri by rememberSaveable { mutableStateOf<String?>(null) }
+    fun prepare(uri: Uri, video: Boolean?, deleteAfter: File? = null) {
+        preparing = true
+        sendError = null
+        scope.launch {
+            val isVideo = video ?: (context.contentResolver.getType(uri)?.startsWith("video/") == true)
+            val result = withContext(Dispatchers.IO) {
+                runCatching { if (isVideo) CommsMedia.prepareVideo(context, uri) else CommsMedia.prepareImage(context, uri) }
+            }
+            deleteAfter?.let { runCatching { it.delete() } }
+            preparing = false
+            result.onSuccess { attachment = it }
+                .onFailure { sendError = it.message ?: "That file could not be read" }
+        }
+    }
+    val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) prepare(uri, null)
+    }
+    fun captureFile(extension: String): Pair<File, Uri> {
+        val f = File(File(context.cacheDir, "camera").also { it.mkdirs() }, "capture_${System.currentTimeMillis()}.$extension")
+        return f to FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", f)
+    }
+    fun capturedFile(): File? = captureUri?.let { File(File(context.cacheDir, "camera"), Uri.parse(it).lastPathSegment ?: return null) }
+    val takePhoto = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        val uri = captureUri?.let { Uri.parse(it) }
+        val file = capturedFile()
+        captureUri = null
+        if (ok && uri != null) prepare(uri, video = false, deleteAfter = file) else file?.delete()
+    }
+    val recordVideo = rememberLauncherForActivityResult(ActivityResultContracts.CaptureVideo()) { ok ->
+        val uri = captureUri?.let { Uri.parse(it) }
+        val file = capturedFile()
+        captureUri = null
+        if (ok && uri != null) prepare(uri, video = true, deleteAfter = file) else file?.delete()
+    }
+    var cameraWanted by remember { mutableStateOf<Boolean?>(null) } // true: photo, false: video
+    fun openCamera(video: Boolean) {
+        val (f, uri) = captureFile(if (video) "mp4" else "jpg")
+        runCatching { f.parentFile?.listFiles()?.forEach { old -> if (old != f) old.delete() } }
+        captureUri = uri.toString()
+        if (video) recordVideo.launch(uri) else takePhoto.launch(uri)
+    }
+    // Aegis declares the camera permission (for scanning codes), so the camera
+    // app refuses to hand a picture back until it is granted.
+    val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val video = cameraWanted ?: return@rememberLauncherForActivityResult
+        cameraWanted = null
+        if (granted) openCamera(video) else sendError = "Taking a ${if (video) "video" else "photo"} needs the camera. Allow it under Permissions."
+    }
+    fun camera(video: Boolean) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) openCamera(video)
+        else { cameraWanted = video; askCamera.launch(Manifest.permission.CAMERA) }
+    }
+    if (attachMenu) {
+        AttachMenu(
+            onDismiss = { attachMenu = false },
+            onGallery = { attachMenu = false; pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
+            onPhoto = { attachMenu = false; camera(video = false) },
+            onVideo = { attachMenu = false; camera(video = true) }
+        )
+    }
+    viewing?.let { MediaViewer(it, onDismiss = { viewing = null }) }
+
     // While this conversation is on screen and the app is in the foreground, its
     // messages are read on arrival and raise no notification. The composition
     // survives Home and the screen turning off, so the lifecycle decides, not
@@ -834,6 +925,8 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
                     m,
                     onRetry = { scope.launch { CommsRepository.retry(m.id) } },
                     playing = playing == m.id,
+                    progress = mediaProgress[m.id],
+                    onOpen = { viewing = m },
                     onPlay = {
                         if (playing == m.id) {
                             player.stop()
@@ -850,24 +943,63 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
         }
 
         sendError?.let { Text(it, color = CCritical, fontSize = 12.sp) }
+        val pending = attachment
+        if (pending != null || preparing) {
+            Row(
+                Modifier.fillMaxWidth().padding(top = 8.dp).background(CPanel, CShape).padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                val thumb = remember(pending) { pending?.thumbB64?.takeIf { it.isNotBlank() }?.let { CommsMedia.decodeB64(it, 160)?.asImageBitmap() } }
+                Box(Modifier.size(56.dp).clip(RoundedCornerShape(6.dp)).background(CPanelHi), contentAlignment = Alignment.Center) {
+                    if (thumb != null) Image(thumb, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                    else if (preparing) CircularProgressIndicator(color = CAccent, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                    else PictureGlyph(CMuted, Modifier.size(26.dp))
+                    if (pending?.isVideo == true) Text("▶", color = CInk, fontSize = 18.sp)
+                }
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        when {
+                            pending == null -> "Preparing…"
+                            pending.isVideo -> "Video · ${durationLabel(pending.durationMs)}"
+                            else -> "Photo · ${pending.width}×${pending.height}"
+                        },
+                        color = CInk, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        if (pending == null) "Reading and compressing the file"
+                        else "${sizeLabel(pending.bytes.size.toLong())} · ${(pending.bytes.size + CommsWire.MEDIA_CHUNK_BYTES - 1) / CommsWire.MEDIA_CHUNK_BYTES} encrypted envelope(s) · type a caption below, or none",
+                        color = CMuted, fontSize = 11.sp, lineHeight = 14.sp
+                    )
+                }
+                SmallButton("REMOVE", CMuted, enabled = !preparing) { attachment = null }
+            }
+        }
         Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { attachMenu = true },
+                enabled = c != null && !c.keyChanged && attachment == null && !preparing,
+                shape = CShape, border = BorderStroke(1.dp, CRule), contentPadding = PaddingValues(0.dp),
+                modifier = Modifier.size(56.dp)
+            ) { PictureGlyph(if (c != null && attachment == null && !preparing) CAccent else CMuted, Modifier.size(24.dp)) }
             OutlinedTextField(
                 value = draft, onValueChange = { draft = it.take(4000) },
-                placeholder = { Text("Encrypted message", color = CMuted, fontSize = 13.sp) },
+                placeholder = { Text(if (attachment != null) "Caption (optional)" else "Encrypted message", color = CMuted, fontSize = 13.sp) },
                 modifier = Modifier.weight(1f), maxLines = 5, colors = fieldColors()
             )
             Button(
                 onClick = {
                     val text = draft.trim()
-                    if (text.isEmpty()) return@Button
+                    val media = attachment
+                    if (text.isEmpty() && media == null) return@Button
                     sendError = null
-                    val toSend = text
                     draft = ""
+                    attachment = null
                     scope.launch {
-                        CommsRepository.send(peer, toSend).onFailure { sendError = it.message ?: "Not sent" }
+                        if (media != null) CommsRepository.sendMedia(peer, media, text).onFailure { sendError = it.message ?: "Not sent" }
+                        else CommsRepository.send(peer, text).onFailure { sendError = it.message ?: "Not sent" }
                     }
                 },
-                enabled = draft.isNotBlank() && c != null,
+                enabled = (draft.isNotBlank() || attachment != null) && c != null && !preparing,
                 colors = ButtonDefaults.buttonColors(containerColor = CAccent, contentColor = Color(0xFF12161D), disabledContainerColor = CPanelHi, disabledContentColor = CMuted),
                 shape = CShape, modifier = Modifier.height(56.dp)
             ) { Text("SEND", fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
@@ -880,8 +1012,20 @@ private fun ThreadScreen(peer: String, onBack: () -> Unit, onVerify: () -> Unit)
 }
 
 @Composable
-private fun MessageBubble(m: ChatMessage, onRetry: () -> Unit, playing: Boolean = false, onPlay: () -> Unit = {}) {
+private fun MessageBubble(
+    m: ChatMessage,
+    onRetry: () -> Unit,
+    playing: Boolean = false,
+    onPlay: () -> Unit = {},
+    /** (chunks sent, chunks in all) while an outgoing photo or video is on its way. */
+    progress: Pair<Int, Int>? = null,
+    onOpen: () -> Unit = {}
+) {
     val mine = m.direction == Direction.OUT
+    if (m.isMedia) {
+        MediaBubble(m, mine, progress, onOpen, onRetry)
+        return
+    }
     if (m.status == STATUS_CALL || m.status == STATUS_PAYMENT) {
         // A call or payment record: one quiet centred line in the conversation.
         val missed = m.status == STATUS_CALL && m.body.startsWith("Missed")
@@ -954,6 +1098,237 @@ private fun MessageBubble(m: ChatMessage, onRetry: () -> Unit, playing: Boolean 
                 SmallButton("RETRY", CAccent, onClick = onRetry)
             }
         }
+    }
+}
+
+// ── Photos and videos ────────────────────────────────────────────────────────
+
+private fun sizeLabel(bytes: Long): String = when {
+    bytes >= 1024 * 1024 -> String.format(Locale.US, "%.1f MB", bytes / (1024f * 1024f))
+    else -> "${(bytes + 1023) / 1024} KB"
+}
+
+/** The glyph a message's delivery status shows after its time, for the sender. */
+private fun statusGlyph(status: String): Pair<String, Color> = when (status) {
+    "queued" -> "…" to CMuted
+    "sent" -> "✓" to CMuted
+    "delivered" -> "✓✓" to CMuted
+    "read" -> "✓✓" to CClear
+    "failed" -> "!" to CCritical
+    else -> "" to CMuted
+}
+
+/**
+ * A photo or video in the conversation: the picture itself (the thumbnail that
+ * came in the first envelope until the whole file is here, then the file),
+ * its caption, and how far it has got. A tap opens it full-screen once it is
+ * complete.
+ */
+@Composable
+private fun MediaBubble(m: ChatMessage, mine: Boolean, progress: Pair<Int, Int>?, onOpen: () -> Unit, onRetry: () -> Unit) {
+    val media = remember(m.body) { MediaBody.decode(m.body) }
+    val receiving = m.status == STATUS_RECEIVING
+    val complete = !receiving && m.status != "failed" || mine
+    val thumb = remember(m.id, media?.thumbB64) { media?.thumbB64?.takeIf { it.isNotBlank() }?.let { CommsMedia.decodeB64(it, 480)?.asImageBitmap() } }
+    // A photo that is here in full is shown from the file, sharper than its thumbnail.
+    val full by produceState<ImageBitmap?>(initialValue = null, m.id, m.status) {
+        if (media != null && !media.isVideo && (mine || !receiving)) {
+            value = withContext(Dispatchers.IO) { CommsRepository.mediaBytes(m.id)?.let { CommsMedia.decode(it, 900)?.asImageBitmap() } }
+        }
+    }
+    val picture = full ?: thumb
+    val ratio = if (media != null && media.width > 0 && media.height > 0) media.width.toFloat() / media.height else 4f / 3f
+    val width = 240.dp
+    val height = (width / ratio.coerceIn(0.6f, 2.2f))
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = if (mine) Alignment.End else Alignment.Start) {
+        Column(
+            Modifier
+                .widthIn(max = 264.dp)
+                .background(if (mine) CPanelHi else CPanel, RoundedCornerShape(10.dp))
+                .padding(6.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Box(
+                Modifier
+                    .width(width).height(height)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(CGround)
+                    .clickable(enabled = complete && media != null, onClick = onOpen),
+                contentAlignment = Alignment.Center
+            ) {
+                if (picture != null) {
+                    Image(
+                        picture, contentDescription = media?.label() ?: "Attachment",
+                        modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop
+                    )
+                } else {
+                    PictureGlyph(CMuted, Modifier.size(40.dp))
+                }
+                if (media?.isVideo == true) {
+                    Box(Modifier.size(52.dp).background(Color(0xAA0E1116), RoundedCornerShape(26.dp)), contentAlignment = Alignment.Center) {
+                        Text("▶", color = CInk, fontSize = 22.sp)
+                    }
+                    Text(
+                        durationLabel(media.durationMs), color = CInk, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(6.dp).background(Color(0xAA0E1116), RoundedCornerShape(4.dp)).padding(horizontal = 5.dp, vertical = 1.dp)
+                    )
+                }
+                if (receiving || progress != null) {
+                    Column(
+                        Modifier.fillMaxSize().background(Color(0x880E1116)),
+                        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center
+                    ) {
+                        CircularProgressIndicator(color = CAccent, strokeWidth = 2.dp, modifier = Modifier.size(28.dp))
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            if (progress != null) "Sending ${progress.first}/${progress.second}" else "Receiving…",
+                            color = CInk, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+            }
+            if (media != null && media.caption.isNotBlank()) {
+                Text(media.caption, color = CInk, fontSize = 14.sp, lineHeight = 19.sp, modifier = Modifier.padding(horizontal = 4.dp))
+            }
+            Row(Modifier.padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    (media?.let { if (it.isVideo) "Video" else "Photo" } ?: "Attachment") + (media?.let { " · ${sizeLabel(it.size)}" } ?: "") + " · " + timeFmt.format(Date(m.ts)),
+                    color = CMuted, fontSize = 10.sp, fontFamily = FontFamily.Monospace
+                )
+                if (mine) {
+                    val (glyph, colour) = statusGlyph(m.status)
+                    Text(glyph, color = colour, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                }
+            }
+        }
+        if (m.failed) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(m.error ?: "Not sent", color = CCritical, fontSize = 11.sp, modifier = Modifier.widthIn(max = 240.dp))
+                if (mine) SmallButton("RETRY", CAccent, onClick = onRetry)
+            }
+        }
+    }
+}
+
+/** Where an attachment comes from. */
+@Composable
+private fun AttachMenu(onDismiss: () -> Unit, onGallery: () -> Unit, onPhoto: () -> Unit, onVideo: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = CPanel,
+        title = { Text("Send a photo or video", color = CInk, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Photos are resized to at most ${CommsMedia.MAX_IMAGE_EDGE} px and sent as JPEG; videos go as they are, up to " +
+                        "${CommsMedia.MAX_BYTES / (1024 * 1024)} MB. Either travels end-to-end encrypted in pieces the relay cannot read.",
+                    color = CMuted, fontSize = 12.sp, lineHeight = 17.sp
+                )
+                OutlinedButton(onClick = onGallery, shape = CShape, border = BorderStroke(1.dp, CAccent), modifier = Modifier.fillMaxWidth()) {
+                    Text("CHOOSE FROM GALLERY", color = CAccent, fontSize = 12.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold)
+                }
+                OutlinedButton(onClick = onPhoto, shape = CShape, border = BorderStroke(1.dp, CClear), modifier = Modifier.fillMaxWidth()) {
+                    Text("TAKE A PHOTO", color = CClear, fontSize = 12.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold)
+                }
+                OutlinedButton(onClick = onVideo, shape = CShape, border = BorderStroke(1.dp, CClear), modifier = Modifier.fillMaxWidth()) {
+                    Text("RECORD A VIDEO", color = CClear, fontSize = 12.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("CANCEL", color = CMuted, letterSpacing = 1.sp) } }
+    )
+}
+
+/**
+ * A photo or video full-screen. The bytes are decrypted from the message's
+ * file; a video is written to the cache only for as long as this is open,
+ * since VideoView plays from a path.
+ */
+@Composable
+private fun MediaViewer(m: ChatMessage, onDismiss: () -> Unit) {
+    val media = remember(m.body) { MediaBody.decode(m.body) }
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        Box(Modifier.fillMaxSize().background(Color(0xF20A0D12))) {
+            if (media == null) {
+                Text("This attachment cannot be shown", color = CCritical, modifier = Modifier.align(Alignment.Center))
+            } else if (media.isVideo) {
+                var file by remember { mutableStateOf<File?>(null) }
+                var missing by remember { mutableStateOf(false) }
+                LaunchedEffect(m.id) {
+                    val f = withContext(Dispatchers.IO) { CommsMedia.tempCopy(m.id, "mp4") }
+                    if (f == null) missing = true else file = f
+                }
+                DisposableEffect(m.id) { onDispose { CommsMedia.discardTemp(file) } }
+                val f = file
+                if (f != null) {
+                    AndroidView(
+                        factory = { ctx ->
+                            VideoView(ctx).apply {
+                                setMediaController(MediaController(ctx).also { it.setAnchorView(this) })
+                                setOnPreparedListener { it.isLooping = false; start() }
+                                setOnErrorListener { _, _, _ -> Toast.makeText(ctx, "This video cannot be played", Toast.LENGTH_SHORT).show(); true }
+                                setVideoPath(f.absolutePath)
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize().padding(vertical = 48.dp)
+                    )
+                } else if (missing) {
+                    Text("The video is no longer on this phone", color = CCritical, modifier = Modifier.align(Alignment.Center))
+                } else {
+                    CircularProgressIndicator(color = CAccent, modifier = Modifier.align(Alignment.Center))
+                }
+            } else {
+                val image by produceState<ImageBitmap?>(initialValue = null, m.id) {
+                    value = withContext(Dispatchers.IO) {
+                        (CommsRepository.mediaBytes(m.id)?.let { CommsMedia.decode(it, 2048) } ?: CommsMedia.decodeB64(media.thumbB64, 480))?.asImageBitmap()
+                    }
+                }
+                val bitmap = image
+                if (bitmap != null) {
+                    Image(bitmap, contentDescription = media.label(), modifier = Modifier.fillMaxSize().clickable(onClick = onDismiss), contentScale = ContentScale.Fit)
+                } else {
+                    CircularProgressIndicator(color = CAccent, modifier = Modifier.align(Alignment.Center))
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth().align(Alignment.TopCenter).statusBarsPadding().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    media?.let { (if (it.isVideo) "Video · ${durationLabel(it.durationMs)}" else "Photo · ${it.width}×${it.height}") + " · ${sizeLabel(it.size)}" } ?: "",
+                    color = CInkDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f)
+                )
+                SmallButton("CLOSE", CAccent, onClick = onDismiss)
+            }
+            if (media != null && media.caption.isNotBlank()) {
+                Text(
+                    media.caption, color = CInk, fontSize = 14.sp, lineHeight = 19.sp,
+                    modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().fillMaxWidth().background(Color(0xB00E1116)).padding(16.dp)
+                )
+            }
+        }
+    }
+}
+
+/** A picture drawn in place: a framed landscape with a sun, the attach button's icon. */
+@Composable
+private fun PictureGlyph(colour: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val stroke = w * 0.09f
+        drawRoundRect(colour, topLeft = Offset(stroke / 2, stroke / 2), size = Size(w - stroke, h - stroke), cornerRadius = androidx.compose.ui.geometry.CornerRadius(w * 0.12f), style = Stroke(stroke))
+        drawCircle(colour, radius = w * 0.09f, center = Offset(w * 0.34f, h * 0.34f))
+        val hills = Path().apply {
+            moveTo(w * 0.16f, h * 0.78f)
+            lineTo(w * 0.42f, h * 0.5f)
+            lineTo(w * 0.56f, h * 0.64f)
+            lineTo(w * 0.66f, h * 0.55f)
+            lineTo(w * 0.84f, h * 0.78f)
+            close()
+        }
+        drawPath(hills, colour)
     }
 }
 

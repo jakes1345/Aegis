@@ -2147,8 +2147,19 @@ private fun EventLocationSnapshot(lat: Double, lon: Double, status: ScanStatus) 
 // ── Cell / IMSI screen ───────────────────────────────────────────────────
 
 @Composable
-private fun CellScreen(onShowExplainer: ((CatcherFinding) -> Unit)? = null) {
+private fun CellScreen(onShowExplainer: ((CatcherFinding) -> Unit)? = null, onShown: () -> Unit = {}) {
     val cell by Registry.cell.collectAsStateWithLifecycle()
+    val status by Registry.status.collectAsStateWithLifecycle()
+    val now = rememberNow(5_000L)
+
+    // With the scanner off, the tab takes its own reading every 15 s while it is on
+    // screen; with it on, the service's judged readings arrive on the same cadence.
+    LaunchedEffect(status.scanning) {
+        while (true) {
+            onShown()
+            delay(15_000L)
+        }
+    }
 
     LazyColumn(
         Modifier.fillMaxSize().padding(horizontal = 16.dp),
@@ -2157,38 +2168,174 @@ private fun CellScreen(onShowExplainer: ((CatcherFinding) -> Unit)? = null) {
         item(key = "§header") {
             Column(Modifier.padding(top = 20.dp)) {
                 Text("CELLULAR", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-                Text("Baseline-based IMSI catcher detection · no account required", color = Muted, fontSize = 12.sp)
+                Text("Serving tower, radio and baseline-based IMSI catcher detection", color = Muted, fontSize = 12.sp)
+            }
+        }
+
+        val radio = cell.radio
+        val c = cell.cell
+
+        // ── The verdict first, because it is what the tab is for ──────────────
+        if (cell.available && cell.analysing) {
+            item(key = "§risk") { CatcherRiskBadge(cell) }
+            if (cell.level.ordinal >= Threat.MEDIUM.ordinal && cell.findings.isNotEmpty()) {
+                item(key = "§alarm") { CatcherAlarm(cell) }
+            }
+        } else if (cell.available) {
+            item(key = "§not-analysing") {
+                NoticeBanner(
+                    Caution, "NOT ANALYSED",
+                    "Live tower data below, but IMSI-catcher detection only runs while scanning is on. Start scanning from the SCAN tab."
+                )
             }
         }
 
         if (!cell.available) {
             item(key = "§unavailable") {
-                Box(
+                Column(
                     Modifier.fillMaxWidth().background(Panel, CardShape).padding(16.dp),
-                    contentAlignment = Alignment.Center
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Text(cell.reason ?: "Cell data unavailable", color = Muted, fontSize = 13.sp, textAlign = TextAlign.Center)
+                    Text(cell.reason ?: "Reading the modem…", color = InkDim, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    if (radio != null && (radio.operatorName != null || radio.simOperatorName != null)) {
+                        Text(
+                            "Registered on ${radio.operatorName ?: "—"} · SIM ${radio.simOperatorName ?: "—"} · ${radio.simState ?: ""}",
+                            color = Muted, fontSize = 12.sp
+                        )
+                    }
                 }
             }
-        } else {
-            item(key = "§risk") { CatcherRiskBadge(cell) }
+        }
 
-            val c = cell.cell
-            if (c != null) {
-                item(key = "§serving") {
-                    PanelBox {
-                        SectionLabel("SERVING CELL")
-                        CellInfoRow("Technology", c.rat.label)
-                        CellInfoRow("Cell ID", c.cellId)
-                        CellInfoRow("MCC / MNC", "${c.mcc ?: "?"} / ${c.mnc ?: "?"}")
-                        CellInfoRow("Tracking Area", c.tac ?: "Unknown")
-                        CellInfoRow("Signal", c.signalDbm?.let { fmtDbm(it) } ?: "?? dBm")
-                        CellInfoRow("Neighbours", "${c.neighbors ?: "??"}")
-                        CellInfoRow("Observed", fmtTime(c.ts))
+        if (c != null) {
+            // ── Operator & radio ──────────────────────────────────────────────
+            item(key = "§operator") {
+                PanelBox {
+                    SectionLabel("OPERATOR")
+                    val decoded = Plmn.describe(c.mcc, c.mnc)
+                    val operator = radio?.operatorName ?: c.plmnCarrier ?: "Unknown operator"
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(operator, color = Ink, fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        if (radio?.roaming == true) ThreatBadge("ROAMING", Caution)
+                    }
+                    CellInfoRow("Network type", radio?.dataNetworkType ?: c.rat.label)
+                    CellInfoRow("Radio", c.rat.label)
+                    CellInfoRow("PLMN (MCC-MNC)", "${c.mcc ?: "?"}-${c.mnc ?: "?"}" + (decoded?.let { "  $it" } ?: ""))
+                    if (radio != null && (radio.simOperatorName != null || radio.simPlmn != null)) {
+                        val simLine = listOfNotNull(radio.simOperatorName, radio.simPlmn).joinToString(" · ")
+                        CellInfoRow("SIM carrier", simLine)
+                    }
+                    if (radio != null) {
+                        CellInfoRow("Mobile data", if (radio.dataConnected) "Connected" else "Not connected")
+                        if (radio.simState != null && radio.simState != "Ready") CellInfoRow("SIM state", radio.simState)
+                    }
+                    // Roaming on a network whose PLMN decodes to a different carrier than
+                    // the SIM's is the ordinary case; a home PLMN that the modem names
+                    // differently from the table is worth a glance.
+                    val simName = radio?.simOperatorName
+                    val decodedCarrier = c.plmnCarrier
+                    if (radio?.roaming == false && simName != null && decodedCarrier != null &&
+                        !decodedCarrier.contains(simName, ignoreCase = true) && !simName.contains(decodedCarrier.substringBefore(' '), ignoreCase = true)
+                    ) {
+                        Text(
+                            "Not roaming, but the serving PLMN decodes to $decodedCarrier while the SIM is $simName. " +
+                                "Usually a partner or merged network; a catcher impersonating your carrier can also look like this.",
+                            color = Caution, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.padding(top = 4.dp)
+                        )
                     }
                 }
             }
 
+            // ── Signal ─────────────────────────────────────────────────────────
+            item(key = "§signal") {
+                PanelBox {
+                    SectionLabel("SIGNAL")
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        SignalBars(c.bars ?: barsFromDbm(c.signalDbm, c.rat), color = signalColor(c.bars ?: barsFromDbm(c.signalDbm, c.rat)))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                c.signalDbm?.let { fmtDbm(it) } ?: "— dBm",
+                                color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace
+                            )
+                            Text(signalWord(c.bars ?: barsFromDbm(c.signalDbm, c.rat), c.rat), color = Muted, fontSize = 11.sp)
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            if (c.rsrq != null) Text("RSRQ ${c.rsrq} dB", color = InkDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                            if (c.sinr != null) Text("SINR ${c.sinr} dB", color = InkDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                            c.timingAdvance?.let { ta ->
+                                val metres = if (c.rat == Rat.GSM) ta * 550 else ta * 78
+                                Text(
+                                    "TA $ta ≈ ${if (metres >= 1000) "%.1f km".format(Locale.US, metres / 1000.0) else "$metres m"}",
+                                    color = if (ta == 0 && c.rat == Rat.LTE) Accent else InkDim,
+                                    fontSize = 11.sp, fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Serving cell identity ─────────────────────────────────────────
+            item(key = "§serving") {
+                PanelBox {
+                    SectionLabel("SERVING CELL")
+                    CellInfoRow("Cell ID", c.cellId)
+                    if (c.rat == Rat.LTE) {
+                        c.cellId.toLongOrNull()?.let { ci ->
+                            CellInfoRow("eNodeB / sector", "${ci shr 8} / ${ci and 0xFF}")
+                        }
+                    }
+                    if (c.rat == Rat.NR5G) {
+                        c.cellId.toLongOrNull()?.let { nci ->
+                            // gNB id length varies (22–32 bits); the common 24-bit split is shown.
+                            CellInfoRow("gNodeB / cell (24-bit split)", "${nci shr 12} / ${nci and 0xFFF}")
+                        }
+                    }
+                    CellInfoRow(if (c.rat.rank >= Rat.LTE.rank) "Tracking area (TAC)" else "Location area (LAC)", c.tac ?: "Not reported")
+                    c.pci?.let {
+                        CellInfoRow(
+                            when (c.rat) { Rat.GSM -> "BSIC"; Rat.UMTS -> "Scrambling code"; else -> "Physical cell ID" },
+                            it.toString()
+                        )
+                    }
+                    CellInfoRow("Band", c.band ?: "Not reported")
+                    c.arfcn?.let {
+                        CellInfoRow(
+                            when (c.rat) { Rat.LTE -> "EARFCN"; Rat.NR5G -> "NR-ARFCN"; Rat.UMTS -> "UARFCN"; else -> "ARFCN" },
+                            it.toString()
+                        )
+                    }
+                    c.bandwidthKhz?.let { CellInfoRow("Bandwidth", "${it / 1000} MHz") }
+                    CellInfoRow("Neighbours heard", "${c.neighbors ?: "not reported"}")
+                    CellInfoRow("Read", "${fmtClock(c.ts)} · ${fmtAgo(now, c.ts)}")
+                }
+            }
+
+            // ── Neighbours ────────────────────────────────────────────────────
+            if (cell.neighbors.isNotEmpty()) {
+                item(key = "§neighbours") {
+                    PanelBox {
+                        SectionLabel("NEIGHBOURING CELLS (${cell.neighbors.size})")
+                        Text(
+                            "What else the modem can hear. A real tower always has company; a lone transmitter does not.",
+                            color = Muted, fontSize = 11.sp, lineHeight = 15.sp
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        cell.neighbors.take(12).forEach { n ->
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                SignalBars(n.bars ?: barsFromDbm(n.signalDbm, n.rat), color = Muted, height = 12.dp)
+                                Text(n.rat.label, color = InkDim, fontSize = 11.sp, modifier = Modifier.width(56.dp))
+                                Text(n.id, color = InkDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
+                                Text(n.signalDbm?.let { fmtDbm(it) } ?: "—", color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                        if (cell.neighbors.size > 12) Text("+${cell.neighbors.size - 12} more", color = Muted, fontSize = 11.sp)
+                    }
+                }
+            }
+        }
+
+        if (cell.available && cell.analysing) {
             item(key = "§baseline") {
                 Column(Modifier.fillMaxWidth().background(Panel, CardShape).padding(12.dp)) {
                     Text("Baseline maturity", color = InkDim, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
@@ -2226,7 +2373,14 @@ private fun CellScreen(onShowExplainer: ((CatcherFinding) -> Unit)? = null) {
                 }
             } else {
                 item(key = "§no-indicators") {
-                    Text("No active indicators against the current baseline.", color = Clear, fontSize = 12.sp)
+                    Text(
+                        "No active indicators against the current baseline. " +
+                            "Twelve heuristics are checked every 15 s: forced 2G/3G downgrade, tower in the wrong area, " +
+                            "area change while still, signal above the area's record, unknown cell in a familiar area, " +
+                            "towers that appear and vanish, rapid switching, no neighbours, transmitter within 78 m, " +
+                            "signal spikes and technology oscillation.",
+                        color = Muted, fontSize = 11.sp, lineHeight = 15.sp
+                    )
                 }
             }
 
@@ -2236,6 +2390,97 @@ private fun CellScreen(onShowExplainer: ((CatcherFinding) -> Unit)? = null) {
         }
 
         item(key = "§footer") { Spacer(Modifier.height(24.dp)) }
+    }
+}
+
+/** Bars 0..4 from dBm when the platform gives none — the platform's own LTE/NR thresholds. */
+private fun barsFromDbm(dbm: Int?, rat: Rat): Int {
+    if (dbm == null) return 0
+    return when (rat) {
+        Rat.LTE, Rat.NR5G -> when {
+            dbm >= -95 -> 4; dbm >= -105 -> 3; dbm >= -115 -> 2; dbm >= -125 -> 1; else -> 0
+        }
+        else -> when {
+            dbm >= -75 -> 4; dbm >= -85 -> 3; dbm >= -95 -> 2; dbm >= -105 -> 1; else -> 0
+        }
+    }
+}
+
+private fun signalWord(bars: Int, rat: Rat): String = when (bars) {
+    4 -> "Excellent"
+    3 -> "Good"
+    2 -> "Fair"
+    1 -> "Poor"
+    else -> "No signal"
+} + when (rat) {
+    Rat.LTE, Rat.NR5G -> " (RSRP)"
+    else -> " (RSSI)"
+}
+
+private fun signalColor(bars: Int): Color = when (bars) {
+    4, 3 -> Clear
+    2 -> Caution
+    1 -> Accent
+    else -> Muted
+}
+
+@Composable
+private fun SignalBars(bars: Int, color: Color, height: androidx.compose.ui.unit.Dp = 22.dp) {
+    Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        for (i in 1..4) {
+            Box(
+                Modifier.width(height / 4).height(height * i / 4)
+                    .background(if (i <= bars) color else Rule, RoundedCornerShape(1.dp))
+            )
+        }
+    }
+}
+
+/**
+ * The prominent card that says "this looks like an IMSI catcher" and lists exactly
+ * what set it off, so the reader knows what was seen rather than a bare "suspicious".
+ */
+@Composable
+private fun CatcherAlarm(cell: CellStatus) {
+    val col = threatColor(cell.level)
+    val headline = when (cell.level) {
+        Threat.CRITICAL -> "POSSIBLE IMSI CATCHER — STRONG EVIDENCE"
+        Threat.HIGH -> "POSSIBLE IMSI CATCHER"
+        else -> "CELL ANOMALIES PRESENT"
+    }
+    Column(
+        Modifier.fillMaxWidth()
+            .background(col.copy(alpha = 0.15f), CardShape)
+            .border(1.dp, col.copy(alpha = 0.7f), CardShape)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(headline, color = col, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+        Text(
+            "Triggered by ${plural(cell.findings.size, "indicator")}, score ${cell.score}/100:",
+            color = Ink, fontSize = 12.sp
+        )
+        cell.findings.sortedByDescending { it.severity.ordinal }.forEach { f ->
+            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("•", color = severityColor(f.severity), fontSize = 12.sp)
+                Text(f.title, color = severityColor(f.severity), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                ThreatBadge(f.severity.name, severityColor(f.severity))
+            }
+        }
+        cell.cell?.let { c ->
+            Text(
+                "On ${c.rat.label} cell ${c.cellId}" + (c.band?.let { " · $it" } ?: "") +
+                    (c.signalDbm?.let { " · ${fmtDbm(it)}" } ?: ""),
+                color = InkDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
+        }
+        Text(
+            when (cell.level) {
+                Threat.CRITICAL, Threat.HIGH -> "Avoid calls and SMS here. Use end-to-end encrypted messaging over Wi-Fi with a VPN, or airplane mode. Tap an indicator below for details."
+                else -> "Not conclusive on its own. Watch whether more indicators appear; tap one below for what it means."
+            },
+            color = InkDim, fontSize = 12.sp, lineHeight = 17.sp
+        )
     }
 }
 
@@ -2264,7 +2509,10 @@ private fun CatcherRiskBadge(cell: CellStatus) {
         )
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(desc, color = col, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-            Text("Score ${cell.score}/100", color = col.copy(alpha = 0.8f), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            Text(
+                "Score ${cell.score}/100 · analysing live" + (if (cell.mature) "" else " · baseline still learning"),
+                color = col.copy(alpha = 0.8f), fontSize = 11.sp, fontFamily = FontFamily.Monospace
+            )
         }
     }
 }
@@ -2291,10 +2539,13 @@ private fun WhatThisMeans(score: Int) {
 }
 
 @Composable
-private fun CellInfoRow(label: String, value: String) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(label, color = Muted, fontSize = 12.sp)
-        Text(value, color = InkDim, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+private fun CellInfoRow(label: String, value: String, valueColor: Color = InkDim) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+        Text(label, color = Muted, fontSize = 12.sp, modifier = Modifier.padding(end = 12.dp))
+        Text(
+            value, color = valueColor, fontSize = 12.sp, fontFamily = FontFamily.Monospace,
+            textAlign = TextAlign.End, modifier = Modifier.weight(1f)
+        )
     }
 }
 
@@ -2766,9 +3017,17 @@ private fun DeviceScreen(onShown: () -> Unit) {
     val health by Registry.phoneHealth.collectAsStateWithLifecycle()
     val status by Registry.status.collectAsStateWithLifecycle()
     // Live microphone and camera monitoring only runs inside the scanner service;
-    // the static findings are re-checked by the Activity whenever this tab appears.
+    // the static findings are re-checked by the Activity whenever this tab appears,
+    // and every 30 s while it stays up so battery, USB and VPN rows stay current.
     val liveMonitoring = status.scanning
-    LaunchedEffect(Unit) { onShown() }
+    LaunchedEffect(Unit) {
+        while (true) {
+            onShown()
+            delay(30_000L)
+        }
+    }
+    val problems = health.problems
+    val checked = health.facts.size
 
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Spacer(Modifier.height(20.dp))
@@ -2779,7 +3038,7 @@ private fun DeviceScreen(onShown: () -> Unit) {
         ) {
             Column(Modifier.weight(1f)) {
                 Text("DEVICE HEALTH", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-                Text("Mic, camera, spyware access — what can see and hear you right now",
+                Text("Security check of the phone itself — integrity, access, sensors, spyware",
                     color = Muted, fontSize = 12.sp)
             }
             val levelColor = when (health.level) {
@@ -2858,7 +3117,7 @@ private fun DeviceScreen(onShown: () -> Unit) {
             // ── Divider ────────────────────────────────────────────────────────
             item(key = "div") { Spacer(Modifier.height(4.dp)) }
 
-            // ── Static findings ────────────────────────────────────────────────
+            // ── Verdict ────────────────────────────────────────────────────────
             if (health.findingsScannedTs == 0L) {
                 item(key = "checking") {
                     Column(
@@ -2867,12 +3126,13 @@ private fun DeviceScreen(onShown: () -> Unit) {
                     ) {
                         Text("Checking…", color = InkDim, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         Text(
-                            "Looking for accessibility services, device admin apps and debug interfaces.",
+                            "Root, bootloader, verified boot, SELinux, encryption, debug interfaces, accessibility " +
+                                "services, device admins and known spyware packages.",
                             color = Muted, fontSize = 12.sp
                         )
                     }
                 }
-            } else if (health.findings.isEmpty()) {
+            } else if (health.findings.isEmpty() && problems.isEmpty()) {
                 item(key = "all_clear") {
                     Column(
                         Modifier.fillMaxWidth().clip(CardShape).background(Panel).padding(14.dp),
@@ -2880,15 +3140,70 @@ private fun DeviceScreen(onShown: () -> Unit) {
                     ) {
                         Text("No issues found", color = Clear, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         Text(
-                            "No accessibility services, device admin apps, or debug interfaces that could be used " +
-                                "for surveillance. Checked ${fmtClock(health.findingsScannedTs)}.",
-                            color = Muted, fontSize = 12.sp
+                            "$checked checks passed: no root, locked bootloader, verified boot, debug interfaces off, " +
+                                "no accessibility services, device admins or known spyware. Checked ${fmtClock(health.findingsScannedTs)}.",
+                            color = Muted, fontSize = 12.sp, lineHeight = 16.sp
                         )
                     }
                 }
             } else {
-                items(health.findings, key = { it.id }) { f ->
-                    HealthFindingRow(f)
+                item(key = "summary") {
+                    val worst = health.level
+                    val col = threatColor(worst)
+                    Column(
+                        Modifier.fillMaxWidth().clip(CardShape).background(col.copy(alpha = 0.12f))
+                            .border(1.dp, col.copy(alpha = 0.5f), CardShape).padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            "${plural(health.findings.size + problems.size, "issue")} on $checked checks",
+                            color = col, fontSize = 13.sp, fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            (health.findings.map { it.title } + problems.map { "${it.label}: ${it.value}" })
+                                .take(4).joinToString(" · ") + if (health.findings.size + problems.size > 4) " · …" else "",
+                            color = InkDim, fontSize = 12.sp, lineHeight = 16.sp
+                        )
+                        Text("Checked ${fmtClock(health.findingsScannedTs)}", color = Muted, fontSize = 11.sp)
+                    }
+                }
+            }
+
+            // ── Findings: things installed or granted that need acting on ────────
+            if (health.findings.isNotEmpty()) {
+                item(key = "findings_head") {
+                    Text(
+                        "APPS WITH SURVEILLANCE-GRADE ACCESS (${health.findings.size})", color = Critical,
+                        fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                }
+                items(health.findings, key = { it.id }) { f -> HealthFindingRow(f) }
+            }
+
+            // ── Checklist ───────────────────────────────────────────────────────
+            if (health.facts.isNotEmpty()) {
+                val groups = health.facts.groupBy { it.category }
+                val order = listOf("Integrity", "Access", "Software", "Network", "Hardware")
+                for (cat in order + (groups.keys - order.toSet())) {
+                    val rows = groups[cat] ?: continue
+                    item(key = "cat_$cat") {
+                        Text(
+                            cat.uppercase(Locale.US), color = Muted, fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+                    }
+                    item(key = "facts_$cat") {
+                        Column(
+                            Modifier.fillMaxWidth().clip(CardShape).background(Panel).padding(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            rows.forEachIndexed { i, f ->
+                                if (i > 0) Hairline()
+                                HealthFactRow(f)
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2896,6 +3211,42 @@ private fun DeviceScreen(onShown: () -> Unit) {
         }
     }
 }
+
+@Composable
+private fun HealthFactRow(f: HealthFact) {
+    val col = when (f.severity) {
+        null -> Clear
+        Severity.LOW -> Muted
+        Severity.MEDIUM -> Caution
+        Severity.HIGH -> Accent
+        Severity.CRITICAL -> Critical
+    }
+    // Purely informational rows (a version number, a battery level) get a neutral dot;
+    // a check that passed gets green; a problem gets its severity's colour.
+    val informational = f.severity == null && INFORMATIONAL_FACTS.contains(f.id)
+    val dot = if (informational) Rule else col
+    Column(Modifier.fillMaxWidth().padding(vertical = 7.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Canvas(Modifier.size(7.dp)) { drawCircle(dot) }
+            Text(f.label, color = InkDim, fontSize = 12.sp, modifier = Modifier.weight(1f))
+            Text(
+                f.value, color = if (f.severity == null) (if (informational) InkDim else Ink) else col,
+                fontSize = 12.sp, fontFamily = FontFamily.Monospace,
+                fontWeight = if (f.severity != null && f.severity.ordinal >= Severity.MEDIUM.ordinal) FontWeight.Bold else FontWeight.Normal,
+                textAlign = TextAlign.End, modifier = Modifier.weight(1.4f)
+            )
+        }
+        if (f.detail != null) {
+            Text(f.detail, color = if (f.severity == null) Muted else col.copy(alpha = 0.9f), fontSize = 11.sp, lineHeight = 15.sp,
+                modifier = Modifier.padding(start = 15.dp))
+        }
+    }
+}
+
+/** Checklist rows that describe rather than judge, so a green dot would overclaim. */
+private val INFORMATIONAL_FACTS = setOf(
+    "integrity_api", "android", "model", "build", "kernel", "cpu", "battery", "vpn", "pdns", "vpn_always"
+)
 
 @Composable
 private fun ActiveSensorBanner(label: String, color: Color, detail: String, lines: List<String>) {
@@ -2955,36 +3306,188 @@ private fun wifiReason(reason: String): String = when (reason) {
 }
 
 @Composable
-private fun WifiScreen() {
+private fun WifiScreen(onShown: () -> Unit = {}) {
     val anomalies by Registry.wifi.collectAsStateWithLifecycle()
+    val wifi by Registry.wifiStatus.collectAsStateWithLifecycle()
+    val now = rememberNow(5_000L)
     val sorted = remember(anomalies) {
         anomalies.sortedWith(compareByDescending<WifiAnomaly> { it.threat.ordinal }.thenByDescending { it.ts })
     }
 
-    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        Spacer(Modifier.height(20.dp))
-        Text("WiFi Anomaly Scanner", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-        Text("Detects IMSI catcher bait networks and suspicious access points", color = Muted, fontSize = 12.sp)
-        Spacer(Modifier.height(12.dp))
-        if (sorted.isEmpty()) {
-            Box(Modifier.fillMaxWidth().background(Panel, CardShape).padding(16.dp)) {
+    // Android allows four scan requests per two minutes in the foreground; every
+    // 30 s uses that budget exactly while the tab is open.
+    LaunchedEffect(Unit) {
+        while (true) {
+            onShown()
+            delay(30_000L)
+        }
+    }
+
+    val conn = wifi.connection
+    val flagged = wifi.nearby.count { it.flags.isNotEmpty() }
+    val open = wifi.nearby.count { !it.security.secure }
+
+    LazyColumn(
+        Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        item(key = "§header") {
+            Column(Modifier.padding(top = 20.dp)) {
+                Text("WI-FI", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                Text("Your connection, everything in range, and the networks that are bait", color = Muted, fontSize = 12.sp)
+            }
+        }
+
+        // ── Anomalies first: they are the reason to look ───────────────────────
+        if (sorted.isNotEmpty()) {
+            item(key = "§anomaly-head") {
+                val high = sorted.count { it.threat.ordinal >= Threat.HIGH.ordinal }
                 Text(
-                    "No WiFi anomalies detected. Scan is passive — results update automatically.",
-                    color = InkDim, fontSize = 13.sp, lineHeight = 18.sp
+                    "SUSPICIOUS NETWORKS (${sorted.size})" + if (high > 0) " · $high high" else "",
+                    color = if (high > 0) Critical else Accent, fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold, letterSpacing = 1.sp
                 )
             }
+            itemsIndexed(sorted, key = { i, a -> "anomaly|${a.bssid}|${a.reason}|$i" }) { _, a -> WifiRow(a) }
+        }
+
+        // ── Connected network ─────────────────────────────────────────────────
+        if (!wifi.available) {
+            item(key = "§unavailable") {
+                Column(Modifier.fillMaxWidth().background(Panel, CardShape).padding(16.dp)) {
+                    Text(wifi.reason ?: "Reading the Wi-Fi radio…", color = InkDim, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        } else if (conn == null) {
+            item(key = "§disconnected") {
+                Column(Modifier.fillMaxWidth().background(Panel, CardShape).padding(14.dp)) {
+                    Text("Not connected to Wi-Fi", color = InkDim, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Wi-Fi is on; the phone is not joined to a network.", color = Muted, fontSize = 12.sp)
+                }
+            }
         } else {
-            val critical = sorted.count { it.threat == Threat.CRITICAL }
-            val high = sorted.count { it.threat == Threat.HIGH }
-            Text(
-                "${plural(sorted.size, "anomaly").replace("anomalys", "anomalies")} · $critical critical · $high high",
-                color = if (critical > 0) Critical else if (high > 0) Accent else Muted,
-                fontSize = 11.sp, fontFamily = FontFamily.Monospace
-            )
-            Spacer(Modifier.height(8.dp))
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                itemsIndexed(sorted, key = { i, a -> "${a.bssid}|${a.reason}|${a.ts}|$i" }) { _, a -> WifiRow(a) }
-                item(key = "§footer") { Spacer(Modifier.height(24.dp)) }
+            item(key = "§connected") {
+                val secCol = if (conn.security.secure) Clear else Critical
+                PanelBox {
+                    SectionLabel("CONNECTED")
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SignalBars(conn.level, color = signalColor(conn.level))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                conn.ssid ?: "<name withheld — location off?>", color = Ink, fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
+                            Text(conn.bssid ?: "BSSID unavailable", color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                        }
+                        ThreatBadge(conn.security.label.uppercase(Locale.US), secCol)
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    CellInfoRow("Signal", "${fmtDbm(conn.rssi)} · ${signalWord(conn.level, Rat.UNKNOWN).substringBefore(" (")}")
+                    CellInfoRow("Frequency", buildString {
+                        append(conn.band)
+                        if (conn.frequencyMhz > 0) append(" · ${conn.frequencyMhz} MHz")
+                        conn.channel?.let { append(" · ch $it") }
+                    })
+                    conn.standard?.let { CellInfoRow("Standard", it) }
+                    CellInfoRow("Security", conn.security.label, if (conn.security.secure) InkDim else Critical)
+                    val speed = listOfNotNull(
+                        conn.txMbps?.let { "↑$it" }, conn.rxMbps?.let { "↓$it" }
+                    ).joinToString(" ").ifBlank { conn.linkSpeedMbps?.toString() ?: "" }
+                    if (speed.isNotBlank()) CellInfoRow("Link speed", "$speed Mbps")
+                    Hairline()
+                    CellInfoRow("IPv4", conn.ipv4 ?: "none")
+                    conn.ipv6?.let { CellInfoRow("IPv6", it) }
+                    CellInfoRow("Gateway", conn.gateway ?: "unknown")
+                    CellInfoRow(
+                        "DNS",
+                        if (conn.dnsServers.isEmpty()) "none" else conn.dnsServers.joinToString("\n")
+                    )
+                    CellInfoRow(
+                        "Private DNS", conn.privateDns ?: "Off",
+                        if (conn.privateDns != null) Clear else InkDim
+                    )
+                    CellInfoRow("VPN", if (conn.vpnActive) "Active" else "None", if (conn.vpnActive) Clear else InkDim)
+                    if (conn.metered) CellInfoRow("Metered", "Yes")
+                    conn.flags.forEach { flag ->
+                        Text("⚠ $flag", color = if (conn.security.secure) Caution else Critical, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.padding(top = 2.dp))
+                    }
+                }
+            }
+        }
+
+        // ── Nearby ────────────────────────────────────────────────────────────
+        if (wifi.available) {
+            item(key = "§nearby-head") {
+                Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "IN RANGE (${wifi.nearby.size})", color = InkDim, fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold, letterSpacing = 1.sp, modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        buildString {
+                            if (open > 0) append("$open open · ")
+                            if (flagged > 0) append("$flagged flagged · ")
+                            append(if (wifi.scannedTs > 0) fmtAgo(now, wifi.scannedTs) else "—")
+                        },
+                        color = if (flagged > 0) Caution else Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+            if (wifi.nearby.isEmpty()) {
+                item(key = "§none-nearby") {
+                    Text(
+                        "No scan results yet. Android hands out cached results; a fresh scan has been requested and the list fills in within a few seconds.",
+                        color = Muted, fontSize = 12.sp, lineHeight = 16.sp
+                    )
+                }
+            }
+            items(wifi.nearby, key = { "ap|${it.bssid}" }) { n -> NearbyWifiRow(n) }
+        }
+
+        item(key = "§footer") { Spacer(Modifier.height(24.dp)) }
+    }
+}
+
+@Composable
+private fun NearbyWifiRow(n: WifiNetwork) {
+    val stripe = when {
+        n.flags.any { it.contains("evil twin") || it.contains("interception") || it.contains("bait") } -> Critical
+        !n.security.secure -> Accent
+        n.flags.isNotEmpty() -> Caution
+        n.connected -> Clear
+        else -> Rule
+    }
+    Row(Modifier.fillMaxWidth().clip(CardShape).background(Panel).height(IntrinsicSize.Min)) {
+        Box(Modifier.width(3.dp).fillMaxHeight().background(stripe))
+        Row(
+            Modifier.weight(1f).padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            SignalBars(n.level, color = signalColor(n.level), height = 16.dp)
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        if (n.hidden) "<hidden>" else n.ssid, color = if (n.hidden) Muted else Ink, fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (n.connected) ThreatBadge("CONNECTED", Clear)
+                }
+                Text(
+                    "${n.bssid} · ${n.band}" + (n.channel?.let { " ch $it" } ?: "") + (n.standard?.let { " · ${it.substringBefore(" (")}" } ?: ""),
+                    color = Muted, fontSize = 10.sp, fontFamily = FontFamily.Monospace
+                )
+                n.flags.forEach { flag ->
+                    Text("⚠ $flag", color = stripe.takeIf { it != Rule } ?: Caution, fontSize = 11.sp, lineHeight = 14.sp)
+                }
+            }
+            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(fmtDbm(n.rssi), color = InkDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                Text(
+                    n.security.label, color = if (n.security.secure) Muted else Critical, fontSize = 10.sp,
+                    fontWeight = if (n.security.secure) FontWeight.Normal else FontWeight.Bold
+                )
             }
         }
     }

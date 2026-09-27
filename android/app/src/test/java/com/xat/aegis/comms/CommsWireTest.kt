@@ -122,12 +122,47 @@ class CommsWireTest {
     }
 
     @Test
+    fun mediaHeaderAndChunkRoundTrip() {
+        val thumb = java.util.Base64.getEncoder().encodeToString(ByteArray(900) { it.toByte() })
+        val header = roundTrip(CommsWire.mediaHeader("p-1", 77L, "image/jpeg", 1920, 1080, 0L, 61_440L, 2, "the view", thumb))
+        assertEquals(CommsWire.T_MEDIA, CommsWire.type(header))
+        assertEquals("p-1", header.getString(CommsWire.F_ID))
+        assertEquals(77L, header.getLong(CommsWire.F_TS))
+        assertEquals("image/jpeg", header.getString(CommsWire.F_MIME))
+        assertEquals(1920, header.getInt(CommsWire.F_WIDTH))
+        assertEquals(1080, header.getInt(CommsWire.F_HEIGHT))
+        assertEquals(0L, header.getLong(CommsWire.F_DURATION))
+        assertEquals(61_440L, header.getLong(CommsWire.F_SIZE))
+        assertEquals(2, header.getInt(CommsWire.F_CHUNKS))
+        assertEquals("the view", header.getString(CommsWire.F_CAPTION))
+        assertEquals(thumb, header.getString(CommsWire.F_THUMB))
+        assertEquals(sender, CommsWire.senderOf(header))
+        // No caption or thumbnail: the fields are left out rather than sent empty.
+        val bare = roundTrip(CommsWire.mediaHeader("p-2", 1L, "video/mp4", 0, 0, 12_000L, 10L, 1, "  ", null))
+        assertTrue(!bare.has(CommsWire.F_CAPTION))
+        assertTrue(!bare.has(CommsWire.F_THUMB))
+
+        val data = java.util.Base64.getEncoder().encodeToString(ByteArray(CommsWire.MEDIA_CHUNK_BYTES) { (it % 253).toByte() })
+        val chunk = roundTrip(CommsWire.mediaChunk("p-1", 1, data))
+        assertEquals(CommsWire.T_MEDIA_CHUNK, CommsWire.type(chunk))
+        assertEquals("p-1", chunk.getString(CommsWire.F_ID))
+        assertEquals(1, chunk.getInt(CommsWire.F_INDEX))
+        assertEquals(data, chunk.getString(CommsWire.F_DATA))
+        // A full chunk with the sender's identity must leave room inside the relay's
+        // 64 KB envelope once Olm's base64 and the sealed envelope's base64 are added.
+        val payloadBytes = chunk.toString().toByteArray(Charsets.UTF_8).size
+        val relayBase64 = ((payloadBytes + 120) * 4 / 3 + 60) * 4 / 3
+        assertTrue("a chunk envelope would be $relayBase64 base64 chars", relayBase64 < 64 * 1024 * 4 / 3)
+    }
+
+    @Test
     fun noBuilderUsesAReservedField() {
         val all = listOf(
             CommsWire.message("i", 1, "b"), CommsWire.receipt(listOf("i"), "read"), CommsWire.resync(),
             CommsWire.callOffer("c", 1, "s"), CommsWire.callRinging("c"), CommsWire.callAnswer("c", "s"), CommsWire.callReoffer("c", "s"),
             CommsWire.callIce("c", listOf(CommsWire.Candidate("0", 0, "x"))), CommsWire.callEnd("c", "r"),
             CommsWire.payment("i", "t", 1, 1, "n"), CommsWire.voicemail("i", 1, "QQ==", 1),
+            CommsWire.mediaHeader("i", 1, "image/jpeg", 1, 1, 0, 1, 1, "c", "QQ=="), CommsWire.mediaChunk("i", 0, "QQ=="),
         )
         for (p in all) for (f in CommsWire.SENDER_FIELDS) assertTrue("${CommsWire.type(p)} uses $f", !p.has(f))
     }
