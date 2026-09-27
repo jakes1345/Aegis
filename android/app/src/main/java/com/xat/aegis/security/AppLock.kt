@@ -141,6 +141,14 @@ object AppLock {
             _enabled.value = on
             _locked.value = on
             _biometricEnabled.value = on && isBiometricEnabled(context)
+            if (Wiper.isPending(context)) {
+                // A wipe was started and the process died before it finished: the
+                // passcode may already be gone while data is still on disk. Finish
+                // it now, and stay locked for the moment until the process dies.
+                _locked.value = true
+                Wiper.start(context)
+                return
+            }
             initialised = true
         }
     }

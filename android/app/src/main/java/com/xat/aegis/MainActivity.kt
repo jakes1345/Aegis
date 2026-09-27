@@ -14,6 +14,9 @@ import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -46,6 +49,8 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -247,52 +252,85 @@ class MainActivity : AppCompatActivity() {
             MaterialTheme(colorScheme = darkColorScheme(background = Ground, surface = Panel)) {
                 Surface(color = Ground, modifier = Modifier.fillMaxSize()) {
                     val locked by AppLock.locked.collectAsStateWithLifecycle()
-                    if (locked) {
-                        LockScreen()
-                        return@Surface
-                    }
 
-                    // Read the preference here, not once in onCreate: this branch leaves
-                    // composition while locked and re-enters on unlock, and a value
-                    // captured before onboarding finished would show onboarding again.
-                    var onboardingDone by remember { mutableStateOf(isOnboardingDone(this@MainActivity)) }
+                    // The lock screen is drawn OVER the app, not INSTEAD of it. Taking
+                    // MainApp out of composition while locked unregistered every
+                    // rememberLauncherForActivityResult inside it (camera, gallery,
+                    // video, QR scanner, background-location flow) mid-flight: the
+                    // camera pauses Aegis, the relock fires, and the result came back
+                    // to a launcher that no longer existed, so the capture was lost.
+                    // Kept composed, the launchers stay registered and the result is
+                    // delivered once the user unlocks. LockScreen fills the window with
+                    // an opaque background, and FLAG_SECURE (set whenever a passcode is
+                    // on) keeps what is underneath out of screenshots and Recents.
+                    Box(Modifier.fillMaxSize()) {
+                        Box(
+                            Modifier
+                                .fillMaxSize()
+                                // Nothing underneath the lock may be tapped through it:
+                                // every pointer event is consumed at the Initial pass,
+                                // before any child sees it, for as long as locked is true.
+                                .pointerInput(locked) {
+                                    if (locked) awaitPointerEventScope {
+                                        while (true) {
+                                            awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() }
+                                        }
+                                    }
+                                }
+                        ) {
+                            // Read the preference on first composition rather than once in
+                            // onCreate, so a value captured before onboarding finished can
+                            // never show onboarding again; onComplete flips it in place.
+                            var onboardingDone by remember { mutableStateOf(isOnboardingDone(this@MainActivity)) }
 
-                    val onboardingPermissions = rememberLauncherForActivityResult(
-                        ActivityResultContracts.RequestMultiplePermissions()
-                    ) { grants ->
-                        if (ESSENTIAL.all { grants[it] == true }) startScanning()
-                    }
+                            val onboardingPermissions = rememberLauncherForActivityResult(
+                                ActivityResultContracts.RequestMultiplePermissions()
+                            ) { grants ->
+                                if (ESSENTIAL.all { grants[it] == true }) startScanning()
+                            }
 
-                    if (!onboardingDone) {
-                        OnboardingScreen(
-                            // Onboarding used to start the service straight off the
-                            // last page without ever asking for a permission, so the
-                            // service failed startForeground for want of location
-                            // access and stopped itself. Tapping "Start" appeared to
-                            // do nothing at all on a fresh install.
-                            startScanService = {
-                                val missing = REQUIRED.filterNot { granted(it) }
-                                if (missing.isEmpty()) startScanning()
-                                else onboardingPermissions.launch(missing.toTypedArray())
-                            },
-                            onComplete = { onboardingDone = true }
-                        )
-                    } else {
-                        MainApp(
-                            onStart = { startScanning() },
-                            onStop = { sendToService(ScanService.ACTION_STOP) },
-                            onClearData = { sendToService(ScanService.ACTION_CLEAR) },
-                            hasPermissions = { ESSENTIAL.all { granted(it) } },
-                            onAddToVault = { tag, label, replace -> addToVault(tag, label, replace) },
-                            onRemoveVault = { id -> removeFromVault(id) },
-                            onEmulate = { card -> if (card == null) stopEmulation() else armEmulation(card) },
-                            onUnlockVault = { unlockVault() },
-                            onLockVault = { Registry.lockVault() },
-                            onEraseVault = { eraseVault() },
-                            onRefreshDeviceHealth = { refreshDeviceHealth() },
-                            onRefreshCell = { refreshCell() },
-                            onRefreshWifi = { refreshWifi() }
-                        )
+                            if (!onboardingDone) {
+                                OnboardingScreen(
+                                    // Onboarding used to start the service straight off the
+                                    // last page without ever asking for a permission, so the
+                                    // service failed startForeground for want of location
+                                    // access and stopped itself. Tapping "Start" appeared to
+                                    // do nothing at all on a fresh install.
+                                    startScanService = {
+                                        val missing = REQUIRED.filterNot { granted(it) }
+                                        if (missing.isEmpty()) startScanning()
+                                        else onboardingPermissions.launch(missing.toTypedArray())
+                                    },
+                                    onComplete = { onboardingDone = true }
+                                )
+                            } else {
+                                MainApp(
+                                    onStart = { startScanning() },
+                                    onStop = { sendToService(ScanService.ACTION_STOP) },
+                                    onClearData = { sendToService(ScanService.ACTION_CLEAR) },
+                                    hasPermissions = { ESSENTIAL.all { granted(it) } },
+                                    onAddToVault = { tag, label, replace -> addToVault(tag, label, replace) },
+                                    onRemoveVault = { id -> removeFromVault(id) },
+                                    onEmulate = { card -> if (card == null) stopEmulation() else armEmulation(card) },
+                                    onUnlockVault = { unlockVault() },
+                                    onLockVault = { Registry.lockVault() },
+                                    onEraseVault = { eraseVault() },
+                                    onRefreshDeviceHealth = { refreshDeviceHealth() },
+                                    onRefreshCell = { refreshCell() },
+                                    onRefreshWifi = { refreshWifi() }
+                                )
+                            }
+                        }
+
+                        // Instant on: a fade-in would show the app for a frame. A short
+                        // fade-out on unlock is fine, the user has just proved who they are.
+                        AnimatedVisibility(
+                            visible = locked,
+                            enter = fadeIn(animationSpec = tween(0)),
+                            exit = fadeOut(animationSpec = tween(200))
+                        ) {
+                            LockScreen()
+                        }
                     }
                 }
             }
@@ -1802,6 +1840,17 @@ private fun threatArgb(threat: Threat, following: Boolean): Int = when {
     else -> 0xFF4A8FD4.toInt()
 }
 
+/**
+ * Colour of a device's trail polyline, by threat level alone. LOW is a muted
+ * grey-blue so it reads as background next to the blue GPS track.
+ */
+private fun trailArgb(threat: Threat): Int = when (threat) {
+    Threat.CRITICAL -> 0xFFF2545B.toInt()
+    Threat.HIGH -> 0xFFFF7A3D.toInt()
+    Threat.MEDIUM -> 0xFFE8B33D.toInt()
+    else -> 0xFF6F7A8B.toInt()
+}
+
 /** Keep a downloaded tile this long past whatever the tile server's headers allow. */
 private const val TILE_EXTRA_LIFETIME_MS = 7L * 24 * 60 * 60 * 1000
 
@@ -1860,11 +1909,17 @@ private fun MapScreen() {
     var hasCentered by remember { mutableStateOf(false) }
 
     LaunchedEffect(status.lat, status.lon, mapData) {
-        val lat = status.lat ?: return@LaunchedEffect
-        val lon = status.lon ?: return@LaunchedEffect
-
-        // Rebuild all overlays except the tile layer.
+        // Rebuild all overlays except the tile layer. This runs before the fix check
+        // on purpose: ACTION_CLEAR resets the registry, which drops the fix to null,
+        // and returning first left the cleared devices' markers and trails on screen.
         mapView.overlays.removeAll { it !is org.osmdroid.views.overlay.TilesOverlay }
+
+        val lat = status.lat
+        val lon = status.lon
+        if (lat == null || lon == null) {
+            mapView.invalidate()
+            return@LaunchedEffect
+        }
 
         // GPS track
         if (mapData.track.size > 1) {
@@ -1875,6 +1930,22 @@ private fun MapScreen() {
                 setPoints(mapData.track.map { GeoPoint(it.lat, it.lon) })
             }
             mapView.overlays.add(0, line)
+        }
+
+        // Device trails: the distinct places each tracker was heard, joined in the
+        // order they were first visited, so the path it took alongside the user shows.
+        val trailWidthPx = 4f * Resources.getSystem().displayMetrics.density
+        for (trail in mapData.devices) {
+            if (trail.points.size < 2) continue
+            val line = Polyline(mapView).apply {
+                outlinePaint.color = trailArgb(trail.threat)
+                outlinePaint.strokeWidth = trailWidthPx
+                outlinePaint.alpha = 200
+                setPoints(trail.points.map { GeoPoint(it.lat, it.lon) })
+                title = trail.name
+                snippet = plural(trail.points.size, "place")
+            }
+            mapView.overlays.add(line)
         }
 
         // Device markers

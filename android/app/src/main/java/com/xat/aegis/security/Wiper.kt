@@ -60,6 +60,12 @@ object Wiper {
             isActive = true
         }
         val app = context.applicationContext
+        // A durable "wipe pending" mark, written before anything is erased. If the
+        // process is killed mid-wipe (OOM, force-stop) the next launch finds it
+        // ([AppLock.init]) and finishes the job before the app becomes usable;
+        // otherwise a half-wiped app could come back with no passcode and data
+        // still on disk. Step 5 deletes it along with the rest of filesDir.
+        runCatching { pendingMarker(app).createNewFile() }
         scope.launch {
             try {
                 val remote = launch { runCatching { CommsRepository.unpair() } }
@@ -79,6 +85,14 @@ object Wiper {
             }
         }
     }
+
+    /** The file whose presence means a wipe was started and has not been seen through. */
+    internal fun pendingMarker(context: Context): File = File(context.filesDir, PENDING_MARKER)
+
+    /** Whether a previous wipe was interrupted before it finished. */
+    fun isPending(context: Context): Boolean = runCatching { pendingMarker(context).exists() }.getOrDefault(false)
+
+    private const val PENDING_MARKER = "wipe_pending"
 
     /** Every key in the app's Keystore namespace: the vault's, the lock's, the biometric one, COMMS'. */
     private fun wipeKeystore() {

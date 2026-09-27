@@ -17,6 +17,7 @@ import java.util.Locale
 object Report {
 
     private val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+    private val sdfMinute = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
 
     /** How long an exported report stays in the cache for a share target to read. */
     private const val EXPORT_RETENTION_MS = 24 * 60 * 60_000L
@@ -30,8 +31,9 @@ object Report {
         nfc: List<NfcTag>
     ): Intent {
         val text = buildReport(status, detections, timeline, cell, nfc)
-        // Each report carries the GPS history, so earlier ones are not left lying in
-        // the cache indefinitely. They are kept for a day, not deleted at once: a
+        // Each report carries the GPS locations where devices were observed, if any,
+        // so earlier ones are not left lying in the cache indefinitely. They are kept
+        // for a day, not deleted at once: a
         // mail client reads the attachment when it actually sends, which offline can
         // be well after the share, and deleting the file underneath it lost the report.
         val now = System.currentTimeMillis()
@@ -79,9 +81,16 @@ object Report {
             appendLine("    Signal  : ${d.rssi} dBm")
             appendLine("    Status  : ${if (d.following) "*** CONFIRMED FOLLOWING ***" else if (d.persistent) "Persistent" else "Brief"}")
             appendLine("    Threat  : ${d.threat}  Score: ${d.score}")
+            appendLine("    Confidence: ${d.confidence.name}")
+            appendLine("    First seen: ${sdfMinute.format(Date(d.firstSeen))}  Last seen: ${sdfMinute.format(Date(d.lastSeen))}")
             appendLine("    Sightings: ${d.sightings}  Places: ${d.places}  Displacement: ${d.displacementM.toInt()} m")
             if (d.tracker != null) appendLine("    Type    : ${d.tracker.label} (${d.tracker.brand})")
             if (d.rotations > 0) appendLine("    MAC rotations: ${d.rotations}")
+            appendLine("    ${d.addresses} address rotation${if (d.addresses == 1) "" else "s"}")
+            if (d.points.isNotEmpty()) {
+                appendLine("    LOCATIONS:")
+                for (p in d.points) appendLine("      - %.6f,%.6f".format(p.lat, p.lon))
+            }
         }
         appendLine()
 

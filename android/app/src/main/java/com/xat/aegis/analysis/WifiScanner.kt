@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.NetworkCapabilities
@@ -242,6 +243,14 @@ object WifiScanner {
         if (ContextCompat.checkSelfPermission(app, Manifest.permission.ACCESS_FINE_LOCATION)
             != PackageManager.PERMISSION_GRANTED
         ) return WifiStatus(available = false, reason = "Location permission needed to read network names", wifiEnabled = wifi.isWifiEnabled)
+        // The system location switch gates scan results the same way the permission
+        // does: off, the platform returns an empty list and the tab read "nothing in
+        // range" on a street full of access points.
+        val locationOn = runCatching { app.getSystemService(LocationManager::class.java)?.isLocationEnabled }
+            .getOrNull() ?: false
+        if (!locationOn) {
+            return WifiStatus(available = false, reason = "Location is turned off — enable it in Settings to see nearby networks", wifiEnabled = wifi.isWifiEnabled)
+        }
         if (!wifi.isWifiEnabled) {
             return WifiStatus(available = false, reason = "Wi-Fi is turned off", wifiEnabled = false)
         }
@@ -432,8 +441,10 @@ object WifiScanner {
         ScanResult.WIFI_STANDARD_11N -> "Wi-Fi 4 (802.11n)"
         ScanResult.WIFI_STANDARD_11AC -> "Wi-Fi 5 (802.11ac)"
         ScanResult.WIFI_STANDARD_11AX -> "Wi-Fi 6 (802.11ax)"
+        // 11AD is 7 and 11BE is 8: the old code had a literal `7 -> "Wi-Fi 7"` arm
+        // after the 11AD arm, so it was unreachable and Wi-Fi 7 was never labelled.
+        ScanResult.WIFI_STANDARD_11BE -> "Wi-Fi 7 (802.11be)"
         ScanResult.WIFI_STANDARD_11AD -> "WiGig (802.11ad)"
-        7 -> "Wi-Fi 7 (802.11be)"
         else -> null
     }
 

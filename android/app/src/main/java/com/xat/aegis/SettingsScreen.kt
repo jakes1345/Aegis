@@ -157,6 +157,8 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
     val lockEnabled by AppLock.enabled.collectAsStateWithLifecycle()
     val biometricEnabled by AppLock.biometricEnabled.collectAsStateWithLifecycle()
     var hasDuress by remember { mutableStateOf(AppLock.hasDuress(context)) }
+    var wipeAfter by remember { mutableIntStateOf(AppLock.wipeAfter(context)) }
+    var relockAfterMs by remember { mutableLongStateOf(AppLock.relockAfterMs(context)) }
     var showPasscodeSetup by remember { mutableStateOf(false) }
     var showPasscodeDisable by remember { mutableStateOf(false) }
     var showDuressSetup by remember { mutableStateOf(false) }
@@ -623,7 +625,10 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                         )
                         Text(
                             if (lockEnabled)
-                                "Aegis locks when you leave. Wrong passcode after ${AppLock.wipeAfter(context)} attempts wipes everything."
+                                if (wipeAfter > 0)
+                                    "Aegis locks when you leave. Wrong passcode after $wipeAfter ${if (wipeAfter == 1) "attempt" else "attempts"} wipes everything."
+                                else
+                                    "Aegis locks when you leave. Repeated wrong passcodes lock you out for longer each time."
                             else
                                 "Set a 6–12 digit passcode. All app data is wiped after too many wrong guesses.",
                             color = SMutedClr, fontSize = 12.sp, lineHeight = 16.sp
@@ -678,6 +683,28 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                             )
                         }
                     }
+                    SChoiceRow(
+                        title = "Wrong passcode limit",
+                        subtitle = "How many wrong guesses in a row wipe Aegis",
+                        choices = AppLock.WIPE_AFTER_CHOICES,
+                        selected = wipeAfter,
+                        label = ::wipeAfterLabel,
+                        onSelect = { choice ->
+                            wipeAfter = choice
+                            scope.launch(Dispatchers.IO) { AppLock.setWipeAfter(context, choice) }
+                        }
+                    )
+                    SChoiceRow(
+                        title = "Lock after",
+                        subtitle = "How long Aegis can be in the background before it asks again",
+                        choices = AppLock.RELOCK_CHOICES,
+                        selected = relockAfterMs,
+                        label = ::relockLabel,
+                        onSelect = { choice ->
+                            relockAfterMs = choice
+                            scope.launch(Dispatchers.IO) { AppLock.setRelockAfterMs(context, choice) }
+                        }
+                    )
                     HorizontalDivider(color = SRuleClr, thickness = 0.5.dp)
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(
@@ -890,6 +917,71 @@ private fun SSettingsKv(label: String, value: String) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(label, color = SMutedClr, fontSize = 12.sp)
         Text(value, color = SInkDimClr, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+    }
+}
+
+private fun wipeAfterLabel(attempts: Int): String = when (attempts) {
+    0 -> "Never — lock out instead"
+    1 -> "1 attempt"
+    else -> "$attempts attempts"
+}
+
+private fun relockLabel(ms: Long): String = when (ms) {
+    0L -> "Immediately"
+    30_000L -> "30 seconds"
+    60_000L -> "1 minute"
+    else -> "${ms / 60_000L} minutes"
+}
+
+/**
+ * A titled row with a small inline selector on the right: the current choice as a
+ * text button that opens a [DropdownMenu] of every option.
+ */
+@Composable
+private fun <T> SChoiceRow(
+    title: String,
+    subtitle: String,
+    choices: List<T>,
+    selected: T,
+    label: (T) -> String,
+    onSelect: (T) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = SInkClr, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Text(subtitle, color = SMutedClr, fontSize = 12.sp, lineHeight = 16.sp)
+        }
+        Spacer(Modifier.width(12.dp))
+        Box {
+            TextButton(
+                onClick = { expanded = true },
+                colors = ButtonDefaults.textButtonColors(contentColor = SAccentClr),
+                shape = SCardShape
+            ) {
+                Text(label(selected), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            }
+            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                for (choice in choices) {
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                label(choice),
+                                fontWeight = if (choice == selected) FontWeight.Bold else FontWeight.Normal
+                            )
+                        },
+                        onClick = {
+                            expanded = false
+                            if (choice != selected) onSelect(choice)
+                        }
+                    )
+                }
+            }
+        }
     }
 }
 

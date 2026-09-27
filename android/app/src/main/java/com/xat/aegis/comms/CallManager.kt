@@ -607,12 +607,18 @@ object CallManager {
     }.getOrNull()
 
     private suspend fun createPeerConnection(callId: String): Media {
+        // Only the servers the relay hands out are used. There is no built-in
+        // fallback: a third party's STUN server would learn this phone's address
+        // on every call, which the relay's own TURN never does.
         val servers = withContext(Dispatchers.IO) {
             runCatching { CommsRepository.relayClient().turn() }
-                .onFailure { CommsLog.add("Could not fetch call servers from the relay (${it.message}); using STUN only") }
-                .getOrDefault(listOf(RelayClient.IceServer(listOf("stun:stun.cloudflare.com:3478"), null, null)))
+                .onFailure { CommsLog.add("Could not fetch call servers from the relay (${it.message}); using host candidates only") }
+                .getOrDefault(emptyList())
         }
-        if (servers.none { s -> s.urls.any { it.startsWith("turn") } }) {
+        if (servers.isEmpty()) {
+            Log.w(TAG, "no ICE servers: the call connects only on the same network or over a VPN")
+            CommsLog.add("No call servers available: the call connects only when both phones can reach each other directly")
+        } else if (servers.none { s -> s.urls.any { it.startsWith("turn") } }) {
             CommsLog.add("No TURN relay configured: calls connect only when both networks allow a direct path")
         }
         val ice = servers.map { s ->

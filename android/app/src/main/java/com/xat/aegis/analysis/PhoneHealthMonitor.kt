@@ -2,11 +2,14 @@ package com.xat.aegis.analysis
 
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.KeyguardManager
+import android.app.admin.DeviceAdminInfo
 import android.app.admin.DevicePolicyManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.pm.ResolveInfo
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.media.AudioRecordingConfiguration
@@ -130,6 +133,10 @@ class PhoneHealthMonitor(private val context: Context) {
         val findings = mutableListOf<PhoneHealthFinding>()
         val pm = context.packageManager
 
+        // Package visibility filtering hides most other apps' ApplicationInfo from a
+        // third-party app, so looking a label up by package name throws
+        // NameNotFoundException and the tab showed raw package names. Used only as
+        // the last resort below, after the platform-supplied ResolveInfo.
         fun label(pkg: String) = runCatching {
             pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
         }.getOrDefault(pkg)
@@ -142,6 +149,10 @@ class PhoneHealthMonitor(private val context: Context) {
                     val info = svc.resolveInfo.serviceInfo
                     val pkg = info.packageName
                     if (pkg == context.packageName) return@forEach
+                    // The ResolveInfo the accessibility manager hands over already
+                    // carries the label; no package lookup needed.
+                    val name = runCatching { svc.resolveInfo.loadLabel(pm)?.toString() }
+                        .getOrNull()?.takeIf { it.isNotBlank() } ?: label(pkg)
                     // The id carries the service class: one app can register several
                     // services, and the Device tab keys its list on the id, so two
                     // findings sharing "a11y_<pkg>" crashed it.
@@ -149,7 +160,7 @@ class PhoneHealthMonitor(private val context: Context) {
                         id = "a11y_$pkg/${info.name}",
                         severity = Severity.HIGH,
                         category = "Accessibility",
-                        title = "${label(pkg)} — accessibility service active",
+                        title = "$name — accessibility service active",
                         detail = "Accessibility services can read every word on screen, intercept key presses, " +
                                 "perform taps on your behalf, and run in the background indefinitely. " +
                                 "Stalkerware almost always registers as one. Check Settings → Accessibility → Installed services."
@@ -162,11 +173,12 @@ class PhoneHealthMonitor(private val context: Context) {
             val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
             dpm.activeAdmins?.forEach { admin ->
                 if (admin.packageName == context.packageName) return@forEach
+                val name = adminLabel(admin) ?: label(admin.packageName)
                 findings += PhoneHealthFinding(
                     id = "admin_${admin.packageName}/${admin.className}",
                     severity = Severity.HIGH,
                     category = "Device Admin",
-                    title = "${label(admin.packageName)} — device admin",
+                    title = "$name — device admin",
                     detail = "Device admin apps can lock or wipe the device, enforce password policies, " +
                             "and block uninstallation. MDM agents and stalkerware both use this. " +
                             "Revoke from Settings → Security → Device admin apps."
@@ -350,6 +362,20 @@ class PhoneHealthMonitor(private val context: Context) {
     }
 
     // ── Probes ───────────────────────────────────────────────────────────────
+
+    /**
+     * The label of a device admin through [DeviceAdminInfo], which resolves the
+     * receiver component itself. Admin receivers answer DEVICE_ADMIN_ENABLED, and
+     * that intent is declared in the manifest's <queries>, so the component is
+     * visible even when the package's ApplicationInfo is not. Null when the
+     * platform still refuses, and the caller falls back to the package name.
+     */
+    private fun adminLabel(admin: ComponentName): String? = runCatching {
+        val pm = context.packageManager
+        val receiver = pm.getReceiverInfo(admin, PackageManager.GET_META_DATA)
+        val resolve = ResolveInfo().apply { activityInfo = receiver }
+        DeviceAdminInfo(context, resolve).loadLabel(pm)?.toString()?.takeIf { it.isNotBlank() }
+    }.getOrNull()
 
     private fun settingOn(name: String): Boolean =
         runCatching { Settings.Global.getInt(context.contentResolver, name, 0) != 0 }.getOrDefault(false)

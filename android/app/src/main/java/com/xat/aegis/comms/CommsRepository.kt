@@ -65,6 +65,8 @@ object CommsRepository {
     private const val MAX_CAPTION = 500
     /** Chunks of a file whose rest never came are forgotten after this long. */
     private const val CHUNK_TTL_MS = 7L * 24 * 3600_000L
+    /** An inbound photo or video still incomplete after this long is marked failed rather than left "receiving". */
+    private const val MEDIA_RECEIVE_TIMEOUT_MS = 10L * 60_000L
     private const val HOLD_FOREGROUND = "foreground"
     private const val HOLD_CALL = "call"
 
@@ -529,9 +531,12 @@ object CommsRepository {
         val id = UUID.randomUUID().toString()
         store.insertMessage(ChatMessage(id, peer, Direction.OUT, text, System.currentTimeMillis(), "queued", read = true))
         bump()
-        runCatching { flushOutbox() }.onFailure { CommsLog.add("Sending failed: ${it.message}") }
-        val (status, error) = store.statusOf(id) ?: ("queued" to null)
-        if (status == "failed") Result.failure(RelayException(error ?: "Not sent")) else Result.success(Unit)
+        // On the repository's scope: the caller's scope is the screen's, and leaving
+        // the conversation used to cancel the flush half-way, leaving the message
+        // "queued" with no retry timer. The bubble shows a failure and its RETRY
+        // button through the store, not through this result.
+        scope.launch { runCatching { flushOutbox() }.onFailure { CommsLog.add("Sending failed: ${it.message}") } }
+        Result.success(Unit)
     }
 
     /**
@@ -570,7 +575,8 @@ object CommsRepository {
     suspend fun retry(id: String) = withContext(Dispatchers.IO) {
         store.setStatus(id, "queued")
         bump()
-        runCatching { flushOutbox() }.onFailure { CommsLog.add("Sending failed: ${it.message}") }
+        // On the repository's scope, for the same reason as [send].
+        scope.launch { runCatching { flushOutbox() }.onFailure { CommsLog.add("Sending failed: ${it.message}") } }
     }
 
     /**
@@ -599,6 +605,17 @@ object CommsRepository {
                             synchronized(mediaSent) { mediaSent.remove(m.id) }
                             _mediaProgress.update { it - m.id }
                         }
+                    }
+                    is Deliver.TooLarge -> {
+                        // The relay will never take this envelope, and it must not hold
+                        // up everything queued behind it: this message alone fails.
+                        CommsLog.add("Message to ${formatAegisNumber(contact.number)} failed: ${outcome.reason}")
+                        store.markFailed(contact.number, m.id, outcome.reason)
+                        if (m.isMedia) {
+                            synchronized(mediaSent) { mediaSent.remove(m.id) }
+                            _mediaProgress.update { it - m.id }
+                        }
+                        continue
                     }
                     is Deliver.Offline -> {
                         _state.update { it.copy(error = outcome.reason) }
@@ -658,6 +675,8 @@ object CommsRepository {
         object Sent : Deliver()
         class Failed(val reason: String) : Deliver()
         class Offline(val reason: String) : Deliver()
+        /** The relay refused the envelope as too large (413): final for this message, but the queue behind it goes on. */
+        class TooLarge(val reason: String) : Deliver()
     }
 
     private sealed class Prepared {
@@ -732,6 +751,7 @@ object CommsRepository {
             when (val d = relayOutcome(e)) {
                 is Deliver.Offline -> Prepared.Offline(d.reason)
                 is Deliver.Failed -> Prepared.Failed(d.reason)
+                is Deliver.TooLarge -> Prepared.Failed(d.reason)
                 Deliver.Sent -> Prepared.Failed(e.message ?: "Relay error")
             }
         } catch (e: CryptoException) {
@@ -764,7 +784,8 @@ object CommsRepository {
     private fun relayOutcome(e: RelayException): Deliver = when {
         e.code == 404 -> Deliver.Failed("No such Aegis number on this relay any more")
         e.code == 401 -> Deliver.Failed("The relay does not accept this phone's signature (is its clock right?)")
-        e.code == 0 || e.code == 408 || e.code == 413 || e.code == 429 || e.code >= 500 || e.code == RelayClient.MALFORMED ->
+        e.code == 413 -> Deliver.TooLarge(e.message ?: "The relay refused the message as too large")
+        e.code == 0 || e.code == 408 || e.code == 429 || e.code >= 500 || e.code == RelayClient.MALFORMED ->
             Deliver.Offline(e.message ?: "The relay is not reachable right now")
         else -> Deliver.Failed(e.message ?: "Relay refused the message")
     }
@@ -822,6 +843,7 @@ object CommsRepository {
         when (val r = deliver(contact, payload)) {
             Deliver.Sent -> { if (kind != CommsWire.CALL_ICE) CommsLog.add("Call $kind sent to ${formatAegisNumber(contact.number)}"); null }
             is Deliver.Failed -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} failed: ${r.reason}"); r.reason }
+            is Deliver.TooLarge -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} failed: ${r.reason}"); r.reason }
             is Deliver.Offline -> { CommsLog.add("Call $kind to ${formatAegisNumber(contact.number)} not sent: ${r.reason}"); r.reason }
         }
     }
@@ -852,6 +874,7 @@ object CommsRepository {
             when (val result = deliver(contact, CommsWire.voicemail(id, ts, audioB64, durationMs))) {
                 Deliver.Sent -> Unit
                 is Deliver.Failed -> throw RelayException(result.reason)
+                is Deliver.TooLarge -> throw RelayException(result.reason)
                 is Deliver.Offline -> throw RelayException(result.reason)
             }
             val body = VoicemailBody(audioB64, durationMs).encode()
@@ -906,6 +929,7 @@ object CommsRepository {
             when (val d = deliver(contact, CommsWire.payment(id, result.txid, ts, amount, text))) {
                 Deliver.Sent -> Unit
                 is Deliver.Failed -> CommsLog.add("Payment notice to ${formatAegisNumber(contact.number)} failed: ${d.reason}; the coins have been transferred")
+                is Deliver.TooLarge -> CommsLog.add("Payment notice to ${formatAegisNumber(contact.number)} failed: ${d.reason}; the coins have been transferred")
                 is Deliver.Offline -> CommsLog.add("Payment notice to ${formatAegisNumber(contact.number)} not sent: ${d.reason}; the coins have been transferred")
             }
             result.balance
@@ -938,6 +962,7 @@ object CommsRepository {
                 when (val d = transmit(contact, p.envelope)) {
                     Deliver.Sent -> Unit
                     is Deliver.Failed -> CommsLog.add("$type to ${formatAegisNumber(contact.number)} failed: ${d.reason}")
+                    is Deliver.TooLarge -> CommsLog.add("$type to ${formatAegisNumber(contact.number)} failed: ${d.reason}")
                     is Deliver.Offline -> CommsLog.add("$type to ${formatAegisNumber(contact.number)} not sent: ${d.reason}")
                 }
             }
@@ -962,6 +987,11 @@ object CommsRepository {
                         Deliver.Sent -> store.clearReceipts(peer, chunk, status)
                         is Deliver.Failed -> {
                             // Will never go (their keys changed, the number is gone): drop it.
+                            CommsLog.add("Receipt to ${formatAegisNumber(peer)} dropped: ${d.reason}")
+                            store.clearReceipts(peer, chunk, status)
+                        }
+                        is Deliver.TooLarge -> {
+                            // A receipt batch the relay will not take is split no further; drop it like any final failure.
                             CommsLog.add("Receipt to ${formatAegisNumber(peer)} dropped: ${d.reason}")
                             store.clearReceipts(peer, chunk, status)
                         }
@@ -1037,6 +1067,10 @@ object CommsRepository {
      * holds [lock].
      */
     private fun processStagedLocked(p: CommsStore.PendingInbound): Boolean {
+        // A photo whose rest never came must not spin as "receiving" for good.
+        if (store.expireStaleMedia(System.currentTimeMillis() - MEDIA_RECEIVE_TIMEOUT_MS) > 0) {
+            CommsLog.add("Attachment(s) still incomplete after ${MEDIA_RECEIVE_TIMEOUT_MS / 60_000} minutes marked failed")
+        }
         val json = CommsWire.parse(p.payload)
         if (json == null) {
             CommsLog.add("Envelope ${shortId(p.id)} decrypted but is not an Aegis payload; dropped")
@@ -1266,6 +1300,14 @@ object CommsRepository {
                 val existing = store.message(id)
                 if (existing != null && existing.status != STATUS_RECEIVING) return // whole already, or not media
                 if (existing != null && existing.peer != contact.number) return
+                val announced = existing?.let { MediaBody.decode(it.body) }
+                if (announced != null && index >= announced.chunks) {
+                    // Past the end the header declared: kept, it would make the count
+                    // reach the total while a real chunk is missing, and the file
+                    // could then never be assembled.
+                    CommsLog.add("Chunk $index of an attachment from ${formatAegisNumber(contact.number)} dropped: it announced only ${announced.chunks}")
+                    return
+                }
                 if (existing == null && store.orphanChunkIds().size >= 8 && store.chunkCount(id) == 0) {
                     // Chunks for files whose header never came must not pile up without bound.
                     CommsLog.add("Chunk of an unannounced attachment from ${formatAegisNumber(contact.number)} dropped")
@@ -1273,7 +1315,7 @@ object CommsRepository {
                 }
                 val bytes = runCatching { java.util.Base64.getDecoder().decode(data) }.getOrNull() ?: return
                 store.saveChunk(id, index, bytes, envelopeTs)
-                val body = existing?.let { MediaBody.decode(it.body) } ?: return
+                val body = announced ?: return
                 completeMediaIfWhole(contact, id, body)
             }
             else -> CommsLog.add("Payload of type \"${CommsWire.type(json)}\" from ${formatAegisNumber(contact.number)} not understood; ignored")

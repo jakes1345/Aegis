@@ -247,6 +247,42 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
      * and seconds to go, so its "delivered" can easily arrive before the last
      * chunk is confirmed; it must not be pulled back to "sent".
      */
+    /** A message of ours to [peer] that the relay will never take (too large, say): failed for good, with a RETRY in the bubble. */
+    fun markFailed(peer: String, id: String, error: String? = null) {
+        writableDatabase.execSQL(
+            "UPDATE messages SET status = 'failed', error = ? WHERE peer = ? AND id = ? AND direction = 'OUT'",
+            arrayOf(error, peer, id)
+        )
+    }
+
+    /**
+     * Inbound photos and videos announced before [olderThan] whose chunks never
+     * all came are marked failed, so the bubble stops saying "receiving"; their
+     * chunks go too. Returns how many.
+     */
+    fun expireStaleMedia(olderThan: Long): Int {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val ids = db.rawQuery(
+                "SELECT id FROM messages WHERE kind = ? AND direction = 'IN' AND status = ? AND ts < ?",
+                arrayOf(KIND_MEDIA, STATUS_RECEIVING, olderThan.toString())
+            ).use { c ->
+                val out = ArrayList<String>()
+                while (c.moveToNext()) out += c.getString(0)
+                out
+            }
+            for (id in ids) {
+                db.execSQL("UPDATE messages SET status = 'failed', error = ? WHERE id = ?", arrayOf("The file never arrived in full", id))
+                db.delete("media_chunks", "id = ?", arrayOf(id))
+            }
+            db.setTransactionSuccessful()
+            return ids.size
+        } finally {
+            db.endTransaction()
+        }
+    }
+
     fun markSentIfQueued(id: String) {
         val values = ContentValues().apply { put("status", "sent"); putNull("error") }
         writableDatabase.update("messages", values, "id = ? AND status = 'queued'", arrayOf(id))

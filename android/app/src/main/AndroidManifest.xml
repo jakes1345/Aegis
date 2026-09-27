@@ -99,6 +99,18 @@
         <package android:name="com.mxspy" />
         <package android:name="com.pcTattletale" />
         <package android:name="com.retinax.mobilespy" />
+        <!--
+            Makes every active device admin visible so its label can be resolved
+            through its receiver component; without this the Device tab showed raw
+            package names. Same for accessibility services, whose ResolveInfo the
+            platform supplies but whose package would otherwise stay hidden.
+        -->
+        <intent>
+            <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+        </intent>
+        <intent>
+            <action android:name="android.accessibilityservice.AccessibilityService" />
+        </intent>
     </queries>
 
     <application

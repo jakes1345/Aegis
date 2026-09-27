@@ -3,6 +3,7 @@ package com.xat.aegis.analysis
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.os.Build
 import android.telephony.CellIdentityNr
 import android.telephony.CellInfo
@@ -13,6 +14,7 @@ import android.telephony.CellInfoTdscdma
 import android.telephony.CellInfoWcdma
 import android.telephony.CellSignalStrength
 import android.telephony.CellSignalStrengthNr
+import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
 import com.xat.aegis.NeighborCell
@@ -51,9 +53,36 @@ class CellMonitor(private val context: Context) {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
             != PackageManager.PERMISSION_GRANTED
         ) return "Location permission needed to read cell identity"
-        if (tm.phoneType == TelephonyManager.PHONE_TYPE_NONE) return "No cellular radio (Wi-Fi-only device)"
+        // The system-wide location switch gates cell identity just like the runtime
+        // permission does: with it off, getAllCellInfo() comes back empty with no
+        // explanation, and the tab used to blame the modem.
+        if (!locationEnabled()) return "Location is turned off — enable it in Settings to read cell identity"
+        // FEATURE_TELEPHONY, not getPhoneType(): LTE tablets and data-only handsets
+        // report PHONE_TYPE_NONE while camped on a live cell with a working SIM.
+        if (!context.packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY)) {
+            return "No cellular radio (Wi-Fi-only device)"
+        }
         if (tm.simState == TelephonyManager.SIM_STATE_ABSENT) return "No SIM card — the modem is not registered on any network"
         return null
+    }
+
+    /** The system location master switch; false also when the service is missing. */
+    private fun locationEnabled(): Boolean =
+        runCatching { context.getSystemService(LocationManager::class.java)?.isLocationEnabled }
+            .getOrNull() ?: false
+
+    /**
+     * The manager to read cells from. On a dual-SIM device `getAllCellInfo()` returns
+     * one registered cell per subscription in no guaranteed order, so a reading taken
+     * from the default manager could alternate between SIMs from one poll to the next
+     * and look like rapid cell switching. Scoping to the default data subscription
+     * pins every poll to the same SIM, the one [radioInfo] describes.
+     */
+    private fun dataManager(base: TelephonyManager): TelephonyManager {
+        val subId = runCatching { SubscriptionManager.getDefaultDataSubscriptionId() }
+            .getOrDefault(SubscriptionManager.INVALID_SUBSCRIPTION_ID)
+        if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) return base
+        return runCatching { base.createForSubscriptionId(subId) }.getOrDefault(base)
     }
 
     /** The serving cell right now, or null if it cannot be read. */
@@ -69,11 +98,15 @@ class CellMonitor(private val context: Context) {
      * the cache when the request times out or the modem refuses.
      */
     suspend fun sampleFull(): Snapshot? {
-        val manager = tm ?: return null
+        val base = tm ?: return null
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
             != PackageManager.PERMISSION_GRANTED
         ) return null
+        // With the location switch off the platform hands back an empty list; the
+        // callers ask unavailableReason() first and show why, so nothing to read here.
+        if (!locationEnabled()) return null
 
+        val manager = dataManager(base)
         val fresh = withTimeoutOrNull(REQUEST_TIMEOUT_MS) { requestFresh(manager) }
         val all = fresh?.takeIf { it.isNotEmpty() }
             ?: try { manager.allCellInfo } catch (_: SecurityException) { null }
