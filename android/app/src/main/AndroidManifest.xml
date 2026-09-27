@@ -33,8 +33,14 @@
     <!-- COMMS calls: the proximity sensor switches the screen off at the ear. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <!-- Wi-Fi anomaly scan reads the system's cached scan results only -->
+    <!-- Wi-Fi tab: reads the connected network and the scan cache, and asks the
+         platform for a fresh scan when the tab is open (throttled by Android). -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+
+    <!-- Cell tab: the data network type (LTE / NR / HSPA+). A normal permission on
+         Android 13+, granted at install; on 12 the read is skipped. -->
+    <uses-permission android:name="android.permission.READ_BASIC_PHONE_STATE" />
 
     <!-- NFC / HF RFID passive tag sweep -->
     <uses-permission android:name="android.permission.NFC" />
@@ -49,6 +55,51 @@
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
     <uses-feature android:name="android.hardware.nfc" android:required="false" />
+
+    <!--
+        Device tab: the packages the security check looks for. Package visibility
+        filtering hides every other app from getPackageInfo unless it is named here;
+        this is the list of root managers, hooking frameworks and known stalkerware
+        that PhoneHealthMonitor reports when installed. Nothing else is visible.
+    -->
+    <queries>
+        <package android:name="com.topjohnwu.magisk" />
+        <package android:name="io.github.vvb2060.magisk" />
+        <package android:name="io.github.huskydg.magisk" />
+        <package android:name="me.weishu.kernelsu" />
+        <package android:name="me.bmax.apatch" />
+        <package android:name="eu.chainfire.supersu" />
+        <package android:name="com.koushikdutta.superuser" />
+        <package android:name="com.noshufou.android.su" />
+        <package android:name="com.thirdparty.superuser" />
+        <package android:name="com.kingroot.kinguser" />
+        <package android:name="com.kingo.root" />
+        <package android:name="com.zachspong.temprootremovejb" />
+        <package android:name="de.robv.android.xposed.installer" />
+        <package android:name="org.meowcat.edxposed.manager" />
+        <package android:name="org.lsposed.manager" />
+        <package android:name="com.saurik.substrate" />
+        <package android:name="re.frida.server" />
+        <package android:name="com.mspy.lite" />
+        <package android:name="com.mspy.android" />
+        <package android:name="com.flexispy.android" />
+        <package android:name="com.hellospy.system" />
+        <package android:name="com.spyzie.android" />
+        <package android:name="com.cocospy.android" />
+        <package android:name="com.spyic.android" />
+        <package android:name="com.hoverwatch.android" />
+        <package android:name="com.thetruthspy.android" />
+        <package android:name="com.spyhuman.android" />
+        <package android:name="com.xnspy.android" />
+        <package android:name="com.mobistealth.android" />
+        <package android:name="com.ikeymonitor.android" />
+        <package android:name="com.cerberusapp" />
+        <package android:name="com.lsdroid.cerberus" />
+        <package android:name="com.spy2mobile.light" />
+        <package android:name="com.mxspy" />
+        <package android:name="com.pcTattletale" />
+        <package android:name="com.retinax.mobilespy" />
+    </queries>
 
     <application
         android:allowBackup="false"

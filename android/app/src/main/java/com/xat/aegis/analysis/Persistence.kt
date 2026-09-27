@@ -4,12 +4,16 @@ import com.xat.aegis.Detection
 import com.xat.aegis.FollowConfidence
 import com.xat.aegis.Threat
 import com.xat.aegis.TrackerType
+import com.xat.aegis.detect.BleNames
 
 const val PERSIST_THRESHOLD_MS = 10 * 60 * 1000L
 const val PERSIST_MIN_SIGHTINGS = 5
 
 /** Ceiling on simultaneously tracked devices — see [Tracker.prune]. */
 private const val MAX_ENTRIES = 4000
+
+/** Ceiling on distinct service names remembered per device; a row cannot show more anyway. */
+private const val MAX_SERVICES = 8
 
 /**
  * Tracks how long a device stays with you and — where there is a position fix —
@@ -33,6 +37,14 @@ class Tracker(
     private class Entry(val key: String) {
         var address = ""
         var name = ""
+        // Identification is sticky: an advertisement that omits the name or the
+        // manufacturer (scan responses and rotating payloads do) must not blank out
+        // what an earlier packet already told us.
+        var advertisedName: String? = null
+        var manufacturer: String? = null
+        val services = LinkedHashSet<String>()
+        var radio = "BLE"
+        var addressKind: String? = null
         var rssi = 0
         var tracker: TrackerType? = null
         var approxMetres: Double? = null
@@ -56,7 +68,6 @@ class Tracker(
     fun observe(
         key: String,
         address: String,
-        name: String,
         rssi: Int,
         tracker: TrackerType?,
         approxMetres: Double?,
@@ -64,7 +75,12 @@ class Tracker(
         addresses: Int,
         fix: Fix?,
         hasPosition: Boolean,
-        now: Long
+        now: Long,
+        advertisedName: String? = null,
+        manufacturer: String? = null,
+        services: List<String> = emptyList(),
+        radio: String = "BLE",
+        addressKind: String? = null
     ): Observation {
         val entry = entries.getOrPut(key) {
             Entry(key).apply { firstSeen = now }
@@ -73,7 +89,6 @@ class Tracker(
         val wasFollowing = entry.following
 
         entry.address = address
-        entry.name = name
         entry.rssi = rssi
         entry.approxMetres = approxMetres
         entry.rotations = rotations
@@ -82,6 +97,13 @@ class Tracker(
         entry.sightings++
         // A device only becomes identifiable once it advertises something we match.
         if (entry.tracker == null && tracker != null) entry.tracker = tracker
+
+        advertisedName?.let { entry.advertisedName = it }
+        manufacturer?.let { entry.manufacturer = it }
+        if (services.isNotEmpty() && entry.services.size < MAX_SERVICES) entry.services.addAll(services)
+        if (radio != "Unknown") entry.radio = radio
+        addressKind?.let { entry.addressKind = it }
+        entry.name = BleNames.displayName(entry.advertisedName, entry.tracker, entry.manufacturer, address)
 
         fix?.let { entry.area.add(it) }
 
@@ -146,7 +168,12 @@ class Tracker(
             rotations = entry.rotations,
             addresses = entry.addresses,
             approxMetres = entry.approxMetres,
-            points = entry.area.points()
+            points = entry.area.points(),
+            advertisedName = entry.advertisedName,
+            manufacturer = entry.manufacturer,
+            services = entry.services.toList(),
+            radio = entry.radio,
+            addressKind = entry.addressKind
         )
 
         return Observation(detection, entry.following && !wasFollowing)
@@ -179,7 +206,12 @@ class Tracker(
                 rotations = entry.rotations,
                 addresses = entry.addresses,
                 approxMetres = entry.approxMetres,
-                points = entry.area.points()
+                points = entry.area.points(),
+                advertisedName = entry.advertisedName,
+                manufacturer = entry.manufacturer,
+                services = entry.services.toList(),
+                radio = entry.radio,
+                addressKind = entry.addressKind
             )
         }
 

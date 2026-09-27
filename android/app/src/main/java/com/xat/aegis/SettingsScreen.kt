@@ -162,12 +162,11 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
     var showDuressSetup by remember { mutableStateOf(false) }
     var showDuressRemove by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    // Only a strong (class 3) biometric can drive the enrolment-bound Keystore key
+    // the lock screen's prompt needs, and only once one is enrolled.
     val canUseBiometric = remember(context) {
-        val result = BiometricManager.from(context).canAuthenticate(
-            BiometricManager.Authenticators.BIOMETRIC_STRONG or
-            BiometricManager.Authenticators.BIOMETRIC_WEAK
-        )
-        result == BiometricManager.BIOMETRIC_SUCCESS || result == BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED
+        BiometricManager.from(context).canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) ==
+            BiometricManager.BIOMETRIC_SUCCESS
     }
 
     // ── Resume after reboot ─────────────────────────────────────────────────

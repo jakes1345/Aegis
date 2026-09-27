@@ -28,12 +28,29 @@ import org.json.JSONObject
  *   payment  "id", "txid" (the relay's transaction id), "ts", "amt" (AegisCoin), "note" (optional)
  *            — the coins moved through the relay already; this tells the recipient, privately
  *   voicemail "id", "ts", "audio" (base64 AMR-NB), "dur" (ms)
+ *   media    "id", "ts", "mime", "w", "h", "dur" (video ms, else 0), "size" (bytes), "n" (chunk count),
+ *            "cap" (caption, optional), "thumb" (small JPEG, base64, optional)
+ *            — announces a photo or video; its bytes follow in "n" mchunk payloads
+ *   mchunk   "id" (the media's), "i" (0-based index), "data" (base64 of at most [MEDIA_CHUNK_BYTES] bytes)
+ *
+ * The relay takes envelopes of at most 64 KB. A payload's bytes are base64
+ * inside the Olm ciphertext and the sealed envelope is base64 again for the
+ * relay, so each envelope carries roughly half its size in payload; that is why
+ * media travels in chunks and why [MEDIA_CHUNK_BYTES] is what it is.
  *
  * Pure Kotlin and org.json, so the JVM tests use exactly this code.
  */
 object CommsWire {
 
     const val VERSION = 1
+
+    /**
+     * Raw bytes per media chunk. 30 KB becomes 40 KB of base64 in the payload,
+     * about 55 KB once Olm's ciphertext is base64 inside the sealed envelope, and
+     * about 74 KB as the relay sees it: under its 64 KB (87 KB base64) limit,
+     * with room for the sender's identity fields.
+     */
+    const val MEDIA_CHUNK_BYTES = 30 * 1024
 
     const val F_VERSION = "v"
     const val F_TYPE = "t"
@@ -53,6 +70,8 @@ object CommsWire {
     const val T_CALL = "call"
     const val T_PAYMENT = "payment"
     const val T_VOICEMAIL = "voicemail"
+    const val T_MEDIA = "media"
+    const val T_MEDIA_CHUNK = "mchunk"
 
     // msg
     const val F_ID = "id"
@@ -94,6 +113,17 @@ object CommsWire {
     const val F_AUDIO = "audio"
     /** Its length in milliseconds. */
     const val F_DURATION = "dur"
+
+    // media / mchunk
+    const val F_MIME = "mime"
+    const val F_WIDTH = "w"
+    const val F_HEIGHT = "h"
+    const val F_SIZE = "size"
+    const val F_CHUNKS = "n"
+    const val F_CAPTION = "cap"
+    const val F_THUMB = "thumb"
+    const val F_INDEX = "i"
+    const val F_DATA = "data"
 
     // One ICE candidate inside "cands".
     private const val C_MID = "m"
@@ -152,6 +182,22 @@ object CommsWire {
 
     fun voicemail(id: String, ts: Long, audioB64: String, durationMs: Long): JSONObject =
         base(T_VOICEMAIL).put(F_ID, id).put(F_TS, ts).put(F_AUDIO, audioB64).put(F_DURATION, durationMs)
+
+    /** Announces a photo or video whose bytes follow in [chunks] mchunk payloads. */
+    fun mediaHeader(
+        id: String, ts: Long, mime: String, width: Int, height: Int, durationMs: Long,
+        size: Long, chunks: Int, caption: String?, thumbB64: String?
+    ): JSONObject {
+        val o = base(T_MEDIA).put(F_ID, id).put(F_TS, ts).put(F_MIME, mime).put(F_WIDTH, width).put(F_HEIGHT, height)
+            .put(F_DURATION, durationMs).put(F_SIZE, size).put(F_CHUNKS, chunks)
+        if (!caption.isNullOrBlank()) o.put(F_CAPTION, caption)
+        if (!thumbB64.isNullOrBlank()) o.put(F_THUMB, thumbB64)
+        return o
+    }
+
+    /** Chunk [index] of media [id]; [dataB64] is base64 of at most [MEDIA_CHUNK_BYTES] bytes. */
+    fun mediaChunk(id: String, index: Int, dataB64: String): JSONObject =
+        base(T_MEDIA_CHUNK).put(F_ID, id).put(F_INDEX, index).put(F_DATA, dataB64)
 
     /**
      * Adds the sender's identity to [payload]. Throws [IllegalStateException]

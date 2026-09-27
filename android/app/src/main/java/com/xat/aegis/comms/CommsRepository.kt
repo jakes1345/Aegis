@@ -47,6 +47,8 @@ import java.util.UUID
  *                                         it starts a fresh session by itself.
  *   {"v":1,"t":"payment","id":uuid,"txid":relay id,"ts":ms,"amt":coins,"note":text,...}
  *   {"v":1,"t":"voicemail","id":uuid,"ts":ms,"audio":base64 AMR-NB,"dur":ms,...}
+ *   {"v":1,"t":"media","id":uuid,"ts":ms,"mime":..,"w":..,"h":..,"dur":ms,"size":bytes,"n":chunks,"cap":..,"thumb":b64,...}
+ *   {"v":1,"t":"mchunk","id":media uuid,"i":index,"data":base64,...}   — one of "n" pieces of the file
  * The sender's keys ride along so a first message from someone who has our
  * number pins their identity without trusting the relay for it; the relay's
  * record for that number must still match before the message is accepted.
@@ -60,6 +62,9 @@ object CommsRepository {
     /** A voicemail's base64 audio: 30 s of AMR-NB at 4.75 kbit/s is under 25 KB; anything far past that is not one. */
     private const val MAX_VOICEMAIL_B64 = 96_000
     private const val MAX_COIN_NOTE = 140
+    private const val MAX_CAPTION = 500
+    /** Chunks of a file whose rest never came are forgotten after this long. */
+    private const val CHUNK_TTL_MS = 7L * 24 * 3600_000L
     private const val HOLD_FOREGROUND = "foreground"
     private const val HOLD_CALL = "call"
 
@@ -113,6 +118,16 @@ object CommsRepository {
     private val _unread = MutableStateFlow(0)
     val unread: StateFlow<Int> = _unread.asStateFlow()
 
+    /**
+     * Chunks sent so far of each outgoing photo or video, by message id, while it
+     * is going: (done, total). The bubble shows it as "Sending 4/17".
+     */
+    private val _mediaProgress = MutableStateFlow<Map<String, Pair<Int, Int>>>(emptyMap())
+    val mediaProgress: StateFlow<Map<String, Pair<Int, Int>>> = _mediaProgress.asStateFlow()
+
+    /** Where each outgoing media transfer got to, so a retry after a network failure carries on rather than starting over. */
+    private val mediaSent = HashMap<String, Int>()
+
     /** The conversation currently on screen; its messages do not raise notifications. */
     @Volatile
     var openPeer: String? = null
@@ -131,6 +146,7 @@ object CommsRepository {
         config.purgeLegacy()
         identities = IdentityStore(appContext)
         store = CommsStore(appContext)
+        CommsMedia.init(appContext)
         relay = RelayClient({ identities.get() }, { config.relayUrl }, { config.number })
         LiveLink.init(appContext)
         CallManager.init(appContext)
@@ -148,6 +164,7 @@ object CommsRepository {
         if (config.isRegistered && config.online) CommsService.start(appContext)
         watchNetwork()
         if (config.isRegistered) scope.launch { pruneSessions() }
+        scope.launch { runCatching { store.purgeChunks(System.currentTimeMillis() - CHUNK_TTL_MS) } }
     }
 
     /**
@@ -310,6 +327,7 @@ object CommsRepository {
             CommsService.stop(appContext)
             LiveLink.disconnect()
             store.clearAll()
+            CommsMedia.deleteAll()
             identities.destroy()
             config.clear()
             KeystoreBox.destroy()
@@ -491,7 +509,7 @@ object CommsRepository {
     suspend fun deleteContact(number: String) = withContext(Dispatchers.IO) {
         lock.withLock {
             store.contact(number)?.let { c -> identities.update { it.dropSessions(c.curve25519) } }
-            store.deleteContact(number)
+            store.deleteContact(number).forEach { CommsMedia.delete(it) }
             CommsNotifications.cancel(appContext, number)
             bump()
         }
@@ -516,6 +534,35 @@ object CommsRepository {
         if (status == "failed") Result.failure(RelayException(error ?: "Not sent")) else Result.success(Unit)
     }
 
+    /**
+     * Queues a photo or video for [peer] and starts sending it. Like a text it
+     * stays queued through network failures and goes when the relay is back; the
+     * file itself is kept encrypted on this phone under the message id, and the
+     * bubble shows it from there.
+     */
+    suspend fun sendMedia(peer: String, media: CommsMedia.Prepared, caption: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!config.isRegistered) throw RelayException("Not registered with a relay")
+            store.contact(peer) ?: throw RelayException("Unknown contact")
+            if (media.bytes.isEmpty()) throw IllegalArgumentException("The file is empty")
+            if (media.bytes.size > CommsMedia.MAX_BYTES) throw IllegalArgumentException("The file is too large to send")
+            val id = UUID.randomUUID().toString()
+            val chunks = (media.bytes.size + CommsWire.MEDIA_CHUNK_BYTES - 1) / CommsWire.MEDIA_CHUNK_BYTES
+            val body = MediaBody(
+                media.mime, media.width, media.height, media.durationMs, media.bytes.size.toLong(), chunks,
+                caption.trim().take(MAX_CAPTION), media.thumbB64
+            )
+            CommsMedia.save(id, media.bytes)
+            store.insertMessage(ChatMessage(id, peer, Direction.OUT, body.encode(), System.currentTimeMillis(), "queued", read = true, kind = KIND_MEDIA))
+            bump()
+            CommsLog.add("${if (media.isVideo) "Video" else "Photo"} (${media.bytes.size / 1024} KB, $chunks envelope(s)) queued for ${formatAegisNumber(peer)}")
+            scope.launch { runCatching { flushOutbox() }.onFailure { CommsLog.add("Sending failed: ${it.message}") } }
+        }
+    }
+
+    /** The bytes of a media message on this phone, or null when they are gone (or still arriving). */
+    fun mediaBytes(id: String): ByteArray? = CommsMedia.load(id)
+
     /** Retries a message that failed. */
     suspend fun retry(id: String) = withContext(Dispatchers.IO) {
         store.setStatus(id, "queued")
@@ -538,8 +585,9 @@ object CommsRepository {
                     store.setStatus(m.id, "failed", "Contact removed")
                     continue
                 }
-                when (val outcome = deliver(contact, CommsWire.message(m.id, m.ts, m.body))) {
-                    Deliver.Sent -> { store.setStatus(m.id, "sent"); retryBackoffMs = RETRY_MIN_MS }
+                val outcome = if (m.isMedia) deliverMedia(contact, m) else deliver(contact, CommsWire.message(m.id, m.ts, m.body))
+                when (outcome) {
+                    Deliver.Sent -> { store.markSentIfQueued(m.id); retryBackoffMs = RETRY_MIN_MS }
                     is Deliver.Failed -> {
                         CommsLog.add("Message to ${formatAegisNumber(contact.number)} failed: ${outcome.reason}")
                         store.setStatus(m.id, "failed", outcome.reason)
@@ -553,6 +601,49 @@ object CommsRepository {
             }
         }
         bump()
+    }
+
+    /**
+     * Sends a queued photo or video: its header, then every chunk in order. A
+     * network failure part-way leaves the message queued and remembers how far
+     * it got, so the retry sends only the rest; the recipient drops any chunk
+     * it already has. A fresh process starts from the header again, which is
+     * harmless for the same reason.
+     */
+    private suspend fun deliverMedia(contact: Contact, m: ChatMessage): Deliver {
+        val body = MediaBody.decode(m.body) ?: return Deliver.Failed("This attachment's record is unreadable")
+        val bytes = CommsMedia.load(m.id) ?: return Deliver.Failed("The ${if (body.isVideo) "video" else "photo"} is no longer on this phone")
+        val total = (bytes.size + CommsWire.MEDIA_CHUNK_BYTES - 1) / CommsWire.MEDIA_CHUNK_BYTES
+        var done = synchronized(mediaSent) { mediaSent[m.id] ?: -1 }
+        fun progress(n: Int) { _mediaProgress.update { it + (m.id to (n.coerceAtLeast(0) to total)) } }
+        try {
+            if (done < 0) {
+                progress(0)
+                val header = CommsWire.mediaHeader(m.id, m.ts, body.mime, body.width, body.height, body.durationMs, bytes.size.toLong(), total, body.caption, body.thumbB64)
+                when (val d = deliver(contact, header)) {
+                    Deliver.Sent -> { done = 0; synchronized(mediaSent) { mediaSent[m.id] = 0 } }
+                    else -> return d
+                }
+            }
+            while (done < total) {
+                val from = done * CommsWire.MEDIA_CHUNK_BYTES
+                val to = minOf(from + CommsWire.MEDIA_CHUNK_BYTES, bytes.size)
+                val data = java.util.Base64.getEncoder().encodeToString(bytes.copyOfRange(from, to))
+                when (val d = deliver(contact, CommsWire.mediaChunk(m.id, done, data))) {
+                    Deliver.Sent -> {
+                        done++
+                        synchronized(mediaSent) { mediaSent[m.id] = done }
+                        progress(done)
+                    }
+                    else -> return d
+                }
+            }
+            synchronized(mediaSent) { mediaSent.remove(m.id) }
+            CommsLog.add("${if (body.isVideo) "Video" else "Photo"} sent to ${formatAegisNumber(contact.number)} in $total envelope(s)")
+            return Deliver.Sent
+        } finally {
+            if (done >= total) _mediaProgress.update { it - m.id }
+        }
     }
 
     private sealed class Deliver {
@@ -693,8 +784,18 @@ object CommsRepository {
         }
     }
 
-    /** Adds this identity's number, name and keys to an outgoing payload; see [CommsWire.withSender]. */
+    /**
+     * Adds this identity's number, name and keys to an outgoing payload; see
+     * [CommsWire.withSender]. Once only: [deliver] runs [prepareLocked] a second
+     * time on the same payload when a session bundle had to be fetched first,
+     * and [CommsWire.withSender] refuses to overwrite the fields it added the
+     * first time. That refusal used to fail every first envelope to a contact
+     * with no session yet (one added from a QR code, say): the message, the
+     * call offer and the voicemail after it all came back as "payload field(s)
+     * from, name, k, c, s, g are reserved for the sender's identity".
+     */
     private fun putSelf(o: JSONObject) {
+        if (CommsWire.SENDER_FIELDS.all { o.has(it) }) return
         val bundle = identities.get()?.publicBundle() ?: return
         val number = config.number ?: return
         CommsWire.withSender(
@@ -1114,8 +1215,94 @@ object CommsRepository {
                 }
                 CommsLog.add("Voicemail (${durationLabel(durationMs)}) from ${formatAegisNumber(contact.number)}")
             }
+            CommsWire.T_MEDIA -> {
+                val id = json.optString(CommsWire.F_ID).takeIf { it.isNotBlank() } ?: return
+                val alreadyRead = store.isRead(id)
+                if (alreadyRead != null) {
+                    // The header again (they resent after a network error). A file
+                    // already whole is receipted again; one still arriving is not yet.
+                    if (store.message(id)?.status != STATUS_RECEIVING) {
+                        store.queueReceipt(contact.number, listOf(id), if (alreadyRead) CommsWire.STATUS_READ else CommsWire.STATUS_DELIVERED)
+                    }
+                    return
+                }
+                val mime = json.optString(CommsWire.F_MIME).takeIf { it.startsWith("image/") || it.startsWith("video/") } ?: run {
+                    CommsLog.add("Attachment from ${formatAegisNumber(contact.number)} dropped: type \"${json.optString(CommsWire.F_MIME)}\" not shown")
+                    return
+                }
+                val size = json.optLong(CommsWire.F_SIZE, 0L)
+                val chunks = json.optInt(CommsWire.F_CHUNKS, 0)
+                val expectedChunks = ((size + CommsWire.MEDIA_CHUNK_BYTES - 1) / CommsWire.MEDIA_CHUNK_BYTES).toInt()
+                if (size <= 0L || size > CommsMedia.MAX_BYTES || chunks <= 0 || chunks > CommsMedia.MAX_CHUNKS || chunks != expectedChunks) {
+                    CommsLog.add("Attachment from ${formatAegisNumber(contact.number)} dropped: $size bytes in $chunks chunk(s) is not acceptable")
+                    return
+                }
+                val thumb = json.optString(CommsWire.F_THUMB).takeIf { it.length <= 24_000 } ?: ""
+                val body = MediaBody(
+                    mime, json.optInt(CommsWire.F_WIDTH, 0), json.optInt(CommsWire.F_HEIGHT, 0), json.optLong(CommsWire.F_DURATION, 0L).coerceAtLeast(0L),
+                    size, chunks, json.optString(CommsWire.F_CAPTION, "").take(MAX_CAPTION), thumb
+                )
+                val ts = claimedTs(envelopeTs, json.optLong(CommsWire.F_TS, envelopeTs))
+                // Shown at once as a thumbnail that fills in; read, receipted and
+                // notified only when the whole file is here.
+                store.insertMessage(ChatMessage(id, contact.number, Direction.IN, body.encode(), ts, STATUS_RECEIVING, read = false, kind = KIND_MEDIA))
+                CommsLog.add("${if (body.isVideo) "Video" else "Photo"} (${size / 1024} KB, $chunks envelope(s)) announced by ${formatAegisNumber(contact.number)}")
+                // Its chunks may have overtaken the header.
+                completeMediaIfWhole(contact, id, body)
+            }
+            CommsWire.T_MEDIA_CHUNK -> {
+                val id = json.optString(CommsWire.F_ID).takeIf { it.isNotBlank() } ?: return
+                val index = json.optInt(CommsWire.F_INDEX, -1)
+                val data = json.optString(CommsWire.F_DATA).takeIf { it.isNotBlank() } ?: return
+                if (index < 0 || index >= CommsMedia.MAX_CHUNKS || data.length > CommsWire.MEDIA_CHUNK_BYTES * 4 / 3 + 4) return
+                val existing = store.message(id)
+                if (existing != null && existing.status != STATUS_RECEIVING) return // whole already, or not media
+                if (existing != null && existing.peer != contact.number) return
+                if (existing == null && store.orphanChunkIds().size >= 8 && store.chunkCount(id) == 0) {
+                    // Chunks for files whose header never came must not pile up without bound.
+                    CommsLog.add("Chunk of an unannounced attachment from ${formatAegisNumber(contact.number)} dropped")
+                    return
+                }
+                val bytes = runCatching { java.util.Base64.getDecoder().decode(data) }.getOrNull() ?: return
+                store.saveChunk(id, index, bytes, envelopeTs)
+                val body = existing?.let { MediaBody.decode(it.body) } ?: return
+                completeMediaIfWhole(contact, id, body)
+            }
             else -> CommsLog.add("Payload of type \"${CommsWire.type(json)}\" from ${formatAegisNumber(contact.number)} not understood; ignored")
         }
+    }
+
+    /**
+     * Once every chunk of media [id] is here, assembles the file, stores it under
+     * the message id and turns the message from "receiving" into a received one:
+     * receipted, and notified unless the conversation is on screen. Caller holds [lock].
+     */
+    private fun completeMediaIfWhole(contact: Contact, id: String, body: MediaBody) {
+        if (store.chunkCount(id) < body.chunks) return
+        val bytes = store.assembleChunks(id, body.chunks)
+        if (bytes == null) {
+            CommsLog.add("Attachment from ${formatAegisNumber(contact.number)} could not be assembled; waiting for it to be sent again")
+            return
+        }
+        if (bytes.size.toLong() != body.size) {
+            CommsLog.add("Attachment from ${formatAegisNumber(contact.number)} arrived with ${bytes.size} bytes, not ${body.size}; dropped")
+            store.deleteChunks(id)
+            store.setStatus(id, "failed", "The file arrived damaged")
+            return
+        }
+        CommsMedia.save(id, bytes)
+        store.deleteChunks(id)
+        val onScreen = openPeer == contact.number
+        store.setStatus(id, "received")
+        if (onScreen) {
+            store.queueReceipt(contact.number, store.markRead(contact.number), CommsWire.STATUS_READ)
+        } else {
+            store.queueReceipt(contact.number, listOf(id), CommsWire.STATUS_DELIVERED)
+        }
+        if (!onScreen) {
+            CommsNotifications.notifyInbound(appContext, contact, store.unreadInbound(contact.number, 5))
+        }
+        CommsLog.add("${if (body.isVideo) "Video" else "Photo"} from ${formatAegisNumber(contact.number)} complete (${bytes.size / 1024} KB)")
     }
 
     /**

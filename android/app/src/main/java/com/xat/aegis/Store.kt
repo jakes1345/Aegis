@@ -1,6 +1,7 @@
 package com.xat.aegis
 
 import android.content.Context
+import com.xat.aegis.security.Wiper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -92,6 +93,8 @@ class Store(context: Context, filename: String) {
     private fun flushLocked() {
         val d = data ?: return
         if (!dirty) return
+        // A wipe is deleting this file; writing it back would undo that.
+        if (Wiper.isActive) return
         try {
             file.parentFile?.mkdirs()
             // Write to a temp file and rename so a crash mid-write cannot leave a

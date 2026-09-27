@@ -61,6 +61,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         )
         createVersion2(db)
         createVersion3(db)
+        createVersion4(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -68,6 +69,28 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         // database (comms.db) is deleted by CommsRepository.init on first run.
         if (oldVersion < 2) createVersion2(db)
         if (oldVersion < 3) createVersion3(db)
+        if (oldVersion < 4) createVersion4(db)
+    }
+
+    /**
+     * Photos and videos: a message kind (text or media) and the chunks of an
+     * inbound file while the rest are still on their way. Chunks are encrypted
+     * like bodies; the assembled file goes to [CommsMedia].
+     */
+    private fun createVersion4(db: SQLiteDatabase) {
+        val hasKind = db.rawQuery("PRAGMA table_info(messages)", null).use { c ->
+            generateSequence { if (c.moveToNext()) c.getString(c.getColumnIndexOrThrow("name")) else null }.any { it == "kind" }
+        }
+        if (!hasKind) db.execSQL("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT '$KIND_TEXT'")
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS media_chunks (
+                id TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                ts INTEGER NOT NULL,
+                data_enc BLOB NOT NULL,
+                PRIMARY KEY (id, idx)
+            )"""
+        )
     }
 
     /** Receipts owed to contacts (sent, and retried, outside the repository lock) and an index for purging. */
@@ -147,11 +170,14 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             out
         }
 
-    fun deleteContact(number: String) {
+    /** Deletes everything about [number]; returns the ids of its media messages so their files can go too. */
+    fun deleteContact(number: String): List<String> {
+        val media = mediaIds(number)
         val db = writableDatabase
         db.beginTransaction()
         try {
             db.delete("receipts", "peer = ?", arrayOf(number))
+            for (id in media) db.delete("media_chunks", "id = ?", arrayOf(id))
             db.delete("messages", "peer = ?", arrayOf(number))
             db.delete("transactions", "peer = ?", arrayOf(number))
             db.delete("contacts", "number = ?", arrayOf(number))
@@ -159,6 +185,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         } finally {
             db.endTransaction()
         }
+        return media
     }
 
     // ── Messages ─────────────────────────────────────────────────────────
@@ -173,12 +200,29 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             put("status", m.status)
             put("read", if (m.read) 1 else 0)
             put("error", m.error)
+            put("kind", m.kind)
         }
         writableDatabase.insertWithOnConflict("messages", null, values, SQLiteDatabase.CONFLICT_IGNORE)
     }
 
     fun hasMessage(id: String): Boolean =
         readableDatabase.rawQuery("SELECT 1 FROM messages WHERE id = ?", arrayOf(id)).use { it.moveToFirst() }
+
+    fun message(id: String): ChatMessage? =
+        readableDatabase.query("messages", null, "id = ?", arrayOf(id), null, null, null).use { c ->
+            if (c.moveToFirst()) readMessage(c) else null
+        }
+
+    /** Ids of the media messages with [peer] (or everyone, when null), whose files live in [CommsMedia]. */
+    fun mediaIds(peer: String? = null): List<String> =
+        readableDatabase.rawQuery(
+            "SELECT id FROM messages WHERE kind = ?" + (if (peer != null) " AND peer = ?" else ""),
+            if (peer != null) arrayOf(KIND_MEDIA, peer) else arrayOf(KIND_MEDIA)
+        ).use { c ->
+            val out = ArrayList<String>()
+            while (c.moveToNext()) out += c.getString(0)
+            out
+        }
 
     /** Whether the inbound message [id] has been read; null when there is no such message. */
     fun isRead(id: String): Boolean? =
@@ -198,9 +242,25 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
     }
 
     /**
+     * Marks a message the relay took as "sent", unless the recipient's receipt
+     * got here first and already moved it further. A photo takes many envelopes
+     * and seconds to go, so its "delivered" can easily arrive before the last
+     * chunk is confirmed; it must not be pulled back to "sent".
+     */
+    fun markSentIfQueued(id: String) {
+        val values = ContentValues().apply { put("status", "sent"); putNull("error") }
+        writableDatabase.update("messages", values, "id = ? AND status = 'queued'", arrayOf(id))
+    }
+
+    /**
      * Advances the status of our messages to [peer], never backwards (a late
      * "delivered" after "read"). Only messages sent to that contact can be
      * receipted by them; nothing is decrypted.
+     *
+     * Messages whose status says what they are (a voicemail, a payment) are
+     * left alone: an unknown status used to rank below everything, so the first
+     * receipt for a voicemail overwrote "voicemail" with "delivered", and the
+     * sender's bubble turned into the recording's base64 as text.
      */
     fun advanceStatus(peer: String, ids: List<String>, status: String) {
         if (ids.isEmpty()) return
@@ -213,7 +273,8 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
                 val current = db.rawQuery("SELECT status FROM messages WHERE id = ? AND peer = ? AND direction = 'OUT'", arrayOf(id, peer)).use { c ->
                     if (c.moveToFirst()) c.getString(0) else null
                 } ?: continue
-                if ((rank[current] ?: -1) < target) {
+                val currentRank = rank[current] ?: continue
+                if (currentRank < target) {
                     db.update("messages", ContentValues().apply { put("status", status) }, "id = ?", arrayOf(id))
                 }
             }
@@ -276,14 +337,18 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         val db = writableDatabase
         db.beginTransaction()
         try {
-            val ids = db.rawQuery("SELECT id FROM messages WHERE peer = ? AND direction = 'IN' AND read = 0 AND status != ?", arrayOf(peer, STATUS_CALL)).use { c ->
+            // A photo still arriving is neither shown nor receipted yet; it is read once it is whole.
+            val ids = db.rawQuery(
+                "SELECT id FROM messages WHERE peer = ? AND direction = 'IN' AND read = 0 AND status != ? AND status != ?",
+                arrayOf(peer, STATUS_CALL, STATUS_RECEIVING)
+            ).use { c ->
                 val out = ArrayList<String>()
                 while (c.moveToNext()) out += c.getString(0)
                 out
             }
             for (id in ids) db.execSQL("UPDATE messages SET read = 1 WHERE id = ?", arrayOf(id))
             // Missed-call entries are read too, but are not messages to receipt.
-            db.execSQL("UPDATE messages SET read = 1 WHERE peer = ? AND direction = 'IN' AND read = 0", arrayOf(peer))
+            db.execSQL("UPDATE messages SET read = 1 WHERE peer = ? AND direction = 'IN' AND read = 0 AND status != ?", arrayOf(peer, STATUS_RECEIVING))
             db.setTransactionSuccessful()
             return ids
         } finally {
@@ -304,6 +369,56 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
     fun unreadCount(): Int =
         readableDatabase.rawQuery("SELECT COUNT(*) FROM messages WHERE direction = 'IN' AND read = 0", null).use { c ->
             if (c.moveToFirst()) c.getInt(0) else 0
+        }
+
+    // ── Media chunks on their way in ─────────────────────────────────────
+
+    /** Keeps chunk [index] of media [id]; a second copy of the same chunk is ignored. */
+    fun saveChunk(id: String, index: Int, data: ByteArray, ts: Long) {
+        val values = ContentValues().apply {
+            put("id", id)
+            put("idx", index)
+            put("ts", ts)
+            put("data_enc", KeystoreBox.encrypt(data))
+        }
+        writableDatabase.insertWithOnConflict("media_chunks", null, values, SQLiteDatabase.CONFLICT_IGNORE)
+    }
+
+    fun chunkCount(id: String): Int =
+        readableDatabase.rawQuery("SELECT COUNT(*) FROM media_chunks WHERE id = ?", arrayOf(id)).use { c ->
+            if (c.moveToFirst()) c.getInt(0) else 0
+        }
+
+    /** Every chunk of [id] in order, or null when one is missing or unreadable. */
+    fun assembleChunks(id: String, expected: Int): ByteArray? {
+        val out = java.io.ByteArrayOutputStream()
+        var next = 0
+        readableDatabase.query("media_chunks", arrayOf("idx", "data_enc"), "id = ?", arrayOf(id), null, null, "idx ASC").use { c ->
+            while (c.moveToNext()) {
+                if (c.getInt(0) != next) return null
+                val plain = runCatching { KeystoreBox.decrypt(c.getBlob(1)) }.getOrNull() ?: return null
+                out.write(plain)
+                next++
+            }
+        }
+        return if (next == expected) out.toByteArray() else null
+    }
+
+    fun deleteChunks(id: String) {
+        writableDatabase.delete("media_chunks", "id = ?", arrayOf(id))
+    }
+
+    /** Chunks of files whose header, or whose remaining chunks, never came. */
+    fun purgeChunks(olderThan: Long) {
+        writableDatabase.execSQL("DELETE FROM media_chunks WHERE ts < ?", arrayOf(olderThan))
+    }
+
+    /** Ids of chunk sets that have no message row yet (their header has not arrived). */
+    fun orphanChunkIds(): List<String> =
+        readableDatabase.rawQuery("SELECT DISTINCT id FROM media_chunks WHERE id NOT IN (SELECT id FROM messages)", null).use { c ->
+            val out = ArrayList<String>()
+            while (c.moveToNext()) out += c.getString(0)
+            out
         }
 
     // ── AegisCoin ────────────────────────────────────────────────────────
@@ -499,6 +614,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             db.delete("pending_inbound", null, null)
             db.delete("receipts", null, null)
             db.delete("transactions", null, null)
+            db.delete("media_chunks", null, null)
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
@@ -521,6 +637,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         val body = runCatching { KeystoreBox.decryptString(c.getBlob(c.getColumnIndexOrThrow("body_enc"))) }
             .getOrElse { return null }
         val errorIdx = c.getColumnIndexOrThrow("error")
+        val kindIdx = c.getColumnIndex("kind")
         return ChatMessage(
             id = c.getString(c.getColumnIndexOrThrow("id")),
             peer = c.getString(c.getColumnIndexOrThrow("peer")),
@@ -529,12 +646,13 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             ts = c.getLong(c.getColumnIndexOrThrow("ts")),
             status = c.getString(c.getColumnIndexOrThrow("status")),
             read = c.getInt(c.getColumnIndexOrThrow("read")) != 0,
-            error = if (c.isNull(errorIdx)) null else c.getString(errorIdx)
+            error = if (c.isNull(errorIdx)) null else c.getString(errorIdx),
+            kind = if (kindIdx >= 0 && !c.isNull(kindIdx)) c.getString(kindIdx) else KIND_TEXT
         )
     }
 
     private companion object {
         const val DB_NAME = "comms_e2ee.db"
-        const val DB_VERSION = 3
+        const val DB_VERSION = 4
     }
 }

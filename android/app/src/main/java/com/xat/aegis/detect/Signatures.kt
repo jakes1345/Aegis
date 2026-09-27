@@ -7,19 +7,6 @@ import com.xat.aegis.TrackerType
 private const val APPLE = 0x004C
 private const val MICROSOFT = 0x0006
 
-private val COMPANY_NAMES = mapOf(
-    0x004C to "Apple", 0x0075 to "Samsung", 0x00E0 to "Google", 0x0157 to "Google",
-    0x0006 to "Microsoft", 0x01D7 to "Xiaomi", 0x0059 to "Nordic Semiconductor",
-    0x02E5 to "Espressif", 0x0499 to "Ruuvi", 0x00D7 to "Tile",
-    0x0057 to "Harman", 0x00F8 to "Bose", 0x046D to "Logitech",
-    0x007D to "Motorola", 0x022B to "Jabra", 0x006F to "Sony",
-    0x0110 to "Amazon", 0x01AE to "GoPro", 0x0087 to "Garmin",
-    0x0038 to "Texas Instruments", 0x001D to "Qualcomm", 0x0025 to "NXP",
-    0x0469 to "Fitbit", 0x005E to "Tile", 0x0017 to "Ericsson",
-    0x0048 to "Plantronics", 0x016D to "Bang & Olufsen",
-    0x09AF to "Nothing", 0x038F to "MediaTek"
-)
-
 /**
  * Tracker signatures based on public reverse engineering — OpenHaystack,
  * packet captures and vendor documentation.
@@ -177,14 +164,10 @@ object Signatures {
     /**
      * Returns a human-readable brand label from the manufacturer-specific data company ID.
      * Used as a fallback when the device name is blank and no tracker signature matched.
+     * The table itself lives in [BleNames], which the scanner now consults directly.
      */
-    fun companyLabel(record: ScanRecord?): String? {
-        if (record == null) return null
-        COMPANY_NAMES.forEach { (id, name) ->
-            if (record.getManufacturerSpecificData(id) != null) return "$name device"
-        }
-        return null
-    }
+    fun companyLabel(record: ScanRecord?): String? =
+        BleNames.manufacturer(record)?.let { "$it device" }
 
     /**
      * Free-space path loss estimate. Rough, and honest about being rough.

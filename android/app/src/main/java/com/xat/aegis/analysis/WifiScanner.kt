@@ -1,10 +1,25 @@
 package com.xat.aegis.analysis
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.NetworkCapabilities
 import android.net.wifi.ScanResult
+import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.SystemClock
+import androidx.core.content.ContextCompat
 import com.xat.aegis.Threat
 import com.xat.aegis.WifiAnomaly
+import com.xat.aegis.WifiConnection
+import com.xat.aegis.WifiNetwork
+import com.xat.aegis.WifiSecurity
+import com.xat.aegis.WifiStatus
+import java.net.Inet4Address
+import java.net.Inet6Address
 
 /**
  * Looks for access points that behave like bait rather than like infrastructure.
@@ -159,6 +174,232 @@ object WifiScanner {
         // infrastructure everywhere and said nothing about bait.
 
         return anomalies.distinctBy { "${it.bssid}|${it.reason}" }
+    }
+
+    // ── Live picture: connected network, IP stack, everything in range ───────
+
+    /**
+     * Asks the platform for a fresh scan. Throttled by Android to four requests per
+     * two minutes in the foreground; a refused request is not an error, the cached
+     * results are simply what [snapshot] reads next.
+     */
+    fun requestScan(context: Context) {
+        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+        if (!wifi.isWifiEnabled) return
+        @Suppress("DEPRECATION")
+        runCatching { wifi.startScan() }
+    }
+
+    /**
+     * What the WIFI tab shows: the network the phone is on, with its addressing, and
+     * every access point in the scan cache sorted strongest first. Each nearby
+     * network carries the flags that make it worth a look — open, WEP, hidden, a
+     * twin of the connected network — so the list is a judgement, not a dump.
+     */
+    fun snapshot(context: Context): WifiStatus {
+        val app = context.applicationContext
+        val wifi = app.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            ?: return WifiStatus(available = false, reason = "No Wi-Fi service on this device")
+        if (ContextCompat.checkSelfPermission(app, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) return WifiStatus(available = false, reason = "Location permission needed to read network names", wifiEnabled = wifi.isWifiEnabled)
+        if (!wifi.isWifiEnabled) {
+            return WifiStatus(available = false, reason = "Wi-Fi is turned off", wifiEnabled = false)
+        }
+
+        val now = System.currentTimeMillis()
+        val connection = connection(app, wifi)
+        val results = try { wifi.scanResults } catch (_: SecurityException) { null } ?: emptyList()
+
+        // Whether any access point on each SSID is encrypted, for the twin rule.
+        val securedSsids = HashSet<String>()
+        for (r in results) {
+            val ssid = normalise(r.SSID) ?: continue
+            if (!isOpen(r)) securedSsids.add(ssid)
+        }
+        val connectedSsid = connection?.ssid?.let { normalise(it) }
+        val connectedBssid = connection?.bssid?.lowercase()
+
+        val nearby = results.mapNotNull { r ->
+            val bssid = r.BSSID?.lowercase() ?: return@mapNotNull null
+            val rawSsid = r.SSID?.trim()?.trim('"').orEmpty()
+            val ssidKey = normalise(r.SSID)
+            val security = securityOf(r.capabilities)
+            val flags = ArrayList<String>(3)
+            when {
+                ssidKey != null && KNOWN_TOOL_SSIDS.contains(ssidKey) -> flags += "Default name of interception/pentest equipment"
+                security == WifiSecurity.OPEN && ssidKey != null && securedSsids.contains(ssidKey) ->
+                    flags += "Open copy of an encrypted network — evil twin"
+                security == WifiSecurity.OPEN && ssidKey != null &&
+                    (isKnownHotspotName(ssidKey) || containsCarrier(tokens(ssidKey))) ->
+                    flags += "Carrier name on an open network — bait"
+                security == WifiSecurity.OPEN -> flags += "Open — traffic readable by anyone in range"
+                security == WifiSecurity.WEP -> flags += "WEP — broken encryption, crackable in minutes"
+                security == WifiSecurity.WPA -> flags += "WPA (TKIP) — obsolete encryption"
+            }
+            if (rawSsid.isEmpty()) flags += "Hidden network"
+            if (connectedSsid != null && ssidKey == connectedSsid && bssid != connectedBssid &&
+                connection != null && security != connection.security
+            ) flags += "Same name as your network, different security"
+            if (r.level >= -35) flags += "Very strong signal — transmitter within a few metres"
+            val age = runCatching { SystemClock.elapsedRealtime() - r.timestamp / 1000L }.getOrNull()
+            WifiNetwork(
+                ssid = rawSsid, bssid = bssid, rssi = r.level,
+                level = runCatching { wifi.calculateSignalLevel(r.level) }.getOrDefault(barsFor(r.level)),
+                frequencyMhz = r.frequency, channel = channelFor(r.frequency), band = bandFor(r.frequency),
+                security = security, standard = standardName(r.wifiStandard),
+                hidden = rawSsid.isEmpty(), flags = flags,
+                connected = bssid == connectedBssid,
+                ageMs = age?.takeIf { it >= 0 }
+            )
+        }.distinctBy { it.bssid }.sortedWith(compareByDescending<WifiNetwork> { it.connected }.thenByDescending { it.rssi })
+
+        return WifiStatus(
+            available = true, wifiEnabled = true, connection = connection,
+            nearby = nearby, scannedTs = now
+        )
+    }
+
+    /**
+     * The connected network. `WifiManager.getConnectionInfo` is deprecated, but the
+     * replacement — a NetworkCallback registered with FLAG_INCLUDE_LOCATION_INFO — is
+     * the only other way to see the SSID, and the snapshot is a one-shot read.
+     * Addressing comes from ConnectivityManager, which knows the actual link.
+     */
+    private fun connection(app: Context, wifi: WifiManager): WifiConnection? {
+        val cm = app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val networks = cm?.let { m -> runCatching { m.allNetworks.toList() }.getOrDefault(emptyList()) } ?: emptyList()
+        val wifiNet = networks.firstOrNull { n ->
+            cm?.getNetworkCapabilities(n)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        }
+        @Suppress("DEPRECATION")
+        val info: WifiInfo? = runCatching { wifi.connectionInfo }.getOrNull()
+        if (info == null || info.networkId == -1 && info.bssid == null) {
+            if (wifiNet == null) return null
+        }
+        val caps = wifiNet?.let { cm?.getNetworkCapabilities(it) }
+        val link: LinkProperties? = wifiNet?.let { cm?.getLinkProperties(it) }
+        val activeCaps = cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+        val vpn = networks.any { n -> cm?.getNetworkCapabilities(n)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true } ||
+            activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+
+        val ssid = info?.ssid?.trim()?.trim('"')?.takeIf { it.isNotEmpty() && it != WifiManager.UNKNOWN_SSID }
+        val bssid = info?.bssid?.takeIf { it.isNotBlank() && it != "02:00:00:00:00:00" && it != "00:00:00:00:00:00" }
+        val rssi = info?.rssi ?: -127
+        val freq = info?.frequency ?: 0
+        val security = info?.let { securityOf(it) } ?: WifiSecurity.UNKNOWN
+
+        val v4 = link?.linkAddresses?.firstOrNull { it.address is Inet4Address }?.let { "${it.address.hostAddress}/${it.prefixLength}" }
+        val v6 = link?.linkAddresses?.firstOrNull { it.address is Inet6Address && !it.address.isLinkLocalAddress }
+            ?.let { "${it.address.hostAddress?.substringBefore('%')}/${it.prefixLength}" }
+        val gateway = link?.routes?.firstOrNull { it.isDefaultRoute && it.gateway is Inet4Address }?.gateway?.hostAddress
+            ?: link?.routes?.firstOrNull { it.isDefaultRoute }?.gateway?.hostAddress
+        val dns = link?.dnsServers?.mapNotNull { it.hostAddress?.substringBefore('%') } ?: emptyList()
+        val privateDns = link?.takeIf { it.isPrivateDnsActive }?.let { it.privateDnsServerName ?: "Automatic (opportunistic DoT)" }
+
+        val flags = ArrayList<String>(3)
+        when (security) {
+            WifiSecurity.OPEN -> flags += "Unencrypted — anyone in range can read your traffic"
+            WifiSecurity.WEP -> flags += "WEP is broken; this network offers no real protection"
+            WifiSecurity.WPA -> flags += "WPA (TKIP) is obsolete and crackable"
+            else -> {}
+        }
+        if (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL) == true) flags += "Captive portal — a login page intercepts your traffic"
+        if (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == false) flags += "No confirmed internet access on this network"
+        if (dns.isNotEmpty() && gateway != null && dns.all { it == gateway } && privateDns == null) flags += "DNS is answered by the router itself — it sees every site you look up"
+        if (dns.any { it in SUSPICIOUS_DNS }) flags += "DNS points at an unusual resolver"
+
+        return WifiConnection(
+            ssid = ssid, bssid = bssid?.lowercase(), rssi = rssi,
+            level = runCatching { wifi.calculateSignalLevel(rssi) }.getOrDefault(barsFor(rssi)),
+            frequencyMhz = freq, channel = channelFor(freq), band = bandFor(freq),
+            security = security,
+            standard = info?.let { standardName(it.wifiStandard) },
+            linkSpeedMbps = info?.linkSpeed?.takeIf { it > 0 },
+            txMbps = info?.txLinkSpeedMbps?.takeIf { it > 0 },
+            rxMbps = info?.rxLinkSpeedMbps?.takeIf { it > 0 },
+            ipv4 = v4, ipv6 = v6, gateway = gateway, dnsServers = dns,
+            privateDns = privateDns, vpnActive = vpn,
+            captivePortal = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL) == true,
+            metered = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false,
+            flags = flags
+        )
+    }
+
+    /** Resolvers that are not a router, a carrier or one of the well-known public services. */
+    private val SUSPICIOUS_DNS = setOf("0.0.0.0", "127.0.0.1")
+
+    /** Security from a scan result's capability string, e.g. `[WPA2-PSK-CCMP][RSN-SAE-CCMP][ESS]`. */
+    fun securityOf(caps: String?): WifiSecurity {
+        val c = caps?.uppercase() ?: return WifiSecurity.UNKNOWN
+        val sae = c.contains("SAE")
+        val psk = c.contains("PSK")
+        val eap = c.contains("EAP")
+        val suiteB = c.contains("SUITE_B_192") || c.contains("EAP_SUITE_B")
+        return when {
+            c.contains("PASSPOINT") -> WifiSecurity.PASSPOINT
+            suiteB -> WifiSecurity.WPA3_ENTERPRISE
+            eap -> WifiSecurity.WPA2_ENTERPRISE
+            sae && psk -> WifiSecurity.WPA2_WPA3
+            sae -> WifiSecurity.WPA3
+            c.contains("WPA2") || (c.contains("RSN") && psk) -> WifiSecurity.WPA2
+            c.contains("WPA") && psk -> WifiSecurity.WPA
+            c.contains("WEP") -> WifiSecurity.WEP
+            c.contains("OWE") -> WifiSecurity.OWE
+            c.contains("WAPI") -> WifiSecurity.WPA2
+            else -> WifiSecurity.OPEN
+        }
+    }
+
+    private fun securityOf(info: WifiInfo): WifiSecurity {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return WifiSecurity.UNKNOWN
+        return when (info.currentSecurityType) {
+            WifiInfo.SECURITY_TYPE_OPEN -> WifiSecurity.OPEN
+            WifiInfo.SECURITY_TYPE_OWE -> WifiSecurity.OWE
+            WifiInfo.SECURITY_TYPE_WEP -> WifiSecurity.WEP
+            WifiInfo.SECURITY_TYPE_PSK -> WifiSecurity.WPA2
+            WifiInfo.SECURITY_TYPE_SAE -> WifiSecurity.WPA3
+            WifiInfo.SECURITY_TYPE_EAP -> WifiSecurity.WPA2_ENTERPRISE
+            WifiInfo.SECURITY_TYPE_EAP_WPA3_ENTERPRISE,
+            WifiInfo.SECURITY_TYPE_EAP_WPA3_ENTERPRISE_192_BIT -> WifiSecurity.WPA3_ENTERPRISE
+            WifiInfo.SECURITY_TYPE_PASSPOINT_R1_R2, WifiInfo.SECURITY_TYPE_PASSPOINT_R3 -> WifiSecurity.PASSPOINT
+            WifiInfo.SECURITY_TYPE_WAPI_PSK, WifiInfo.SECURITY_TYPE_WAPI_CERT -> WifiSecurity.WPA2
+            else -> WifiSecurity.UNKNOWN
+        }
+    }
+
+    fun bandFor(mhz: Int): String = when {
+        mhz <= 0 -> "—"
+        mhz < 3000 -> "2.4 GHz"
+        mhz < 5925 -> "5 GHz"
+        mhz < 7125 -> "6 GHz"
+        else -> "60 GHz"
+    }
+
+    fun channelFor(mhz: Int): Int? = when {
+        mhz == 2484 -> 14
+        mhz in 2412..2472 -> (mhz - 2407) / 5
+        mhz in 5170..5895 -> (mhz - 5000) / 5
+        mhz in 5955..7115 -> (mhz - 5950) / 5
+        else -> null
+    }
+
+    private fun standardName(standard: Int): String? = when (standard) {
+        ScanResult.WIFI_STANDARD_LEGACY -> "802.11a/b/g"
+        ScanResult.WIFI_STANDARD_11N -> "Wi-Fi 4 (802.11n)"
+        ScanResult.WIFI_STANDARD_11AC -> "Wi-Fi 5 (802.11ac)"
+        ScanResult.WIFI_STANDARD_11AX -> "Wi-Fi 6 (802.11ax)"
+        ScanResult.WIFI_STANDARD_11AD -> "WiGig (802.11ad)"
+        7 -> "Wi-Fi 7 (802.11be)"
+        else -> null
+    }
+
+    private fun barsFor(rssi: Int): Int = when {
+        rssi >= -55 -> 4
+        rssi >= -66 -> 3
+        rssi >= -77 -> 2
+        rssi >= -88 -> 1
+        else -> 0
     }
 
     /**

@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.os.Bundle
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -71,11 +72,14 @@ import android.graphics.drawable.BitmapDrawable
 import androidx.compose.ui.viewinterop.AndroidView
 import com.xat.aegis.CatcherFinding
 import com.xat.aegis.analysis.CardVault
+import com.xat.aegis.analysis.CellMonitor
 import com.xat.aegis.analysis.NfcScanner
+import com.xat.aegis.analysis.WifiScanner
 import com.xat.aegis.security.AppLock
 import com.xat.aegis.security.LockScreen
 import com.xat.aegis.analysis.PhoneHealthMonitor
 import com.xat.aegis.analysis.Report
+import com.xat.aegis.detect.BleNames
 import com.xat.aegis.comms.CallManager
 import com.xat.aegis.comms.CallPhase
 import com.xat.aegis.comms.CommsNotifications
@@ -175,6 +179,14 @@ class MainActivity : AppCompatActivity() {
      */
     private val phoneHealthMonitor by lazy { PhoneHealthMonitor(applicationContext) }
 
+    /**
+     * The Cell and WIFI tabs used to be blank until the scanner service had run: the
+     * modem and the Wi-Fi radio are readable from the Activity just as well, so both
+     * tabs now take their own reading while they are on screen. Only the IMSI-catcher
+     * judgement needs the service, because that owns the baseline on disk.
+     */
+    private val cellMonitor by lazy { CellMonitor(applicationContext) }
+
     /** Whether reader mode is currently enabled on the adapter by this activity. */
     private var readerModeOn = false
 
@@ -191,6 +203,15 @@ class MainActivity : AppCompatActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         AppSettings.load(this)
         AppLock.init(this)
+        // With a passcode set, what was on screen must not outlive the lock in the
+        // Recents thumbnail (taken as the app leaves, before the relock delay is
+        // up) or in a screenshot taken by another app.
+        lifecycleScope.launch {
+            AppLock.enabled.collect { on ->
+                if (on) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            }
+        }
         Registry.bindTrustStore(this)
         nfcAdapter = runCatching { NfcAdapter.getDefaultAdapter(this) }.getOrNull()
         cardEmulation = nfcAdapter?.let { runCatching { CardEmulation.getInstance(it) }.getOrNull() }
@@ -266,7 +287,9 @@ class MainActivity : AppCompatActivity() {
                             onUnlockVault = { unlockVault() },
                             onLockVault = { Registry.lockVault() },
                             onEraseVault = { eraseVault() },
-                            onRefreshDeviceHealth = { refreshDeviceHealth() }
+                            onRefreshDeviceHealth = { refreshDeviceHealth() },
+                            onRefreshCell = { refreshCell() },
+                            onRefreshWifi = { refreshWifi() }
                         )
                     }
                 }
@@ -383,6 +406,54 @@ class MainActivity : AppCompatActivity() {
     /** Runs the static findings scan off the main thread and publishes the result. */
     private fun refreshDeviceHealth() {
         lifecycleScope.launch(Dispatchers.IO) { runCatching { phoneHealthMonitor.scanAndPublish() } }
+    }
+
+    /**
+     * Reads the serving cell for the Cell tab while the scanner is off. While it is
+     * on, the service publishes every 15 s with the heuristics applied, and this
+     * must not overwrite that with a reading nothing has judged.
+     */
+    private fun refreshCell() {
+        if (Registry.status.value.scanning) return
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching {
+                val reason = cellMonitor.unavailableReason()
+                val radio = runCatching { cellMonitor.radioInfo() }.getOrNull()
+                if (reason != null) {
+                    Registry.publishCell(CellStatus(available = false, reason = reason, radio = radio))
+                    return@launch
+                }
+                val snapshot = cellMonitor.sampleFull()
+                if (Registry.status.value.scanning) return@launch
+                if (snapshot == null) {
+                    Registry.publishCell(
+                        CellStatus(
+                            available = false, radio = radio,
+                            reason = "The modem has not reported a serving cell yet"
+                        )
+                    )
+                } else {
+                    Registry.publishCell(
+                        CellStatus(
+                            available = true, cell = snapshot.cell, radio = radio,
+                            neighbors = snapshot.neighbors, analysing = false
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    /** Reads the connected network and the scan cache for the WIFI tab. */
+    private fun refreshWifi() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching {
+                WifiScanner.requestScan(applicationContext)
+                Registry.publishWifiStatus(WifiScanner.snapshot(applicationContext))
+                // The judgement on what is in range is cheap and service-free too.
+                if (!Registry.status.value.scanning) Registry.publishWifi(WifiScanner.scan(applicationContext))
+            }
+        }
     }
 
     override fun onStop() {
@@ -984,7 +1055,9 @@ private fun MainApp(
     onUnlockVault: () -> Unit,
     onLockVault: () -> Unit,
     onEraseVault: () -> Unit,
-    onRefreshDeviceHealth: () -> Unit
+    onRefreshDeviceHealth: () -> Unit,
+    onRefreshCell: () -> Unit,
+    onRefreshWifi: () -> Unit
 ) {
     var tab by remember { mutableIntStateOf(0) }
     val tabs = listOf("SCAN", "MAP", "LOG", "CELL", "NFC", "WIFI", "DEVICE", "COMMS")
@@ -1035,9 +1108,9 @@ private fun MainApp(
         followingLive,
         followingLive && detections.any { it.following && it.points.isNotEmpty() },
         false,
-        cell.available && cell.level.ordinal >= Threat.HIGH.ordinal,
+        cell.available && cell.analysing && cell.level.ordinal >= Threat.HIGH.ordinal,
         nfc.any { it.suspicious },
-        wifi.isNotEmpty(),
+        wifi.any { it.threat.ordinal >= Threat.HIGH.ordinal },
         phoneHealth.level.ordinal >= Threat.HIGH.ordinal,
         unreadMessages > 0
     )
@@ -1053,7 +1126,8 @@ private fun MainApp(
                 1 -> MapScreen()
                 2 -> TimelineScreen()
                 3 -> CellScreen(
-                    onShowExplainer = { f -> explainerTarget = ExplainerTarget.CellIndicator(f) }
+                    onShowExplainer = { f -> explainerTarget = ExplainerTarget.CellIndicator(f) },
+                    onShown = onRefreshCell
                 )
                 4 -> NfcScreen(
                     onAddToVault = onAddToVault,
@@ -1063,7 +1137,7 @@ private fun MainApp(
                     onLockVault = onLockVault,
                     onEraseVault = onEraseVault
                 )
-                5 -> WifiScreen()
+                5 -> WifiScreen(onShown = onRefreshWifi)
                 TAB_DEVICE -> DeviceScreen(onShown = onRefreshDeviceHealth)
                 TAB_COMMS -> CommsScreen(
                     openPeer = threadRequest,
@@ -1469,7 +1543,10 @@ private fun RssiBar(rssi: Int) {
         Box(Modifier.width(48.dp).height(5.dp).background(Rule, RoundedCornerShape(2.dp))) {
             Box(Modifier.fillMaxWidth(strength).fillMaxHeight().background(color, RoundedCornerShape(2.dp)))
         }
-        Text(fmtDbm(rssi), color = color, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+        Text(
+            "${fmtDbm(rssi)} · ${BleNames.signalLabel(rssi)}",
+            color = color, fontSize = 11.sp, fontFamily = FontFamily.Monospace, maxLines = 1
+        )
     }
 }
 
@@ -1512,9 +1589,14 @@ private fun DetectionRow(
 
             val t = d.tracker
             if (t != null) {
+                // A signature match is the strongest identification there is; the
+                // manufacturer/service line would only repeat "Apple".
                 Text("${t.label} · ${t.brand}", color = if (trusted) Muted else Accent, fontSize = 12.sp)
             } else {
-                Text("Unidentified BLE device", color = Muted, fontSize = 12.sp)
+                Text(
+                    d.summary, color = Muted, fontSize = 12.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
             }
 
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -1570,6 +1652,21 @@ private fun DetectionDetail(d: Detection, trusted: Boolean, onShowExplainer: (()
             )
         }
 
+        // ── Identification ──
+        // What the radio itself says, resolved through the Bluetooth SIG assigned numbers.
+        SectionLabel("IDENTIFICATION")
+        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            KvRow("Advertised name", d.advertisedName ?: "none broadcast", if (d.advertisedName != null) Ink else Muted)
+            KvRow("Manufacturer", d.manufacturer ?: "not advertised", if (d.manufacturer != null) InkDim else Muted)
+            KvRow("Radio", d.radio)
+            KvRow(
+                "Services",
+                if (d.services.isEmpty()) "none advertised" else d.services.joinToString(" / "),
+                if (d.services.isEmpty()) Muted else InkDim
+            )
+            KvRow("Address", BleNames.formatMac(d.address) + (d.addressKind?.let { " · $it" } ?: ""))
+        }
+
         // ── Observation ──
         SectionLabel("OBSERVATION")
         Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -1582,9 +1679,8 @@ private fun DetectionDetail(d: Detection, trusted: Boolean, onShowExplainer: (()
                 else "${d.sightings} (no location data)"
             )
             KvRow("Est. distance", d.approxMetres?.let { fmtMetres(it) } ?: "unknown")
-            KvRow("Signal", fmtDbm(d.rssi))
+            KvRow("Signal strength", "${fmtDbm(d.rssi)} · ${BleNames.signalLabel(d.rssi)}")
             KvRow("Displacement", "Observed ${d.displacementM.roundToInt()} metres apart")
-            KvRow("Address", d.address)
             KvRow(
                 "MAC rotation",
                 if (d.rotations > 0) "MAC rotated ${d.rotations}× · ${plural(d.addresses, "address").replace("addresss", "addresses")} seen"
@@ -1665,9 +1761,10 @@ private fun DetectionDetail(d: Detection, trusted: Boolean, onShowExplainer: (()
 private data class MarkerKey(val argbFill: Int, val sizeDp: Int, val outline: Boolean)
 
 /**
- * Marker icons by (colour, size, outline). The map redraws every 1.5 s and used to
- * allocate a fresh bitmap for every marker each time; there are only a handful of
- * distinct icons, so they are drawn once and shared.
+ * Marker icons by (colour, size, outline). The overlays are rebuilt whenever a fix
+ * or a device position changes and used to allocate a fresh bitmap for every marker
+ * each time; there are only a handful of distinct icons, so they are drawn once and
+ * shared.
  *
  * Touched only from the main thread (composition and effects).
  */
@@ -1703,6 +1800,35 @@ private fun threatArgb(threat: Threat, following: Boolean): Int = when {
     else -> 0xFF4A8FD4.toInt()
 }
 
+/** Keep a downloaded tile this long past whatever the tile server's headers allow. */
+private const val TILE_EXTRA_LIFETIME_MS = 7L * 24 * 60 * 60 * 1000
+
+private var osmConfigured = false
+
+/**
+ * osmdroid's global configuration, applied once per process rather than on every
+ * visit to the Map tab.
+ *
+ * The important part is the tile lifetime. osmdroid re-requests any tile that is
+ * past its expiry on every single draw of the map, and the OSM tile server hands
+ * out Cache-Control lifetimes as short as fifteen minutes. Left at the default,
+ * a map that had been open for a while re-downloaded its whole viewport each time
+ * it was redrawn. Extending every tile's lifetime by a week keeps the map on the
+ * disk cache for the areas the user actually moves through. This respects the
+ * server's own headers as a minimum, as the OSM tile usage policy asks.
+ *
+ * Main thread only (called from composition).
+ */
+private fun configureOsm(context: android.content.Context) {
+    if (osmConfigured) return
+    osmConfigured = true
+    with(OsmConfig.getInstance()) {
+        load(context, context.getSharedPreferences("osmdroid", android.content.Context.MODE_PRIVATE))
+        userAgentValue = "Aegis/${BuildConfig.VERSION_NAME}"
+        expirationExtendedDuration = TILE_EXTRA_LIFETIME_MS
+    }
+}
+
 @Composable
 private fun MapScreen() {
     val mapData by Registry.map.collectAsStateWithLifecycle()
@@ -1714,13 +1840,14 @@ private fun MapScreen() {
     val followingTrails = mapData.devices.count { it.following }
 
     val mapView = remember {
-        OsmConfig.getInstance().load(
-            context,
-            context.getSharedPreferences("osmdroid", android.content.Context.MODE_PRIVATE)
-        )
-        OsmConfig.getInstance().userAgentValue = "Aegis/${BuildConfig.VERSION_NAME}"
+        configureOsm(context)
         MapView(context).apply {
             setTileSource(TileSourceFactory.MAPNIK)
+            // Tiles are 256 px; drawn unscaled, a phone screen at zoom 17 is around
+            // fifty of them, and every pan, zoom or visit to this tab fetched that
+            // many. Scaled to the display density it is a dozen or so, and the map
+            // labels become legible at arm's length.
+            setTilesScaledToDpi(true)
             setMultiTouchControls(true)
             controller.setZoom(17.0)
             isFlingEnabled = true

@@ -56,6 +56,14 @@ object Registry {
     val wifi: StateFlow<List<WifiAnomaly>> = _wifi.asStateFlow()
     fun publishWifi(anomalies: List<WifiAnomaly>) { _wifi.value = anomalies }
 
+    /** The connected network and everything in range — what the WIFI tab shows. */
+    private val _wifiStatus = MutableStateFlow(WifiStatus())
+    val wifiStatus: StateFlow<WifiStatus> = _wifiStatus.asStateFlow()
+    fun publishWifiStatus(status: WifiStatus) { _wifiStatus.value = status }
+
+    /** Read-modify-write of the cell status; the service and the activity both write it. */
+    fun updateCell(block: (CellStatus) -> CellStatus) { _cell.update(block) }
+
     // --- Trusted devices -----------------------------------------------------
     //
     // Keyed on the Bluetooth address, which is what the scanner has in hand when it
@@ -170,5 +178,6 @@ object Registry {
         _status.value = ScanStatus()
         _cell.value = CellStatus()
         _map.value = MapData()
+        _wifiStatus.value = WifiStatus()
     }
 }

@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.os.SystemClock
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import com.xat.aegis.Registry
@@ -14,6 +15,7 @@ import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.ProviderException
 import java.security.SecureRandom
+import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.Mac
 import javax.crypto.SecretKey
@@ -31,14 +33,26 @@ import javax.crypto.SecretKey
  *
  * Every attempt is counted on disk *before* it is checked, with a synchronous
  * commit, so killing the app between a wrong guess and its bookkeeping cannot
- * give an attempt back. Reaching the owner's limit, or entering the duress
- * passcode, starts [Wiper]; nothing on screen says which happened, or that a
- * limit exists at all. With the wipe switched off, repeated failures are slowed
- * by an escalating lockout instead.
+ * give an attempt back; and a counter found already at the limit (an attempt
+ * that was counted but whose verdict never landed) wipes before anything is
+ * checked, so the kill cannot buy a further guess either. Reaching the owner's
+ * limit, or entering the duress passcode, starts [Wiper]; nothing on screen
+ * says which happened, or that a limit exists at all. With the wipe switched
+ * off, repeated failures are slowed by an escalating lockout instead, timed on
+ * the monotonic clock so that changing the date cannot shorten it.
  *
  * A verifier without its Keystore key cannot come from this app on this phone
  * (restored files, or someone deleting the key to get round the lock), so it
  * is treated as tampering and wipes as well.
+ *
+ * Biometric unlock is not a bare prompt: it decrypts with a Keystore key that
+ * demands a strong biometric per use and that Android destroys when a
+ * fingerprint or face is added ([KeyGenParameterSpec.Builder.setInvalidatedByBiometricEnrollment]).
+ * A newly enrolled finger therefore cannot open Aegis; the passcode is needed,
+ * and biometric unlock has to be switched on again from Settings.
+ *
+ * What none of this defends against is root or a debuggable build: whoever can
+ * edit the app's private files can zero the counter or delete the verifier.
  */
 object AppLock {
 
@@ -59,6 +73,8 @@ object AppLock {
     val RELOCK_CHOICES = listOf(0L, 30_000L, 60_000L, 5 * 60_000L)
 
     internal const val KEY_ALIAS = "aegis_applock_v1"
+    /** AES key that only a strong biometric can use, and that a new enrolment destroys. */
+    internal const val BIOMETRIC_KEY_ALIAS = "aegis_applock_bio_v1"
     internal const val PREFS_NAME = "app_lock"
 
     private const val K_SALT = "salt"
@@ -66,13 +82,16 @@ object AppLock {
     private const val K_DURESS_SALT = "duress_salt"
     private const val K_DURESS_VERIFIER = "duress_verifier"
     private const val K_FAILED = "failed"
-    private const val K_LAST_FAIL = "last_fail_at"
+    /** [SystemClock.elapsedRealtime] of the last wrong guess: monotonic, so the date cannot be moved to get past it. */
+    private const val K_LAST_FAIL = "last_fail_elapsed"
     private const val K_WIPE_AFTER = "wipe_after"
     private const val K_RELOCK_MS = "relock_ms"
     private const val K_BIOMETRIC = "biometric_enabled"
 
     private const val SALT_LEN = 16
     private val DOMAIN = "aegis-applock-v1".toByteArray(Charsets.UTF_8)
+    /** Compared against when no duress verifier exists, so that check costs the same either way. */
+    private val NO_VERIFIER = ByteArray(32)
 
     /** With the wipe off: wrong guesses allowed before the lockout starts, and how it grows. */
     private const val FREE_ATTEMPTS = 5
@@ -135,19 +154,91 @@ object AppLock {
     fun isBiometricEnabled(context: Context): Boolean =
         runCatching { prefs(context).getBoolean(K_BIOMETRIC, false) }.getOrDefault(false)
 
-    fun setBiometricEnabled(context: Context, enabled: Boolean) {
-        prefs(context).edit().putBoolean(K_BIOMETRIC, enabled).commit()
-        _biometricEnabled.value = enabled && _enabled.value
+    /**
+     * Switches biometric unlock on or off. Turning it on makes a fresh Keystore
+     * key bound to the biometrics enrolled right now; it fails (false) when the
+     * lock is off or the phone has no strong biometric enrolled. Blocking.
+     */
+    fun setBiometricEnabled(context: Context, enabled: Boolean): Boolean {
+        synchronized(attemptLock) {
+            val p = prefs(context)
+            if (!enabled || !p.contains(K_VERIFIER)) {
+                deleteBiometricKey()
+                p.edit().putBoolean(K_BIOMETRIC, false).commit()
+                _biometricEnabled.value = false
+                return !enabled
+            }
+            val made = runCatching { createBiometricKey() }.isSuccess
+            if (!made) {
+                deleteBiometricKey()
+                p.edit().putBoolean(K_BIOMETRIC, false).commit()
+                _biometricEnabled.value = false
+                return false
+            }
+            p.edit().putBoolean(K_BIOMETRIC, true).commit()
+            _biometricEnabled.value = true
+            return true
+        }
+    }
+
+    /** What the lock screen gets when it asks to show the biometric prompt. */
+    sealed interface BiometricGate {
+        /** Hand [cipher] to the prompt as its CryptoObject; only an authenticated biometric can complete it. */
+        class Ready(val cipher: Cipher) : BiometricGate
+        /** A biometric was added or the key is gone: biometric unlock has just been switched off. */
+        data object Invalidated : BiometricGate
+        /** Biometric unlock is off, or the Keystore is not answering; use the passcode. */
+        data object Unavailable : BiometricGate
     }
 
     /**
-     * Unlocks the app after a successful biometric authentication.
-     * Does not touch the attempt counter; the OS biometric stack is
-     * responsible for ratelimiting and lockout on the sensor side.
+     * Prepares the biometric unlock: an encrypt operation under the enrolment-bound
+     * key that the BiometricPrompt has to authorise. Blocking (Keystore work).
      */
-    fun unlockWithBiometric() {
-        if (Wiper.isActive) return
+    fun biometricGate(context: Context): BiometricGate {
+        if (Wiper.isActive || !_biometricEnabled.value) return BiometricGate.Unavailable
+        val key = try {
+            (keyStore().getEntry(BIOMETRIC_KEY_ALIAS, null) as? KeyStore.SecretKeyEntry)?.secretKey
+        } catch (e: Exception) {
+            return BiometricGate.Unavailable
+        }
+        if (key == null) {
+            // The key does not survive a new enrolment on some devices; nor a Keystore reset.
+            revokeBiometric(context)
+            return BiometricGate.Invalidated
+        }
+        return try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, key)
+            BiometricGate.Ready(cipher)
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            revokeBiometric(context)
+            BiometricGate.Invalidated
+        } catch (e: Exception) {
+            BiometricGate.Unavailable
+        }
+    }
+
+    /**
+     * Unlocks the app after the BiometricPrompt authorised [cipher]: the proof is
+     * that the operation the Keystore refused before now completes. A success
+     * callback without a usable cipher opens nothing. Does not touch the attempt
+     * counter; the sensor's own lockout paces biometric tries.
+     */
+    fun unlockWithBiometric(cipher: Cipher?): Boolean {
+        if (Wiper.isActive || !_biometricEnabled.value || cipher == null) return false
+        val proven = runCatching { cipher.doFinal(ByteArray(16)); true }.getOrDefault(false)
+        if (!proven) return false
         _locked.value = false
+        return true
+    }
+
+    private fun revokeBiometric(context: Context) {
+        synchronized(attemptLock) {
+            deleteBiometricKey()
+            prefs(context).edit().putBoolean(K_BIOMETRIC, false).commit()
+            _biometricEnabled.value = false
+        }
     }
 
     fun wipeAfter(context: Context): Int = prefs(context).getInt(K_WIPE_AFTER, DEFAULT_WIPE_AFTER)
@@ -219,7 +310,15 @@ object AppLock {
         }
         val wipeAfter = p.getInt(K_WIPE_AFTER, DEFAULT_WIPE_AFTER)
         val failed = p.getInt(K_FAILED, 0)
+        val lastFail = p.getLong(K_LAST_FAIL, 0L)
 
+        if (wipeAfter > 0 && failed >= wipeAfter) {
+            // The counter reached the limit on an attempt whose verdict never
+            // landed (the process was killed mid-check). Killing the app is not a
+            // way to keep guessing: the wipe the limit called for happens now.
+            Wiper.start(context)
+            return Verdict.Wiping
+        }
         if (wipeAfter == 0) {
             val remaining = lockoutRemaining(p, failed)
             if (remaining > 0L) return Verdict.LockedOut(remaining)
@@ -229,14 +328,14 @@ object AppLock {
         // mid-check has still spent the attempt.
         val counted = p.edit()
             .putInt(K_FAILED, failed + 1)
-            .putLong(K_LAST_FAIL, System.currentTimeMillis())
+            .putLong(K_LAST_FAIL, SystemClock.elapsedRealtime())
             .commit()
         if (!counted) return Verdict.Unavailable("Could not record the attempt")
 
         val key = try {
             existingKey()
         } catch (e: Exception) {
-            p.edit().putInt(K_FAILED, failed).commit()
+            giveBack(p, failed, lastFail)
             return Verdict.Unavailable("The Keystore is not responding")
         }
         if (key == null) {
@@ -250,15 +349,17 @@ object AppLock {
             val main = MessageDigest.isEqual(mac(key, salt, input), verifier)
             val duressSalt = p.bytes(K_DURESS_SALT)
             val duressVerifier = p.bytes(K_DURESS_VERIFIER)
-            // The same Keystore work whether or not a duress code is set, so the
-            // time a check takes does not tell anyone that one exists.
+            // The same Keystore work and the same comparison whether or not a
+            // duress code is set, so the time a check takes does not tell anyone
+            // that one exists. MessageDigest.isEqual is constant-time for equal
+            // lengths, and every verifier here is 32 bytes.
             val duressMac = mac(key, duressSalt ?: salt, input)
-            val duress = duressSalt != null && duressVerifier != null &&
-                MessageDigest.isEqual(duressMac, duressVerifier)
+            val duressMatches = MessageDigest.isEqual(duressMac, duressVerifier ?: NO_VERIFIER)
+            val duress = duressSalt != null && duressVerifier != null && duressMatches
             main to duress
         } catch (e: Exception) {
             // A Keystore failure is not a wrong guess; give the attempt back.
-            p.edit().putInt(K_FAILED, failed).commit()
+            giveBack(p, failed, lastFail)
             return Verdict.Unavailable("The Keystore could not check the passcode")
         } finally {
             input.fill(0)
@@ -282,15 +383,28 @@ object AppLock {
         }
     }
 
-    /** With the wipe off: how long the lock refuses attempts after [failed] wrong ones. */
+    /** The Keystore, not the guess, failed: the pre-counted attempt is returned. */
+    private fun giveBack(p: SharedPreferences, failed: Int, lastFail: Long) {
+        val edit = p.edit().putInt(K_FAILED, failed)
+        if (lastFail == 0L) edit.remove(K_LAST_FAIL) else edit.putLong(K_LAST_FAIL, lastFail)
+        edit.commit()
+    }
+
+    /**
+     * With the wipe off: how long the lock refuses attempts after [failed] wrong
+     * ones. Timed on [SystemClock.elapsedRealtime], which the owner cannot set:
+     * moving the date forward does nothing. That clock restarts at boot, so a
+     * timestamp from before a reboot reads as being in the future; the lockout
+     * then starts again in full. A reboot therefore never shortens it, and
+     * never lengthens it beyond one full period either.
+     */
     private fun lockoutRemaining(p: SharedPreferences, failed: Int): Long {
         if (failed < FREE_ATTEMPTS) return 0L
         val steps = (failed - FREE_ATTEMPTS).coerceAtMost(20)
         val duration = (LOCKOUT_BASE_MS shl steps).coerceAtMost(LOCKOUT_MAX_MS)
         val last = p.getLong(K_LAST_FAIL, 0L)
-        val now = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
         if (now < last) {
-            // The clock was set back to get round the lockout; it starts again from now.
             p.edit().putLong(K_LAST_FAIL, now).commit()
             return duration
         }
@@ -385,6 +499,7 @@ object AppLock {
                 val ks = keyStore()
                 if (ks.containsAlias(KEY_ALIAS)) ks.deleteEntry(KEY_ALIAS)
             }
+            deleteBiometricKey()
             _enabled.value = false
             _locked.value = false
             _biometricEnabled.value = false
@@ -417,6 +532,35 @@ object AppLock {
             generate(strongBox = true)
         } catch (e: ProviderException) {
             generate(strongBox = false)
+        }
+    }
+
+    /**
+     * A fresh key for biometric unlock, bound to the biometrics enrolled at this
+     * moment: usable once per strong-biometric authentication, and permanently
+     * invalidated by Android as soon as another fingerprint or face is enrolled.
+     * Throws when the phone has no strong biometric enrolled.
+     */
+    private fun createBiometricKey() {
+        deleteBiometricKey()
+        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        generator.init(
+            KeyGenParameterSpec.Builder(BIOMETRIC_KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
+                .setUserAuthenticationRequired(true)
+                .setUserAuthenticationParameters(0, KeyProperties.AUTH_BIOMETRIC_STRONG)
+                .setInvalidatedByBiometricEnrollment(true)
+                .build()
+        )
+        generator.generateKey()
+    }
+
+    private fun deleteBiometricKey() {
+        runCatching {
+            val ks = keyStore()
+            if (ks.containsAlias(BIOMETRIC_KEY_ALIAS)) ks.deleteEntry(BIOMETRIC_KEY_ALIAS)
         }
     }
 

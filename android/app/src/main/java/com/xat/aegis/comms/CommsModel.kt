@@ -41,13 +41,23 @@ data class ChatMessage(
     val direction: Direction,
     val body: String,
     val ts: Long,
-    /** OUT: queued | sent | delivered | read | failed. IN: received. */
+    /** OUT: queued | sent | delivered | read | failed. IN: received (media: receiving until every chunk is in). */
     val status: String,
     val read: Boolean,
-    val error: String? = null
+    val error: String? = null,
+    /** [KIND_TEXT] or [KIND_MEDIA]; a media message's body is [MediaBody] JSON and its bytes live in [CommsMedia]. */
+    val kind: String = KIND_TEXT
 ) {
     val failed: Boolean get() = status == "failed"
+    val isMedia: Boolean get() = kind == KIND_MEDIA
 }
+
+/** [ChatMessage.kind] of an ordinary text message. */
+const val KIND_TEXT = "text"
+/** [ChatMessage.kind] of a photo or video; see [MediaBody]. */
+const val KIND_MEDIA = "media"
+/** Status of an inbound media message whose chunks are still arriving. */
+const val STATUS_RECEIVING = "receiving"
 
 /** Status value of a [ChatMessage] that records a call in the conversation. */
 const val STATUS_CALL = "call"
@@ -55,6 +65,12 @@ const val STATUS_CALL = "call"
 const val STATUS_PAYMENT = "payment"
 /** Status value of a [ChatMessage] that carries a voicemail; its body is [VoicemailBody] JSON. */
 const val STATUS_VOICEMAIL = "voicemail"
+/**
+ * Statuses that mark what a message *is* rather than how far it got. A delivery
+ * receipt must never replace one of these, or the message loses its meaning
+ * (a voicemail bubble would turn into a wall of base64 text).
+ */
+val TYPE_STATUSES = setOf(STATUS_CALL, STATUS_PAYMENT, STATUS_VOICEMAIL)
 
 /** The ticker every relay's coin community uses. */
 const val COIN_SYMBOL = "AC"
@@ -86,18 +102,63 @@ data class VoicemailBody(val audioB64: String, val durationMs: Long) {
     }
 }
 
+/**
+ * What a [KIND_MEDIA] message's body holds: everything about the photo or video
+ * except its bytes, which are too big for a database row and live encrypted in
+ * a file under the message id (see [CommsMedia]). [thumbB64] is a small JPEG
+ * that travels in the first envelope, so the recipient sees what is coming
+ * while the chunks arrive.
+ */
+data class MediaBody(
+    /** image/jpeg or video/mp4 (whatever the picker handed over, for videos). */
+    val mime: String,
+    val width: Int,
+    val height: Int,
+    /** Video length; 0 for a photo. */
+    val durationMs: Long,
+    /** Bytes of the full file. */
+    val size: Long,
+    /** Envelopes the file is split into. */
+    val chunks: Int,
+    val caption: String,
+    val thumbB64: String
+) {
+    val isVideo: Boolean get() = mime.startsWith("video/")
+
+    fun encode(): String = org.json.JSONObject()
+        .put("mime", mime).put("w", width).put("h", height).put("dur", durationMs)
+        .put("size", size).put("n", chunks).put("cap", caption).put("thumb", thumbB64).toString()
+
+    companion object {
+        fun decode(body: String): MediaBody? = runCatching {
+            val o = org.json.JSONObject(body)
+            val mime = o.optString("mime").takeIf { it.isNotBlank() } ?: return null
+            MediaBody(
+                mime, o.optInt("w", 0), o.optInt("h", 0), o.optLong("dur", 0L), o.optLong("size", 0L),
+                o.optInt("n", 0), o.optString("cap", ""), o.optString("thumb", "")
+            )
+        }.getOrNull()
+    }
+}
+
 /** "0:07" for seven seconds. */
 fun durationLabel(ms: Long): String {
     val s = (ms / 1000L).coerceAtLeast(0L)
     return "${s / 60}:${(s % 60).toString().padStart(2, '0')}"
 }
 
+/** "Photo", "Video · 0:12", with the caption after it when there is one. */
+fun MediaBody.label(): String =
+    (if (isVideo) "Video · ${durationLabel(durationMs)}" else "Photo") + (if (caption.isNotBlank()) " · $caption" else "")
+
 /**
  * A message's body as a line of text: what the notification and the
- * conversation list show. A voicemail's body is audio, not text.
+ * conversation list show. A voicemail's body is audio, and a media message's
+ * body is metadata, not text.
  */
-fun ChatMessage.preview(): String = when (status) {
-    STATUS_VOICEMAIL -> "Voicemail · " + durationLabel(VoicemailBody.decode(body)?.durationMs ?: 0L)
+fun ChatMessage.preview(): String = when {
+    isMedia -> MediaBody.decode(body)?.label() ?: "Photo"
+    status == STATUS_VOICEMAIL -> "Voicemail · " + durationLabel(VoicemailBody.decode(body)?.durationMs ?: 0L)
     else -> body
 }
 

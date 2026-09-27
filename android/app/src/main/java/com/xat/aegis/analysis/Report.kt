@@ -72,7 +72,11 @@ object Report {
         for (d in detections) {
             appendLine()
             appendLine("  ${d.name}")
-            appendLine("    Address : ${d.address}")
+            appendLine("    Address : ${d.address}${d.addressKind?.let { " ($it)" } ?: ""}")
+            appendLine("    Maker   : ${d.manufacturer ?: "not advertised"}  Radio: ${d.radio}")
+            if (d.advertisedName != null) appendLine("    Adv name: ${d.advertisedName}")
+            if (d.services.isNotEmpty()) appendLine("    Services: ${d.services.joinToString(" / ")}")
+            appendLine("    Signal  : ${d.rssi} dBm")
             appendLine("    Status  : ${if (d.following) "*** CONFIRMED FOLLOWING ***" else if (d.persistent) "Persistent" else "Brief"}")
             appendLine("    Threat  : ${d.threat}  Score: ${d.score}")
             appendLine("    Sightings: ${d.sightings}  Places: ${d.places}  Displacement: ${d.displacementM.toInt()} m")

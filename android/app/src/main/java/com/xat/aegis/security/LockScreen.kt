@@ -1,5 +1,7 @@
 package com.xat.aegis.security
 
+import android.os.SystemClock
+import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
@@ -35,6 +37,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import javax.crypto.Cipher
 
 private val LkGround  = Color(0xFF0E1116)
 private val LkPanel   = Color(0xFF161B23)
@@ -65,23 +68,35 @@ fun LockScreen() {
     val maxLen = AppLock.MAX_LENGTH
     val biometricEnabled by AppLock.biometricEnabled.collectAsStateWithLifecycle()
 
-    // Countdown ticker for the lockout display.
+    // Countdown ticker for the lockout display, on the same monotonic clock as the lock itself.
     LaunchedEffect(lockoutMs) {
         if (lockoutMs <= 0L) return@LaunchedEffect
-        val deadline = System.currentTimeMillis() + lockoutMs
+        val deadline = SystemClock.elapsedRealtime() + lockoutMs
         while (true) {
-            val remaining = deadline - System.currentTimeMillis()
+            val remaining = deadline - SystemClock.elapsedRealtime()
             if (remaining <= 0L) { countdown = 0L; break }
             countdown = remaining
             delay(500L)
         }
     }
 
+    // The prompt only opens with a cipher the Keystore will complete for an
+    // authenticated strong biometric; the key behind it dies with a new enrolment.
+    fun promptBiometric() {
+        val act = activity ?: return
+        scope.launch {
+            when (val gate = withContext(Dispatchers.IO) { AppLock.biometricGate(context) }) {
+                is AppLock.BiometricGate.Ready -> showBiometricPrompt(act, gate.cipher)
+                AppLock.BiometricGate.Invalidated ->
+                    errorText = "Biometrics on this phone changed. Enter your passcode; biometric unlock can be switched on again in Settings."
+                AppLock.BiometricGate.Unavailable -> Unit
+            }
+        }
+    }
+
     // Auto-show the biometric prompt when the lock screen first appears.
     LaunchedEffect(biometricEnabled) {
-        if (biometricEnabled && activity != null) {
-            showBiometricPrompt(activity) { AppLock.unlockWithBiometric() }
-        }
+        if (biometricEnabled && activity != null) promptBiometric()
     }
 
     // Auto-submit once the code reaches the set length, OR on an explicit
@@ -98,7 +113,15 @@ fun LockScreen() {
             checking = false
             when (verdict) {
                 AppLock.Verdict.Accepted -> { /* AppLock.locked will flip to false */ }
-                AppLock.Verdict.Wiping -> { /* Process will die; nothing to show. */ }
+                // A wipe, whether from the duress passcode or the failure limit,
+                // must look exactly like one more wrong passcode until the
+                // process goes: the same shake, the same words, no blank pause.
+                AppLock.Verdict.Wiping -> {
+                    shake = true
+                    errorText = "Wrong passcode"
+                    delay(400L)
+                    shake = false
+                }
                 is AppLock.Verdict.Rejected -> {
                     shake = true
                     lockoutMs = verdict.lockedOutForMs
@@ -252,9 +275,7 @@ fun LockScreen() {
                     letterSpacing = 1.5.sp,
                     modifier = Modifier
                         .clip(RoundedCornerShape(4.dp))
-                        .clickable(enabled = active) {
-                            showBiometricPrompt(activity) { AppLock.unlockWithBiometric() }
-                        }
+                        .clickable(enabled = active) { promptBiometric() }
                         .padding(horizontal = 20.dp, vertical = 9.dp)
                 )
             }
@@ -262,11 +283,17 @@ fun LockScreen() {
     }
 }
 
-private fun showBiometricPrompt(activity: FragmentActivity, onSuccess: () -> Unit) {
+/**
+ * Shows the system prompt over [cipher]. Only a strong (class 3) biometric may
+ * satisfy it, because that is all the key behind the cipher accepts; the
+ * success callback then proves itself by finishing the operation, and a
+ * callback whose cipher the Keystore still refuses unlocks nothing.
+ */
+private fun showBiometricPrompt(activity: FragmentActivity, cipher: Cipher) {
     val executor = ContextCompat.getMainExecutor(activity)
     val callback = object : BiometricPrompt.AuthenticationCallback() {
         override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-            onSuccess()
+            AppLock.unlockWithBiometric(result.cryptoObject?.cipher)
         }
         override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {}
         override fun onAuthenticationFailed() {}
@@ -275,9 +302,10 @@ private fun showBiometricPrompt(activity: FragmentActivity, onSuccess: () -> Uni
     val info = BiometricPrompt.PromptInfo.Builder()
         .setTitle("Unlock Aegis")
         .setSubtitle("Confirm your identity to continue")
+        .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
         .setNegativeButtonText("Use passcode")
         .build()
-    prompt.authenticate(info)
+    runCatching { prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher)) }
 }
 
 @Composable

@@ -43,6 +43,7 @@ import com.xat.aegis.analysis.Tracker
 import com.xat.aegis.analysis.PhoneHealthMonitor
 import com.xat.aegis.analysis.WifiScanner
 import com.xat.aegis.analysis.toFix
+import com.xat.aegis.detect.BleNames
 import com.xat.aegis.detect.Signatures
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -317,10 +318,18 @@ class ScanService : LifecycleService() {
                 if (reason != null) {
                     Registry.publishCell(CellStatus(available = false, reason = reason))
                 } else {
-                    val cell = cellMonitor.sample()
-                    if (cell == null) {
-                        Registry.publishCell(CellStatus(available = false, reason = "Waiting for cell data — ensure location permission is granted"))
+                    val snapshot = cellMonitor.sampleFull()
+                    if (snapshot == null) {
+                        Registry.publishCell(
+                            CellStatus(
+                                available = false,
+                                reason = "Waiting for cell data — the modem has not reported a serving cell yet",
+                                radio = runCatching { cellMonitor.radioInfo() }.getOrNull(),
+                                analysing = true
+                            )
+                        )
                     } else {
+                        val cell = snapshot.cell
                         val fix = track.current
                         val findings = imsiCatcher.recordAndAnalyze(cell, fix)
                         val (score, level) = imsiCatcher.scoreAndLevel(findings)
@@ -330,7 +339,10 @@ class ScanService : LifecycleService() {
                                 available = true, cell = cell, findings = findings,
                                 score = score, level = level,
                                 mature = maturity >= 1f, maturity = maturity,
-                                knownCells = knownCells, visits = visits
+                                knownCells = knownCells, visits = visits,
+                                radio = runCatching { cellMonitor.radioInfo() }.getOrNull(),
+                                neighbors = snapshot.neighbors,
+                                analysing = true
                             )
                         )
                         if (level.ordinal >= Threat.MEDIUM.ordinal && findings.isNotEmpty()) {
@@ -385,9 +397,15 @@ class ScanService : LifecycleService() {
                 updateOngoing(list.filter { it.address !in trusted })
 
                 val trail = synchronized(gpsTrail) { ArrayList(gpsTrail) }
+                // Ordered by key, not by the sighting-sorted `list`: the map only cares
+                // where each device is, and sightings change on nearly every advert, so
+                // the sighting order made every 1.5 s MapData compare unequal. Each one
+                // then re-ran the map's overlay effect and invalidated the MapView, and
+                // every redraw re-requests any expired tile from the tile server.
+                // With a stable order the StateFlow drops publishes that change nothing.
                 val deviceTrails = list.filter { it.points.isNotEmpty() }.map {
                     DeviceTrail(it.key, it.name, it.threat, it.following, it.points)
-                }
+                }.sortedBy { it.key }
                 val cellNow = Registry.cell.value
                 val cellMarkers = if (cellNow.level.ordinal >= Threat.MEDIUM.ordinal && cellNow.cell != null) {
                     val fix = track.current
@@ -406,6 +424,11 @@ class ScanService : LifecycleService() {
 
                 // WiFi anomaly scan: immediately on first cycle, then every ~60s
                 if (publishCycle == 1 || publishCycle % 40 == 0) {
+                    // The picture the WIFI tab shows, then the judgement on it. A fresh
+                    // scan is requested first so the next cycle reads new beacons rather
+                    // than whatever the platform cached before the scanner started.
+                    WifiScanner.requestScan(this@ScanService)
+                    runCatching { WifiScanner.snapshot(this@ScanService) }.getOrNull()?.let { Registry.publishWifiStatus(it) }
                     val wifiAnomalies = WifiScanner.scan(this@ScanService)
                     Registry.publishWifi(wifiAnomalies)
                     if (wifiAnomalies.isNotEmpty()) {
@@ -460,24 +483,29 @@ class ScanService : LifecycleService() {
 
         // Skip devices the user has explicitly marked as their own.
         val now = System.currentTimeMillis()
-        val address = result.device.address ?: return
+        val device = result.device
+        val address = device.address?.let { BleNames.formatMac(it) } ?: return
         if (Registry.trusted.value.contains(address)) return
         val fingerprint = Fingerprint.of(record)
         val resolution = identities.resolve(address, result.rssi, fingerprint, now)
         val tracked = Signatures.match(record)
-        val name = record?.deviceName?.takeIf { it.isNotBlank() }
-            ?: tracked?.label
-            ?: Signatures.companyLabel(record)
-            ?: "Unknown device"
         val txPower = record?.txPowerLevel?.takeIf { it != Int.MIN_VALUE }
 
+        // Identification is display-only and resolved here, once per packet, from the
+        // SIG assigned numbers: who made it, what it calls itself, what it advertises.
+        // The tracker keeps the best of these across packets and derives the row name.
         val observation = tracker.observe(
-            key = resolution.identity.id, address = address, name = name,
+            key = resolution.identity.id, address = address,
             rssi = result.rssi, tracker = tracked,
             approxMetres = Signatures.approximateMetres(result.rssi, txPower),
             rotations = resolution.identity.rotations,
             addresses = resolution.identity.addresses.size,
-            fix = track.current, hasPosition = track.hasFix(), now = now
+            fix = track.current, hasPosition = track.hasFix(), now = now,
+            advertisedName = BleNames.advertisedName(this, record, device),
+            manufacturer = BleNames.manufacturer(record),
+            services = BleNames.services(record),
+            radio = BleNames.radio(this, device),
+            addressKind = BleNames.addressKind(device, address)
         )
 
         if (observation.becameFollowing && alerted.add(observation.detection.key)) {
@@ -668,6 +696,9 @@ class ScanService : LifecycleService() {
             )
         }
         Registry.update { it.copy(scanning = false) }
+        // The last reading stays on the Cell tab, but nothing is judging it any more;
+        // the tab says so instead of showing a frozen "RISK: NONE" as if it were live.
+        Registry.updateCell { it.copy(analysing = false, findings = emptyList(), score = 0, level = Threat.NONE) }
         cellStore.flush()
         TimelineLog.flush()
         phoneHealthMonitor.stop()

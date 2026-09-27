@@ -35,9 +35,34 @@ data class Detection(
     val rotations: Int,
     val addresses: Int,
     val approxMetres: Double?,
-    val points: List<LatLon> = emptyList()
+    val points: List<LatLon> = emptyList(),
+    /** Name the device put in its own advertisement (cleaned), or null when it sent none. */
+    val advertisedName: String? = null,
+    /** Maker resolved from the Bluetooth SIG company ID, e.g. "Apple"; null when not advertised. */
+    val manufacturer: String? = null,
+    /** Human names of the advertised services / payload types, e.g. ["Nearby Info", "Battery"]. */
+    val services: List<String> = emptyList(),
+    /** "Classic", "BLE", "Dual" or "Unknown", from [android.bluetooth.BluetoothDevice.getType]. */
+    val radio: String = "BLE",
+    /** "public", "random static", "resolvable private (rotates)"… when the stack reports it. */
+    val addressKind: String? = null
 ) {
     val identified: Boolean get() = tracker != null
+
+    /**
+     * One-line description for the list row when no tracker signature matched:
+     * "Apple · BLE · Nearby Info / Battery". Falls back to what is known.
+     */
+    val summary: String get() {
+        val parts = ArrayList<String>(3)
+        parts.add(manufacturer ?: "Unknown manufacturer")
+        parts.add(radio)
+        if (services.isNotEmpty()) {
+            val shown = services.take(3).joinToString(" / ")
+            parts.add(if (services.size > 3) "$shown +${services.size - 3}" else shown)
+        }
+        return parts.joinToString(" · ")
+    }
 }
 
 data class ScanStatus(
@@ -78,10 +103,55 @@ data class ServingCell(
      * technology (UMTS, NR) or the modem does not expose it. Zero means the
      * transmitter is within one TA step of you — ~550 m on GSM, ~78 m on LTE.
      */
-    val timingAdvance: Int? = null
+    val timingAdvance: Int? = null,
+    /** Signal quality 0..4 as the platform's own bar count (unknown = null). */
+    val bars: Int? = null,
+    /** Physical cell id (LTE/NR) or primary scrambling code (UMTS) / BSIC (GSM). */
+    val pci: Int? = null,
+    /** Channel number: EARFCN (LTE), NR-ARFCN, UARFCN (UMTS) or ARFCN (GSM). */
+    val arfcn: Int? = null,
+    /** Operating band with its frequency, e.g. "B3 · 1800 MHz" or "n78 · 3500 MHz". */
+    val band: String? = null,
+    /** LTE channel bandwidth in kHz, when the modem reports it. */
+    val bandwidthKhz: Int? = null,
+    /** LTE/NR reference-signal quality, dB. */
+    val rsrq: Int? = null,
+    /** LTE RSSNR / NR SS-SINR, dB. */
+    val sinr: Int? = null
 ) {
     val key: String get() = "${mcc ?: "?"}-${mnc ?: "?"}-${tac ?: "?"}-$cellId"
+
+    /** The decoded carrier for this cell's PLMN, or null when the table has no entry. */
+    val plmnCarrier: String? get() = Plmn.carrier(mcc, mnc)
 }
+
+/** A cell the modem hears but is not camped on. */
+data class NeighborCell(
+    val rat: Rat,
+    /** Whatever identifies it: PCI on LTE/NR, PSC on UMTS, CID or BSIC on GSM. */
+    val id: String,
+    val signalDbm: Int?,
+    val bars: Int?
+)
+
+/** What the radio as a whole reports, independent of the individual serving cell. */
+data class RadioInfo(
+    /** Name of the network currently registered on, as the modem reports it. */
+    val operatorName: String? = null,
+    /** Registered PLMN as "MCC-MNC". */
+    val plmn: String? = null,
+    /** Carrier the SIM belongs to. */
+    val simOperatorName: String? = null,
+    val simPlmn: String? = null,
+    val roaming: Boolean = false,
+    /** Data network type in the platform's words ("LTE", "NR", "HSPA+"…), when readable. */
+    val dataNetworkType: String? = null,
+    /** True while a mobile data connection is up. */
+    val dataConnected: Boolean = false,
+    val simState: String? = null,
+    /** Dual SIM: how many active subscriptions. */
+    val activeSims: Int = 0
+)
 
 data class CatcherFinding(
     val id: String,
@@ -106,7 +176,15 @@ data class CellStatus(
     val maturity: Float = 0f,
     val knownCells: Int = 0,
     /** Separate visits recorded across every tracking area. */
-    val visits: Int = 0
+    val visits: Int = 0,
+    val radio: RadioInfo? = null,
+    val neighbors: List<NeighborCell> = emptyList(),
+    /**
+     * True when the scanner service is running the IMSI-catcher heuristics against
+     * the baseline. False when the reading came from the Activity's own snapshot
+     * with the scanner off — the tower data is live but nothing is judging it.
+     */
+    val analysing: Boolean = false
 )
 
 // --- Timeline ---------------------------------------------------------------
@@ -247,6 +325,79 @@ data class WifiAnomaly(
     val ts: Long
 )
 
+enum class WifiSecurity(val label: String, val secure: Boolean) {
+    OPEN("Open", false),
+    OWE("Enhanced Open (OWE)", true),
+    WEP("WEP", false),
+    WPA("WPA", false),
+    WPA2("WPA2", true),
+    WPA2_WPA3("WPA2/WPA3", true),
+    WPA3("WPA3", true),
+    WPA2_ENTERPRISE("WPA2-Enterprise", true),
+    WPA3_ENTERPRISE("WPA3-Enterprise", true),
+    PASSPOINT("Passpoint", true),
+    UNKNOWN("Unknown", false)
+}
+
+/** One access point from the platform's scan cache. */
+data class WifiNetwork(
+    val ssid: String,
+    val bssid: String,
+    val rssi: Int,
+    /** 0..4 as the platform's own bar count. */
+    val level: Int,
+    val frequencyMhz: Int,
+    val channel: Int?,
+    /** "2.4 GHz", "5 GHz" or "6 GHz". */
+    val band: String,
+    val security: WifiSecurity,
+    /** "Wi-Fi 4" … "Wi-Fi 7", or null when the platform does not say. */
+    val standard: String?,
+    val hidden: Boolean,
+    /** Why this network deserves a second look; empty for an ordinary one. */
+    val flags: List<String>,
+    val connected: Boolean,
+    /** Milliseconds since the platform saw this beacon. */
+    val ageMs: Long?
+)
+
+/** The network the phone is on right now, from the radio and the IP stack. */
+data class WifiConnection(
+    val ssid: String?,
+    val bssid: String?,
+    val rssi: Int,
+    val level: Int,
+    val frequencyMhz: Int,
+    val channel: Int?,
+    val band: String,
+    val security: WifiSecurity,
+    val standard: String?,
+    val linkSpeedMbps: Int?,
+    val txMbps: Int?,
+    val rxMbps: Int?,
+    val ipv4: String?,
+    val ipv6: String?,
+    val gateway: String?,
+    val dnsServers: List<String>,
+    /** Hostname of the private (DoT) resolver when one is active, else null. */
+    val privateDns: String?,
+    val vpnActive: Boolean,
+    /** True when the system judges the network as behind a captive portal. */
+    val captivePortal: Boolean,
+    val metered: Boolean,
+    val flags: List<String>
+)
+
+data class WifiStatus(
+    val available: Boolean = false,
+    val reason: String? = null,
+    val wifiEnabled: Boolean = false,
+    val connection: WifiConnection? = null,
+    /** Sorted strongest first; the connected network, if visible, is included. */
+    val nearby: List<WifiNetwork> = emptyList(),
+    val scannedTs: Long = 0L
+)
+
 // --- Map --------------------------------------------------------------------
 
 data class DeviceTrail(
@@ -279,8 +430,26 @@ data class PhoneHealthFinding(
     val detail: String
 )
 
+/**
+ * One line of the device security checklist: what was checked, what it reads,
+ * and — when it is not fine — how bad and why. [severity] null means the row is
+ * informational or in order.
+ */
+data class HealthFact(
+    val id: String,
+    val category: String,
+    val label: String,
+    val value: String,
+    val severity: Severity? = null,
+    val detail: String? = null
+) {
+    val ok: Boolean get() = severity == null
+}
+
 data class PhoneHealth(
     val findings: List<PhoneHealthFinding> = emptyList(),
+    /** The security checklist rows, in display order. */
+    val facts: List<HealthFact> = emptyList(),
     /**
      * When [findings] were last produced by an actual scan, or 0 when nothing has
      * checked yet. The Device tab must not claim "no issues" on the strength of a
@@ -309,11 +478,18 @@ data class PhoneHealth(
      * video call and voice memo looks like. CRITICAL is reserved for findings that
      * are themselves CRITICAL.
      */
-    val level: Threat get() = when {
-        findings.any { it.severity == Severity.CRITICAL } -> Threat.CRITICAL
-        sensorActive || findings.any { it.severity == Severity.HIGH } -> Threat.HIGH
-        findings.any { it.severity == Severity.MEDIUM } -> Threat.MEDIUM
-        findings.isNotEmpty() -> Threat.LOW
-        else -> Threat.NONE
+    val level: Threat get() {
+        val sev = findings.map { it.severity } + facts.mapNotNull { it.severity }
+        return when {
+            sev.any { it == Severity.CRITICAL } -> Threat.CRITICAL
+            sensorActive || sev.any { it == Severity.HIGH } -> Threat.HIGH
+            sev.any { it == Severity.MEDIUM } -> Threat.MEDIUM
+            sev.isNotEmpty() -> Threat.LOW
+            else -> Threat.NONE
+        }
     }
+
+    /** Checklist rows that are not in order, worst first. */
+    val problems: List<HealthFact> get() =
+        facts.filter { it.severity != null }.sortedByDescending { it.severity!!.ordinal }
 }
