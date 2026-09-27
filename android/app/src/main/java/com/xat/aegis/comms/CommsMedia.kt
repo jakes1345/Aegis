@@ -57,6 +57,30 @@ object CommsMedia {
         val app = context.applicationContext
         dir = File(app.filesDir, "comms_media").also { it.mkdirs() }
         cacheDir = File(app.cacheDir, "comms_media_play").also { it.mkdirs() }
+        purgeTempFiles(app)
+    }
+
+    /** Anything younger than this may still be in use by a recording or camera capture. */
+    private const val TEMP_STALE_MS = 5L * 60 * 1000
+
+    /**
+     * Deletes plaintext temporaries left in the cache by a previous run: video
+     * play copies, voicemail play copies, and voicemail recordings and camera
+     * captures old enough that no recording or capture can still be writing them.
+     */
+    fun purgeTempFiles(context: Context) {
+        val cache = context.applicationContext.cacheDir
+        val cutoff = System.currentTimeMillis() - TEMP_STALE_MS
+        fun File.stale() = lastModified() < cutoff
+        runCatching {
+            File(cache, "comms_media_play").listFiles()?.forEach { it.delete() }
+            cache.listFiles()?.forEach { f ->
+                if (!f.isFile || !f.name.endsWith(".amr")) return@forEach
+                if (f.name.startsWith("vm_play_")) f.delete()
+                else if (f.name.startsWith("vm_") && f.stale()) f.delete()
+            }
+            File(cache, "camera").listFiles()?.forEach { if (it.isFile && it.stale()) it.delete() }
+        }
     }
 
     private fun fileFor(id: String) = File(dir, "${id.filter { it.isLetterOrDigit() || it == '-' }}.bin")
@@ -108,9 +132,13 @@ object CommsMedia {
     fun prepareImage(context: Context, uri: Uri): Prepared {
         val resolver = context.contentResolver
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-            ?: throw IllegalArgumentException("That image could not be opened")
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) throw IllegalArgumentException("That file is not an image this phone can read")
+        // decodeStream returns null in bounds-only mode, so the lambda must
+        // report success itself rather than hand back the (always null) bitmap.
+        val opened = resolver.openInputStream(uri)?.use { s ->
+            BitmapFactory.decodeStream(s, null, bounds)
+            true
+        } ?: throw IllegalArgumentException("That image could not be opened")
+        if (!opened || bounds.outWidth <= 0 || bounds.outHeight <= 0) throw IllegalArgumentException("That file is not an image this phone can read")
         // Decode at a power-of-two fraction first, so a 50-megapixel photo never
         // exists in memory at full size, then scale exactly.
         var sample = 1

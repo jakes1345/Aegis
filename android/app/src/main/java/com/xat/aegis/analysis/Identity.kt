@@ -78,10 +78,16 @@ class IdentityResolver(
     // coroutine, so every access to the three maps below has to be guarded. Without
     // this the pruning pass iterates a map the scan thread is writing to and the
     // service dies on ConcurrentModificationException mid-scan.
+    /**
+     * [keep] holds the ids of identities the tracker still considers to be following.
+     * Those outlive the quiet window: the tracker keeps a confirmed follower for days,
+     * and if the identity were forgotten first the same device would come back under
+     * a fresh id, leaving the original row a permanent ghost that nothing updates.
+     */
     @Synchronized
-    fun prune(now: Long, maxAgeMs: Long = 30 * 60_000L) {
+    fun prune(now: Long, maxAgeMs: Long = 30 * 60_000L, keep: Set<String> = emptySet()) {
         val cutoff = now - maxAgeMs
-        byId.values.filter { it.lastSeen < cutoff }.map { it.id }.forEach { forget(it) }
+        byId.values.filter { it.lastSeen < cutoff && it.id !in keep }.map { it.id }.forEach { forget(it) }
 
         // A thirty-minute window in a station or a shopping centre, with every
         // privacy-conscious device rotating its address every quarter hour, is enough
@@ -89,6 +95,7 @@ class IdentityResolver(
         // the least recently heard — they are the ones least likely to be on you.
         if (byId.size > MAX_IDENTITIES) {
             byId.values
+                .filter { it.id !in keep }
                 .sortedBy { it.lastSeen }
                 .take(byId.size - MAX_IDENTITIES)
                 .map { it.id }

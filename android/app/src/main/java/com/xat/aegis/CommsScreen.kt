@@ -1256,8 +1256,18 @@ private fun MediaViewer(m: ChatMessage, onDismiss: () -> Unit) {
                 var file by remember { mutableStateOf<File?>(null) }
                 var missing by remember { mutableStateOf(false) }
                 LaunchedEffect(m.id) {
-                    val f = withContext(Dispatchers.IO) { CommsMedia.tempCopy(m.id, "mp4") }
-                    if (f == null) missing = true else file = f
+                    var f: File? = null
+                    try {
+                        // Assigned inside the IO block: a withContext cancelled
+                        // mid-copy still runs the block to its end but drops
+                        // the result, and the finished copy would be orphaned.
+                        withContext(Dispatchers.IO) { f = CommsMedia.tempCopy(m.id, "mp4") }
+                        if (f == null) missing = true else file = f
+                    } finally {
+                        // Cancelled before `file` was assigned (the viewer closed
+                        // mid-copy): the dispose below would see null and miss it.
+                        if (file == null) CommsMedia.discardTemp(f)
+                    }
                 }
                 DisposableEffect(m.id) { onDispose { CommsMedia.discardTemp(file) } }
                 val f = file

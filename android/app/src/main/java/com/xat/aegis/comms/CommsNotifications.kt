@@ -198,7 +198,7 @@ object CommsNotifications {
             .setContentIntent(contentIntent)
             .setShowWhen(true)
             .build()
-        context.getSystemService(NotificationManager::class.java)?.notify(0x5B00_0000 or (contact.number.hashCode() and 0x00FF_FFFF), notification)
+        context.getSystemService(NotificationManager::class.java)?.notify(missedCallId(contact.number), notification)
     }
 
     /**
@@ -327,8 +327,11 @@ object CommsNotifications {
         context.getSystemService(NotificationManager::class.java)?.notify(notificationId(contact.number), notification)
     }
 
+    /** Clears both the message and the missed-call notification for [peer]. */
     fun cancel(context: Context, peer: String) {
-        context.getSystemService(NotificationManager::class.java)?.cancel(notificationId(peer))
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        manager.cancel(notificationId(peer))
+        manager.cancel(missedCallId(peer))
     }
 
     /** The ongoing notification behind the relay connection service. */
@@ -364,4 +367,5 @@ object CommsNotifications {
     }
 
     private fun notificationId(peer: String) = 0x5A00_0000 or (peer.hashCode() and 0x00FF_FFFF)
+    private fun missedCallId(peer: String) = 0x5B00_0000 or (peer.hashCode() and 0x00FF_FFFF)
 }

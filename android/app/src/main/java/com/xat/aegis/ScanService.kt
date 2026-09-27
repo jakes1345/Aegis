@@ -46,6 +46,7 @@ import com.xat.aegis.analysis.toFix
 import com.xat.aegis.detect.BleNames
 import com.xat.aegis.detect.Signatures
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -71,6 +72,7 @@ class ScanService : LifecycleService() {
     private lateinit var phoneHealthMonitor: PhoneHealthMonitor
 
     /** Whether a scan is currently registered with the adapter. */
+    @Volatile
     private var scanActive = false
 
     /** Screen state decides which filter strategy the scan can use — see [startScanning]. */
@@ -88,6 +90,29 @@ class ScanService : LifecycleService() {
             if (errorCode == ScanCallback.SCAN_FAILED_ALREADY_STARTED) return
             scanActive = false
             Registry.update { it.copy(scanning = false, error = "Bluetooth scan failed ($errorCode)") }
+            // The service stays alive after a failure, so without a retry it would sit
+            // there forever with nothing registered. Transient stack errors are retried
+            // after a pause; the throttle error gets a longer one.
+            val retryMs = when (errorCode) {
+                ScanCallback.SCAN_FAILED_APPLICATION_REGISTRATION_FAILED,
+                ScanCallback.SCAN_FAILED_INTERNAL_ERROR,
+                SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES -> RETRY_DELAY_MS
+                SCAN_FAILED_SCANNING_TOO_FREQUENTLY -> RETRY_THROTTLED_DELAY_MS
+                else -> return
+            }
+            scheduleScanRetry(retryMs)
+        }
+    }
+
+    /** Pending scan retry after an [onScanFailed]; only one is ever in flight. */
+    private var retryJob: Job? = null
+
+    private fun scheduleScanRetry(delayMs: Long) {
+        retryJob?.cancel()
+        retryJob = lifecycleScope.launch {
+            delay(delayMs)
+            retryJob = null
+            if (running && !scanActive) startScanning()
         }
     }
 
@@ -180,7 +205,15 @@ class ScanService : LifecycleService() {
             }
         }
 
-        if (running) return START_STICKY
+        // Already scanning: nothing to do. Running but not scanning means the last scan
+        // failed, and a start from the UI is the user asking for another go.
+        if (running && scanActive) return START_STICKY
+        if (running) {
+            retryJob?.cancel()
+            retryJob = null
+            startScanning()
+            return START_STICKY
+        }
         running = true
 
         try {
@@ -375,7 +408,10 @@ class ScanService : LifecycleService() {
             while (isActive) {
                 val now = System.currentTimeMillis()
                 tracker.prune(now)
-                identities.prune(now)
+                // An identity behind a confirmed follower must outlive the identity
+                // window, or the same device comes back as a stranger and the original
+                // row is orphaned as a permanent "following" ghost.
+                identities.prune(now, keep = tracker.followingKeys())
                 val all = tracker.snapshot(now)
                 val trusted = Registry.trusted.value
                 // Only surface devices worth the user's attention; transient single-sighting
@@ -404,7 +440,7 @@ class ScanService : LifecycleService() {
                 // every redraw re-requests any expired tile from the tile server.
                 // With a stable order the StateFlow drops publishes that change nothing.
                 val deviceTrails = list.filter { it.points.isNotEmpty() }.map {
-                    DeviceTrail(it.key, it.name, it.threat, it.following, it.points)
+                    DeviceTrail(it.key, it.name, it.threat, it.following, it.points, it.lastHeardAt)
                 }.sortedBy { it.key }
                 val cellNow = Registry.cell.value
                 val cellMarkers = if (cellNow.level.ordinal >= Threat.MEDIUM.ordinal && cellNow.cell != null) {
@@ -624,6 +660,7 @@ class ScanService : LifecycleService() {
     )
 
     private fun ongoingText(watching: Int, following: Int) = when {
+        running && !scanActive -> "Scan paused — retrying"
         following > 0 -> "$following confirmed following you"
         watching > 0 -> "Watching $watching device${if (watching == 1) "" else "s"}"
         else -> "Scanning for trackers"
@@ -715,5 +752,11 @@ class ScanService : LifecycleService() {
         private const val CHANNEL_CELL = "cell_alerts"
         private const val NOTIFICATION_ID = 1
         private const val NOTIF_CELL = 2
+
+        // Not exposed as constants on ScanCallback before API 33 / 34, so spelled out.
+        private const val SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES = 5
+        private const val SCAN_FAILED_SCANNING_TOO_FREQUENTLY = 6
+        private const val RETRY_DELAY_MS = 30_000L
+        private const val RETRY_THROTTLED_DELAY_MS = 60_000L
     }
 }

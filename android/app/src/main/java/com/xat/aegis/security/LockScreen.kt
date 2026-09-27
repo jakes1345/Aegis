@@ -86,7 +86,7 @@ fun LockScreen() {
         val act = activity ?: return
         scope.launch {
             when (val gate = withContext(Dispatchers.IO) { AppLock.biometricGate(context) }) {
-                is AppLock.BiometricGate.Ready -> showBiometricPrompt(act, gate.cipher)
+                is AppLock.BiometricGate.Ready -> showBiometricPrompt(act, gate.cipher) { msg -> errorText = msg }
                 AppLock.BiometricGate.Invalidated ->
                     errorText = "Biometrics on this phone changed. Enter your passcode; biometric unlock can be switched on again in Settings."
                 AppLock.BiometricGate.Unavailable -> Unit
@@ -192,15 +192,17 @@ fun LockScreen() {
             )
 
             // ── Dots ───────────────────────────────────────────────────
+            val dotSpacing = if (maxLen > 6) 10.dp else 14.dp
+            val dotSize = if (maxLen > 6) 11.dp else 13.dp
             Row(
-                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                horizontalArrangement = Arrangement.spacedBy(dotSpacing),
                 modifier = Modifier.offset(x = if (shake) shakeX.dp else 0.dp)
             ) {
-                repeat(6) { i ->
+                repeat(maxLen) { i ->
                     val filled = i < code.length
                     Box(
                         Modifier
-                            .size(13.dp)
+                            .size(dotSize)
                             .clip(CircleShape)
                             .background(if (filled) LkAccent else LkRule)
                             .then(
@@ -289,13 +291,20 @@ fun LockScreen() {
  * success callback then proves itself by finishing the operation, and a
  * callback whose cipher the Keystore still refuses unlocks nothing.
  */
-private fun showBiometricPrompt(activity: FragmentActivity, cipher: Cipher) {
+private fun showBiometricPrompt(activity: FragmentActivity, cipher: Cipher, onError: (String) -> Unit) {
     val executor = ContextCompat.getMainExecutor(activity)
     val callback = object : BiometricPrompt.AuthenticationCallback() {
         override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
             AppLock.unlockWithBiometric(result.cryptoObject?.cipher)
         }
-        override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {}
+        override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+            // A cancel or a tap on "Use passcode" is not something to report; anything
+            // else (lockout, hardware failure) leaves the user staring at nothing.
+            if (errorCode != BiometricPrompt.ERROR_NEGATIVE_BUTTON &&
+                errorCode != BiometricPrompt.ERROR_USER_CANCELED) {
+                onError(errString.toString())
+            }
+        }
         override fun onAuthenticationFailed() {}
     }
     val prompt = BiometricPrompt(activity, executor, callback)

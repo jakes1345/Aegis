@@ -1,8 +1,12 @@
 package com.xat.aegis.security
 
 import android.content.Context
+import android.content.Intent
 import android.os.Process
+import com.xat.aegis.ScanService
+import com.xat.aegis.comms.CallService
 import com.xat.aegis.comms.CommsRepository
+import com.xat.aegis.comms.CommsService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -65,6 +69,11 @@ object Wiper {
                 runCatching { wipeDatabases(app) }
                 runCatching { wipeFiles(app) }
             } finally {
+                // These foreground services run START_STICKY; without stopping them
+                // Android would restart them (and the process) after the kill below.
+                runCatching { app.stopService(Intent(app, ScanService::class.java)) }
+                runCatching { app.stopService(Intent(app, CommsService::class.java)) }
+                runCatching { app.stopService(Intent(app, CallService::class.java)) }
                 // Last, and whatever happened above: the next launch finds nothing.
                 Process.killProcess(Process.myPid())
             }

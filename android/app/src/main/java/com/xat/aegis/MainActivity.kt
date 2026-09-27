@@ -243,7 +243,6 @@ class MainActivity : AppCompatActivity() {
 
         handleOpenThreadIntent(intent)
 
-        val onboardingAlreadyDone = isOnboardingDone(this)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(background = Ground, surface = Panel)) {
                 Surface(color = Ground, modifier = Modifier.fillMaxSize()) {
@@ -253,7 +252,10 @@ class MainActivity : AppCompatActivity() {
                         return@Surface
                     }
 
-                    var onboardingDone by remember { mutableStateOf(onboardingAlreadyDone) }
+                    // Read the preference here, not once in onCreate: this branch leaves
+                    // composition while locked and re-enters on unlock, and a value
+                    // captured before onboarding finished would show onboarding again.
+                    var onboardingDone by remember { mutableStateOf(isOnboardingDone(this@MainActivity)) }
 
                     val onboardingPermissions = rememberLauncherForActivityResult(
                         ActivityResultContracts.RequestMultiplePermissions()
@@ -1877,7 +1879,9 @@ private fun MapScreen() {
 
         // Device markers
         for (trail in mapData.devices) {
-            val pt = trail.points.lastOrNull() ?: continue
+            // points is a set of distinct places in insertion order, so its last entry
+            // is the last *new* place, not the last fix. A→B→A would leave the marker at B.
+            val pt = trail.lastHeardAt ?: trail.points.lastOrNull() ?: continue
             val argb = threatArgb(trail.threat, trail.following)
             val sizeDp = if (trail.following) 22 else 16
             val marker = Marker(mapView).apply {

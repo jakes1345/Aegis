@@ -15,6 +15,7 @@ import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.ProviderException
 import java.security.SecureRandom
+import java.security.UnrecoverableKeyException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.Mac
@@ -199,6 +200,14 @@ object AppLock {
         if (Wiper.isActive || !_biometricEnabled.value) return BiometricGate.Unavailable
         val key = try {
             (keyStore().getEntry(BIOMETRIC_KEY_ALIAS, null) as? KeyStore.SecretKeyEntry)?.secretKey
+        } catch (e: UnrecoverableKeyException) {
+            // On some OEM devices an invalidated biometric key throws here instead
+            // of reading back null; treat it the same as a new enrolment.
+            revokeBiometric(context)
+            return BiometricGate.Invalidated
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            revokeBiometric(context)
+            return BiometricGate.Invalidated
         } catch (e: Exception) {
             return BiometricGate.Unavailable
         }
@@ -308,6 +317,10 @@ object AppLock {
             if (unlockOnSuccess) _locked.value = false
             return Verdict.Accepted
         }
+        // A too-short or empty code — tapping TURN OFF with an empty field, say — is
+        // not a real guess. Reject it without spending an attempt, so it can never
+        // count towards the wipe.
+        if (code.length < MIN_LENGTH) return Verdict.Rejected(lockedOutForMs = 0L)
         val wipeAfter = p.getInt(K_WIPE_AFTER, DEFAULT_WIPE_AFTER)
         val failed = p.getInt(K_FAILED, 0)
         val lastFail = p.getLong(K_LAST_FAIL, 0L)

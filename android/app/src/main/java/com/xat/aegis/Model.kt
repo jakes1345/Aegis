@@ -36,6 +36,8 @@ data class Detection(
     val addresses: Int,
     val approxMetres: Double?,
     val points: List<LatLon> = emptyList(),
+    /** Our position at the most recent sighting; [points] are distinct places, not a timeline. */
+    val lastHeardAt: LatLon? = null,
     /** Name the device put in its own advertisement (cleaned), or null when it sent none. */
     val advertisedName: String? = null,
     /** Maker resolved from the Bluetooth SIG company ID, e.g. "Apple"; null when not advertised. */
@@ -405,7 +407,9 @@ data class DeviceTrail(
     val name: String,
     val threat: Threat,
     val following: Boolean,
-    val points: List<LatLon>
+    val points: List<LatLon>,
+    /** Where the device was most recently heard; the marker goes here, not at the last new place. */
+    val lastHeardAt: LatLon? = null
 )
 
 data class CellMarker(

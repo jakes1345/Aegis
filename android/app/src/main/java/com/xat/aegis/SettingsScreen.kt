@@ -1062,7 +1062,9 @@ private fun DuressSetupPanel(
     onDone: () -> Unit,
     onCancel: () -> Unit
 ) {
+    // step 0 = confirm current passcode, step 1 = enter duress, step 2 = confirm duress
     var step  by remember { mutableIntStateOf(0) }
+    var currentCode by remember { mutableStateOf("") }
     var code1 by remember { mutableStateOf("") }
     var code2 by remember { mutableStateOf("") }
     var error by remember { mutableStateOf("") }
@@ -1073,22 +1075,28 @@ private fun DuressSetupPanel(
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Text(
-            if (step == 0) "Choose a duress code (6–12 digits)" else "Confirm the duress code",
+            when (step) {
+                0 -> "Confirm your passcode"
+                1 -> "Choose a duress code (6–12 digits)"
+                else -> "Confirm the duress code"
+            },
             color = SInkClr, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
         )
-        Text(
-            "Must differ from your main passcode. Entering it silently wipes Aegis.",
-            color = SMutedClr, fontSize = 12.sp, lineHeight = 16.sp
-        )
+        if (step != 0) {
+            Text(
+                "Must differ from your main passcode. Entering it silently wipes Aegis.",
+                color = SMutedClr, fontSize = 12.sp, lineHeight = 16.sp
+            )
+        }
         if (error.isNotEmpty()) Text(error, color = SCriticalClr, fontSize = 12.sp)
         OutlinedTextField(
-            value = if (step == 0) code1 else code2,
+            value = when (step) { 0 -> currentCode; 1 -> code1; else -> code2 },
             onValueChange = { v ->
                 val digits = v.filter { it.isDigit() }.take(AppLock.MAX_LENGTH)
-                if (step == 0) code1 = digits else code2 = digits
+                when (step) { 0 -> currentCode = digits; 1 -> code1 = digits; else -> code2 = digits }
                 error = ""
             },
-            label = { Text("Digits", color = SMutedClr) },
+            label = { Text(if (step == 0) "Current passcode" else "Digits", color = SMutedClr) },
             singleLine = true,
             colors = OutlinedTextFieldDefaults.colors(
                 focusedTextColor = SInkClr,
@@ -1110,15 +1118,30 @@ private fun DuressSetupPanel(
                 onClick = {
                     scope.launch {
                         error = ""
-                        if (step == 0) {
-                            AppLock.problem(code1)?.let { error = it; return@launch }
-                            step = 1
-                        } else {
-                            if (code1 != code2) { error = "Codes do not match"; return@launch }
-                            val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                                AppLock.setDuress(context, code1)
+                        when (step) {
+                            0 -> {
+                                val v = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    AppLock.attempt(context, currentCode, unlockOnSuccess = false)
+                                }
+                                when (v) {
+                                    AppLock.Verdict.Accepted -> step = 1
+                                    is AppLock.Verdict.Rejected -> error = "Wrong passcode"
+                                    is AppLock.Verdict.LockedOut -> error = "Too many attempts — try later"
+                                    AppLock.Verdict.Wiping -> onCancel()
+                                    is AppLock.Verdict.Unavailable -> error = "Keystore unavailable"
+                                }
                             }
-                            r.onSuccess { onDone() }.onFailure { error = it.message ?: "Failed" }
+                            1 -> {
+                                AppLock.problem(code1)?.let { error = it; return@launch }
+                                step = 2
+                            }
+                            else -> {
+                                if (code1 != code2) { error = "Codes do not match"; return@launch }
+                                val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    AppLock.setDuress(context, code1)
+                                }
+                                r.onSuccess { onDone() }.onFailure { error = it.message ?: "Failed" }
+                            }
                         }
                     }
                 },
@@ -1127,7 +1150,7 @@ private fun DuressSetupPanel(
                 ),
                 shape = SCardShape
             ) {
-                Text(if (step == 0) "NEXT" else "SAVE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                Text(if (step < 2) "NEXT" else "SAVE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
             }
         }
     }

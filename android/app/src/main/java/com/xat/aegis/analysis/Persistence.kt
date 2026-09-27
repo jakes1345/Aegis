@@ -2,6 +2,7 @@ package com.xat.aegis.analysis
 
 import com.xat.aegis.Detection
 import com.xat.aegis.FollowConfidence
+import com.xat.aegis.LatLon
 import com.xat.aegis.Threat
 import com.xat.aegis.TrackerType
 import com.xat.aegis.detect.BleNames
@@ -11,6 +12,9 @@ const val PERSIST_MIN_SIGHTINGS = 5
 
 /** Ceiling on simultaneously tracked devices — see [Tracker.prune]. */
 private const val MAX_ENTRIES = 4000
+
+/** How long a confirmed follower is remembered after its last sighting — see [Tracker.prune]. */
+const val FOLLOWING_RETENTION_MS = 7 * 24 * 3600_000L
 
 /** Ceiling on distinct service names remembered per device; a row cannot show more anyway. */
 private const val MAX_SERVICES = 8
@@ -58,6 +62,8 @@ class Tracker(
         var score = 0
         var confidence = FollowConfidence.NONE
         val area = ObservationArea()
+        /** Our position at the most recent sighting — where the map should mark it. */
+        var lastHeardAt: LatLon? = null
     }
 
     data class Observation(val detection: Detection, val becameFollowing: Boolean)
@@ -105,7 +111,10 @@ class Tracker(
         addressKind?.let { entry.addressKind = it }
         entry.name = BleNames.displayName(entry.advertisedName, entry.tracker, entry.manufacturer, address)
 
-        fix?.let { entry.area.add(it) }
+        fix?.let {
+            entry.area.add(it)
+            entry.lastHeardAt = LatLon(it.lat, it.lon)
+        }
 
         val duration = now - entry.firstSeen
         entry.persistent =
@@ -169,6 +178,7 @@ class Tracker(
             addresses = entry.addresses,
             approxMetres = entry.approxMetres,
             points = entry.area.points(),
+            lastHeardAt = entry.lastHeardAt,
             advertisedName = entry.advertisedName,
             manufacturer = entry.manufacturer,
             services = entry.services.toList(),
@@ -207,6 +217,7 @@ class Tracker(
                 addresses = entry.addresses,
                 approxMetres = entry.approxMetres,
                 points = entry.area.points(),
+                lastHeardAt = entry.lastHeardAt,
                 advertisedName = entry.advertisedName,
                 manufacturer = entry.manufacturer,
                 services = entry.services.toList(),
@@ -216,14 +227,19 @@ class Tracker(
         }
 
     /**
-     * Drops devices that have gone quiet — except anything that proved it travels
-     * with you, because trackers sleep between reports and forgetting one would
-     * throw away the only evidence that matters.
+     * Drops devices that have gone quiet. Anything that proved it travels with you is
+     * kept far longer — trackers sleep between reports and forgetting one would throw
+     * away the only evidence that matters — but not forever: a follower silent for a
+     * week is gone, and keeping its row would only leave a permanent CRITICAL ghost.
      */
     @Synchronized
     fun prune(now: Long, maxAgeMs: Long = 30 * 60 * 1000L) {
         val cutoff = now - maxAgeMs
-        entries.entries.removeAll { it.value.lastSeen < cutoff && !it.value.following }
+        val followingCutoff = now - FOLLOWING_RETENTION_MS
+        entries.entries.removeAll { (_, entry) ->
+            if (entry.following) entry.lastSeen < followingCutoff
+            else entry.lastSeen < cutoff
+        }
 
         // Somewhere crowded can produce thousands of one-sighting devices inside the
         // retention window. Drop the least recently heard, but never anything that has
@@ -237,6 +253,14 @@ class Tracker(
                 .forEach { entries.remove(it.key) }
         }
     }
+
+    /**
+     * Keys (identity ids) of every device currently confirmed as following. The
+     * identity resolver must not forget these while the tracker still remembers them.
+     */
+    @Synchronized
+    fun followingKeys(): Set<String> =
+        entries.values.filter { it.following }.mapTo(HashSet()) { it.key }
 
     /** Forgets every device. Used by "clear all data". */
     @Synchronized
