@@ -25,6 +25,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -1080,6 +1081,105 @@ private sealed class ExplainerTarget {
     data class CellIndicator(val finding: CatcherFinding) : ExplainerTarget()
 }
 
+// ── SOS button ────────────────────────────────────────────────────────────
+
+/** How long the SOS button must be held before the confirmation appears. */
+private const val SOS_HOLD_MS = 1500L
+
+/**
+ * A round hold-to-arm SOS button with a progress ring, followed by a confirm
+ * dialog. [onConfirmed] runs only after the user has both held the button for
+ * [SOS_HOLD_MS] and tapped SEND in the dialog.
+ */
+@Composable
+private fun SosButton(onConfirmed: () -> Unit) {
+    var sosProgress by remember { mutableFloatStateOf(0f) }
+    var sosPressing by remember { mutableStateOf(false) }
+    var showSosConfirm by remember { mutableStateOf(false) }
+
+    LaunchedEffect(sosPressing) {
+        if (sosPressing) {
+            val start = System.currentTimeMillis()
+            while (sosPressing) {
+                sosProgress = (System.currentTimeMillis() - start) / SOS_HOLD_MS.toFloat()
+                if (sosProgress >= 1f) {
+                    showSosConfirm = true
+                    sosPressing = false
+                    break
+                }
+                delay(16)
+            }
+            if (!showSosConfirm) sosProgress = 0f
+        } else if (!showSosConfirm) {
+            sosProgress = 0f
+        }
+    }
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .size(52.dp)
+            .clip(CircleShape)
+            .background(Critical.copy(alpha = if (sosPressing) 1f else 0.85f))
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onPress = {
+                        sosPressing = true
+                        tryAwaitRelease()
+                        sosPressing = false
+                    }
+                )
+            }
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            if (sosProgress > 0f) {
+                val stroke = 3.dp.toPx()
+                drawArc(
+                    color = Color.White.copy(alpha = 0.6f),
+                    startAngle = -90f,
+                    sweepAngle = 360f * sosProgress.coerceIn(0f, 1f),
+                    useCenter = false,
+                    topLeft = Offset(stroke / 2f, stroke / 2f),
+                    size = Size(size.width - stroke, size.height - stroke),
+                    style = Stroke(width = stroke)
+                )
+            }
+        }
+        Text(
+            "SOS", color = Color.White, fontSize = 11.sp,
+            fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp
+        )
+    }
+
+    if (showSosConfirm) {
+        AlertDialog(
+            onDismissRequest = { showSosConfirm = false; sosProgress = 0f },
+            containerColor = Panel,
+            title = { Text("Send emergency alert?", fontWeight = FontWeight.Bold, color = Ink) },
+            text = {
+                Text(
+                    "This will send your location to all your group members immediately.",
+                    color = InkDim, fontSize = 13.sp
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showSosConfirm = false
+                    sosProgress = 0f
+                    onConfirmed()
+                }) {
+                    Text("SEND SOS", color = Critical, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSosConfirm = false; sosProgress = 0f }) {
+                    Text("CANCEL", color = Muted)
+                }
+            }
+        )
+    }
+}
+
 // ── Root composable ───────────────────────────────────────────────────────
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1110,6 +1210,9 @@ private fun MainApp(
     val phoneHealth by Registry.phoneHealth.collectAsStateWithLifecycle()
     val unreadMessages by CommsRepository.unread.collectAsStateWithLifecycle()
     val activeCall by CallManager.call.collectAsStateWithLifecycle()
+    val locked by AppLock.locked.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     // Settings navigation and threat explainer state
     var showSettings by remember { mutableStateOf(false) }
@@ -1185,6 +1288,27 @@ private fun MainApp(
                     openInvite = inviteRequest,
                     onInviteConsumed = { Registry.takeInviteRequest() }
                 )
+            }
+
+            // SOS panic button, floating over the active tab. Hidden while settings is
+            // open or the phone is locked; no animation needed for a critical safety button.
+            if (!showSettings && !locked) {
+                Box(Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 16.dp)) {
+                    SosButton(onConfirmed = {
+                        val s = Registry.status.value
+                        val loc = if (s.lat != null && s.lon != null) Pair(s.lat, s.lon) else null
+                        scope.launch(Dispatchers.IO) {
+                            Registry.setPanicActive(true)
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(
+                                    context,
+                                    if (loc != null) "SOS sent with your location" else "SOS sent — no GPS fix to attach",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                    })
+                }
             }
         }
         NavigationBar(
@@ -1885,6 +2009,7 @@ private fun MapScreen() {
     val mapData by Registry.map.collectAsStateWithLifecycle()
     val status by Registry.status.collectAsStateWithLifecycle()
     val cell by Registry.cell.collectAsStateWithLifecycle()
+    val sharedThreats by Registry.sharedThreats.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     val cellHot = cell.available && cell.level.ordinal >= Threat.HIGH.ordinal
@@ -1908,15 +2033,45 @@ private fun MapScreen() {
     // Only center the map on the very first GPS fix; after that the user controls it.
     var hasCentered by remember { mutableStateOf(false) }
 
-    LaunchedEffect(status.lat, status.lon, mapData) {
+    LaunchedEffect(status.lat, status.lon, mapData, sharedThreats) {
         // Rebuild all overlays except the tile layer. This runs before the fix check
         // on purpose: ACTION_CLEAR resets the registry, which drops the fix to null,
         // and returning first left the cleared devices' markers and trails on screen.
         mapView.overlays.removeAll { it !is org.osmdroid.views.overlay.TilesOverlay }
 
+        // Community threat markers: reports from group members carry their own
+        // position, so they are drawn whether or not this phone has a fix — a member
+        // indoors with no GPS still needs to see what was reported around them.
+        val now = System.currentTimeMillis()
+        for (threat in sharedThreats) {
+            if (threat.expiresAt < now) continue
+            val markerArgb = when (threat.severity) {
+                "CRITICAL" -> 0xFFF2545B.toInt()
+                "HIGH" -> 0xFFFF7A3D.toInt()
+                "MEDIUM" -> 0xFFE8B33D.toInt()
+                else -> 0xFF6F7A8B.toInt()
+            }
+            val marker = Marker(mapView).apply {
+                position = GeoPoint(threat.lat, threat.lon)
+                title = "${threat.fromName}: ${threat.title}"
+                snippet = "${threat.kind} · ${fmtAgo(now, threat.ts)}"
+                icon = markerBitmap(markerArgb, 10, outline = true)
+                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+            }
+            mapView.overlays.add(marker)
+        }
+
         val lat = status.lat
         val lon = status.lon
         if (lat == null || lon == null) {
+            // No fix: nothing of our own to draw, but centre on the community reports
+            // once so they are not off-screen somewhere in the default viewport.
+            if (!hasCentered) {
+                sharedThreats.firstOrNull { it.expiresAt >= now }?.let {
+                    mapView.controller.setCenter(GeoPoint(it.lat, it.lon))
+                    hasCentered = true
+                }
+            }
             mapView.invalidate()
             return@LaunchedEffect
         }
@@ -2113,11 +2268,34 @@ private fun DayHeader(label: String, count: Int) {
     }
 }
 
+/**
+ * A short tag for event kinds that come from outside this phone's own sensors,
+ * so a row from a group member is not mistaken for a local detection. Null for
+ * the ordinary kinds, whose title already says what happened.
+ */
+private fun eventKindTag(kind: EventKind): Pair<String, Color>? = when (kind) {
+    EventKind.SHARED_THREAT -> "COMMUNITY REPORT" to Accent
+    EventKind.PANIC -> "SOS ALERT" to Critical
+    else -> null
+}
+
+/**
+ * Stripe and dot colour of a log row. Severity decides for local detections; a
+ * community report is always the group's accent and an SOS is always critical,
+ * whatever severity the sender attached.
+ */
+private fun eventColor(e: TimelineEvent): Color = when (e.kind) {
+    EventKind.SHARED_THREAT -> Accent
+    EventKind.PANIC -> Critical
+    else -> severityColor(e.severity)
+}
+
 @Composable
 private fun TimelineRow(e: TimelineEvent, status: ScanStatus) {
     var open by remember(e.id) { mutableStateOf(false) }
-    val col = severityColor(e.severity)
-    val titleColor = if (e.severity == Severity.LOW) InkDim else col
+    val col = eventColor(e)
+    val tag = eventKindTag(e.kind)
+    val titleColor = if (e.severity == Severity.LOW && tag == null) InkDim else col
     val lat = e.lat
     val lon = e.lon
     val hasLoc = lat != null && lon != null
@@ -2146,6 +2324,15 @@ private fun TimelineRow(e: TimelineEvent, status: ScanStatus) {
                     maxLines = if (open) Int.MAX_VALUE else 2, overflow = TextOverflow.Ellipsis
                 )
                 Text(fmtClock(e.ts), color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            }
+            if (tag != null) {
+                Text(
+                    tag.first, color = tag.second, fontSize = 9.sp, fontWeight = FontWeight.Bold,
+                    letterSpacing = 0.8.sp,
+                    modifier = Modifier
+                        .background(tag.second.copy(alpha = 0.15f), RoundedCornerShape(3.dp))
+                        .padding(horizontal = 5.dp, vertical = 1.dp)
+                )
             }
             if (e.detail.isNotBlank()) {
                 Text(

@@ -9,15 +9,24 @@ import com.xat.aegis.Detection
 import com.xat.aegis.NfcTag
 import com.xat.aegis.ScanStatus
 import com.xat.aegis.TimelineEvent
+import com.xat.aegis.WifiAnomaly
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 
 object Report {
 
-    private val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
-    private val sdfMinute = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+    private val utc: TimeZone = TimeZone.getTimeZone("UTC")
+
+    // All timestamps are written in UTC so reports from different phones and time
+    // zones can be lined up against each other and against server logs.
+    private val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss 'UTC'", Locale.US).apply { timeZone = utc }
+    private val sdfMinute = SimpleDateFormat("yyyy-MM-dd HH:mm 'UTC'", Locale.US).apply { timeZone = utc }
+    private val sdfIso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply { timeZone = utc }
 
     /** How long an exported report stays in the cache for a share target to read. */
     private const val EXPORT_RETENTION_MS = 24 * 60 * 60_000L
@@ -28,9 +37,10 @@ object Report {
         detections: List<Detection>,
         timeline: List<TimelineEvent>,
         cell: CellStatus,
-        nfc: List<NfcTag>
+        nfc: List<NfcTag>,
+        wifi: List<WifiAnomaly> = emptyList()
     ): Intent {
-        val text = buildReport(status, detections, timeline, cell, nfc)
+        val text = toText(status, detections, timeline, cell, nfc, wifi)
         // Each report carries the GPS locations where devices were observed, if any,
         // so earlier ones are not left lying in the cache indefinitely. They are kept
         // for a day, not deleted at once: a
@@ -54,15 +64,18 @@ object Report {
         }
     }
 
-    private fun buildReport(
+    /** Human-readable evidence report. All timestamps are UTC. */
+    fun toText(
         status: ScanStatus,
         detections: List<Detection>,
         timeline: List<TimelineEvent>,
         cell: CellStatus,
-        nfc: List<NfcTag>
-    ) = buildString {
+        nfc: List<NfcTag>,
+        wifi: List<WifiAnomaly> = emptyList()
+    ): String = buildString {
+        val now = Date()
         appendLine("=== AEGIS EVIDENCE REPORT ===")
-        appendLine("Generated: ${sdf.format(Date())}")
+        appendLine("Aegis Report — generated ${sdf.format(now)}")
         appendLine()
 
         appendLine("LOCATION")
@@ -106,8 +119,18 @@ object Report {
         }
         if (cell.findings.isNotEmpty()) {
             appendLine("  Indicators (${cell.findings.size}):")
-            for (f in cell.findings) appendLine("    [${f.severity}] ${f.title}")
+            for (f in cell.findings) appendLine("    [${f.severity}] ${f.id}: ${f.title}")
             appendLine("    Detail: ${cell.findings.joinToString("; ") { it.detail }}")
+        }
+        appendLine()
+
+        appendLine("WIFI ANOMALIES (${wifi.size})")
+        for (w in wifi) {
+            appendLine()
+            appendLine("  SSID  : ${w.ssid}")
+            appendLine("  BSSID : ${w.bssid}  Signal: ${w.rssi} dBm")
+            appendLine("  Reason: ${w.reason}  Threat: ${w.threat}")
+            appendLine("  Seen  : ${sdf.format(Date(w.ts))}")
         }
         appendLine()
 
@@ -127,5 +150,78 @@ object Report {
             if (e.detail.isNotBlank()) appendLine("    ${e.detail}")
             if (e.lat != null) appendLine("    @ %.5f, %.5f".format(e.lat, e.lon))
         }
+    }
+
+    /**
+     * Machine-readable counterpart of [toText]: the same evidence as JSON, using the
+     * per-threat blocks from [ThreatPayload] so a report and a shared threat payload
+     * describe a device in the same shape. Pretty-printed with two-space indent.
+     */
+    fun toJson(
+        status: ScanStatus,
+        detections: List<Detection>,
+        timeline: List<TimelineEvent>,
+        cell: CellStatus?,
+        wifi: List<WifiAnomaly> = emptyList(),
+        nfc: List<NfcTag> = emptyList()
+    ): String {
+        val now = System.currentTimeMillis()
+        val root = JSONObject()
+        root.put("v", ThreatPayload.VERSION)
+        root.put("app", "aegis")
+        root.put("ts", now)
+        root.put("ts_utc", sdfIso.format(Date(now)))
+
+        root.put("status", JSONObject().apply {
+            put("scanning", status.scanning)
+            put("fix", status.hasFix)
+            if (status.hasFix && status.lat != null && status.lon != null) {
+                put("lat", status.lat); put("lon", status.lon)
+            }
+            put("travelled_m", status.travelledM)
+            put("nearby", status.nearbyCount)
+        })
+
+        val dArr = JSONArray()
+        for (d in detections) {
+            dArr.put(ThreatPayload.buildBleSection(d, includeTrail = true).also {
+                it.put("name", d.name)
+                it.put("threat", d.threat.name)
+                it.put("score", d.score)
+                it.put("following", d.following)
+                it.put("persistent", d.persistent)
+                d.tracker?.let { t -> it.put("tracker", t.label); it.put("brand", t.brand) }
+            })
+        }
+        root.put("ble", dArr)
+
+        cell?.let { root.put("cell", ThreatPayload.buildCellSection(it)) }
+
+        val wArr = JSONArray()
+        for (w in wifi) wArr.put(ThreatPayload.buildWifiSection(w))
+        root.put("wifi", wArr)
+
+        val nArr = JSONArray()
+        for (t in nfc) {
+            nArr.put(JSONObject().apply {
+                put("uid", t.uid); put("type", t.type)
+                put("techs", JSONArray().also { a -> t.techs.forEach { a.put(it) } })
+                t.payload?.let { put("payload", it) }
+                put("suspicious", t.suspicious); put("note", t.note); put("ts", t.ts)
+            })
+        }
+        root.put("nfc", nArr)
+
+        val tArr = JSONArray()
+        for (e in timeline.take(100)) {
+            tArr.put(JSONObject().apply {
+                put("id", e.id); put("kind", e.kind.name); put("ts", e.ts)
+                put("sev", e.severity.name); put("title", e.title); put("detail", e.detail)
+                e.lat?.let { put("lat", it) }; e.lon?.let { put("lon", it) }
+            })
+        }
+        root.put("timeline", tArr)
+
+        return root.toString(2)
     }
 }

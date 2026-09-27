@@ -195,7 +195,11 @@ enum class EventKind {
     FOLLOWING, CATCHER, NFC_TAG, SCAN_START, SCAN_STOP,
     WIFI_ANOMALY,
     /** BLE tracker persisting while cell anomaly is also active — correlated surveillance. */
-    CORRELATED_SURVEILLANCE
+    CORRELATED_SURVEILLANCE,
+    /** A threat another member of one of the user's organisation groups shared. */
+    SHARED_THREAT,
+    /** An SOS the user (or a group member) sent to their groups. */
+    PANIC
 }
 
 data class TimelineEvent(
@@ -418,10 +422,20 @@ data class CellMarker(
     val level: Threat
 )
 
+/**
+ * A threat detection shared by a member of one of the user's organisation groups,
+ * as the map and log show it. The comms layer stores the same record; this alias
+ * keeps one definition (kind is FOLLOWING / CATCHER / WIFI_ANOMALY / CORRELATED,
+ * severity is CRITICAL / HIGH / MEDIUM / LOW, and it is dropped once [SharedThreat.expiresAt] has passed).
+ */
+typealias SharedThreat = com.xat.aegis.comms.SharedThreat
+
 data class MapData(
     val track: List<LatLon> = emptyList(),
     val devices: List<DeviceTrail> = emptyList(),
-    val cells: List<CellMarker> = emptyList()
+    val cells: List<CellMarker> = emptyList(),
+    /** Community reports from group members, drawn even without a GPS fix of our own. */
+    val shared: List<SharedThreat> = emptyList()
 )
 
 // --- Phone health / surveillance indicators ---------------------------------

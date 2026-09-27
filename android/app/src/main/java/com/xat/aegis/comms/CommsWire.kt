@@ -73,6 +73,44 @@ object CommsWire {
     const val T_MEDIA = "media"
     const val T_MEDIA_CHUNK = "mchunk"
 
+    // Organisation groups: fanned out client-side to every member, one envelope each.
+    /** A text message to a group: "gid", "id", "body". */
+    const val T_GROUP_MSG = "gmsg"
+    /** A roster change: "gid", "op" (add | remove | roster) and the fields of that op. */
+    const val T_GROUP_CTRL = "gctl"
+    /** A threat detection shared with a group: "gid", "id", "ts", "kind", "sev", "lat", "lon", "title", "detail", "exp", optional "ble"/"cell". */
+    const val T_THREAT = "threat"
+    /** An SOS to a group: "gid", "id", "ts", "lat", "lon", "note". */
+    const val T_PANIC = "panic"
+
+    // group
+    const val F_GID = "gid"
+    const val F_OP = "op"
+    const val F_MEMBER = "num"
+    /** The added member's display name and identity key: "name" and "k" belong to the sender. */
+    const val F_MEMBER_NAME = "mname"
+    const val F_MEMBER_ED25519 = "med"
+    const val F_ROLE = "role"
+    const val F_MEMBERS = "members"
+    const val F_GROUP_NAME = "gname"
+    const val F_CREATED_BY = "by"
+    const val F_CREATED_TS = "cts"
+    const val OP_ADD = "add"
+    const val OP_REMOVE = "remove"
+    /** Sent to a newly added member: the group's name and its whole roster. */
+    const val OP_ROSTER = "roster"
+
+    // threat / panic
+    const val F_KIND = "kind"
+    const val F_SEVERITY = "sev"
+    const val F_LAT = "lat"
+    const val F_LON = "lon"
+    const val F_TITLE = "title"
+    const val F_DETAIL = "detail"
+    const val F_EXPIRES = "exp"
+    const val F_BLE = "ble"
+    const val F_CELL = "cell"
+
     // msg
     const val F_ID = "id"
     const val F_TS = "ts"
@@ -199,6 +237,52 @@ object CommsWire {
     fun mediaChunk(id: String, index: Int, dataB64: String): JSONObject =
         base(T_MEDIA_CHUNK).put(F_ID, id).put(F_INDEX, index).put(F_DATA, dataB64)
 
+    /** A text message to group [gid]; the same payload goes to every member. */
+    fun groupMsg(gid: String, body: String, msgId: String, ts: Long): JSONObject =
+        base(T_GROUP_MSG).put(F_GID, gid).put(F_ID, msgId).put(F_TS, ts).put(F_BODY, body)
+
+    /**
+     * A roster change in group [gid]: [op] is [OP_ADD], [OP_REMOVE] or
+     * [OP_ROSTER], and [extra] holds that op's fields (null values are left out).
+     * The sender's identity fields are reserved; see [withSender].
+     */
+    fun groupCtrl(gid: String, op: String, extra: Map<String, Any?> = emptyMap()): JSONObject {
+        val o = base(T_GROUP_CTRL).put(F_GID, gid).put(F_OP, op)
+        for ((k, v) in extra) {
+            require(k !in SENDER_FIELDS) { "group control field \"$k\" is reserved for the sender's identity" }
+            if (v != null) o.put(k, v)
+        }
+        return o
+    }
+
+    /** One member of a roster, as carried in [OP_ROSTER]'s "members" array. */
+    fun rosterEntry(number: String, name: String, role: String, ed25519: String): JSONObject =
+        JSONObject().put(F_MEMBER, number).put(F_NAME, name).put(F_ROLE, role).put(F_ED25519, ed25519)
+
+    /** Shares a threat detection with group [gid]; [bleJson] and [cellJson] are optional JSON objects with the raw evidence. */
+    fun threat(
+        gid: String, threatId: String, ts: Long,
+        kind: String, severity: String,
+        lat: Double, lon: Double,
+        title: String, detail: String,
+        expiresAt: Long,
+        bleJson: String? = null, cellJson: String? = null
+    ): JSONObject {
+        val o = base(T_THREAT).put(F_GID, gid).put(F_ID, threatId).put(F_TS, ts)
+            .put(F_KIND, kind).put(F_SEVERITY, severity)
+            .put(F_LAT, lat).put(F_LON, lon)
+            .put(F_TITLE, title).put(F_DETAIL, detail)
+            .put(F_EXPIRES, expiresAt)
+        bleJson?.let { runCatching { JSONObject(it) }.getOrNull() }?.let { o.put(F_BLE, it) }
+        cellJson?.let { runCatching { JSONObject(it) }.getOrNull() }?.let { o.put(F_CELL, it) }
+        return o
+    }
+
+    /** An SOS to group [gid] with the sender's position. */
+    fun panic(gid: String, panicId: String, ts: Long, lat: Double, lon: Double, note: String?): JSONObject =
+        base(T_PANIC).put(F_GID, gid).put(F_ID, panicId).put(F_TS, ts)
+            .put(F_LAT, lat).put(F_LON, lon).put(F_NOTE, note ?: "")
+
     /**
      * Adds the sender's identity to [payload]. Throws [IllegalStateException]
      * when the payload already uses one of those fields, rather than silently
@@ -245,5 +329,17 @@ object CommsWire {
     fun receiptIds(payload: JSONObject): List<String> {
         val arr = payload.optJSONArray(F_IDS) ?: return emptyList()
         return (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+    }
+
+    /** One member as read back from an [OP_ROSTER] payload's "members" array. */
+    data class RosterEntry(val number: String, val name: String, val role: String, val ed25519: String)
+
+    fun rosterEntries(payload: JSONObject): List<RosterEntry> {
+        val arr = payload.optJSONArray(F_MEMBERS) ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            val number = o.optString(F_MEMBER).takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            RosterEntry(number, o.optString(F_NAME), o.optString(F_ROLE), o.optString(F_ED25519))
+        }
     }
 }

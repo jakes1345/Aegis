@@ -173,6 +173,27 @@ object Registry {
     fun requestInvite(text: String) { _inviteRequest.value = text }
     fun takeInviteRequest(): String? = _inviteRequest.getAndUpdate { null }
 
+    // --- Organisation / community -------------------------------------------
+
+    /** Shared community threats received from org members; expired ones are dropped on publish. */
+    private val _sharedThreats = MutableStateFlow<List<SharedThreat>>(emptyList())
+    val sharedThreats: StateFlow<List<SharedThreat>> = _sharedThreats.asStateFlow()
+
+    fun publishSharedThreats(threats: List<SharedThreat>) {
+        _sharedThreats.value = threats.filter { it.expiresAt > System.currentTimeMillis() }
+    }
+
+    /** A group conversation the COMMS tab should open (parallel to [requestThread]). */
+    private val _groupRequest = MutableStateFlow<String?>(null)
+    val groupRequest: StateFlow<String?> = _groupRequest.asStateFlow()
+    fun requestGroup(gid: String) { _groupRequest.value = gid }
+    fun takeGroupRequest(): String? = _groupRequest.getAndUpdate { null }
+
+    /** True from the moment an SOS is sent until it is cleared. */
+    private val _panicActive = MutableStateFlow(false)
+    val panicActive: StateFlow<Boolean> = _panicActive.asStateFlow()
+    fun setPanicActive(active: Boolean) { _panicActive.value = active }
+
     fun reset() {
         _detections.value = emptyList()
         _status.value = ScanStatus()

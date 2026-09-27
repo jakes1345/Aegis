@@ -15,6 +15,59 @@ fun parseAegisNumber(raw: String): String? {
 
 enum class Direction { IN, OUT }
 
+/** What a member may do in an organisation group: admins manage the roster, members talk. */
+enum class OrgRole { ADMIN, MEMBER }
+
+/** An organisation or community group this identity belongs to. Messages fan out client-side to every member. */
+data class Group(
+    /** UUID chosen by the phone that created the group. */
+    val id: String,
+    val name: String,
+    /** Aegis number of the creator. */
+    val createdBy: String,
+    val createdTs: Long,
+    val myRole: OrgRole,
+    val memberCount: Int = 0
+)
+
+data class GroupMember(
+    val gid: String,
+    val number: String,
+    val name: String,
+    val role: OrgRole,
+    val ed25519: String,
+    /** Aegis number of the admin who added them. */
+    val addedBy: String,
+    val addedTs: Long
+)
+
+data class GroupThread(
+    val group: Group,
+    val lastMessage: ChatMessage?,
+    val unread: Int,
+    val memberCount: Int
+)
+
+/** A threat detection a group member shared with the group; forgotten once [expiresAt] has passed. */
+data class SharedThreat(
+    /** UUID chosen by the sender. */
+    val id: String,
+    val gid: String,
+    val fromNumber: String,
+    val fromName: String,
+    val ts: Long,
+    /** FOLLOWING / CATCHER / WIFI_ANOMALY / CORRELATED */
+    val kind: String,
+    /** CRITICAL / HIGH / MEDIUM / LOW */
+    val severity: String,
+    val lat: Double,
+    val lon: Double,
+    val title: String,
+    val detail: String,
+    /** [ts] plus a TTL that depends on [kind]. */
+    val expiresAt: Long
+)
+
 /**
  * Someone this identity can talk to. The keys are pinned at first contact;
  * [verified] is true once the owner has scanned this contact's QR code (or
@@ -46,7 +99,13 @@ data class ChatMessage(
     val read: Boolean,
     val error: String? = null,
     /** [KIND_TEXT] or [KIND_MEDIA]; a media message's body is [MediaBody] JSON and its bytes live in [CommsMedia]. */
-    val kind: String = KIND_TEXT
+    val kind: String = KIND_TEXT,
+    /**
+     * In a group conversation ([peer] is the group id) the Aegis number of the
+     * member who sent an inbound message; null in a 1:1 conversation, where
+     * [peer] is the sender.
+     */
+    val sender: String? = null
 ) {
     val failed: Boolean get() = status == "failed"
     val isMedia: Boolean get() = kind == KIND_MEDIA
@@ -225,13 +284,16 @@ data class PairingCode(
     val sealing: String,
     val signature: String,
     val name: String,
-    val invite: String? = null
+    val invite: String? = null,
+    /** With [orgName]: the invite also joins the newcomer to this organisation group. */
+    val orgId: String? = null,
+    val orgName: String? = null
 ) {
     fun encode(): String {
         val q = (listOf(
             "r" to relayUrl, "n" to number, "k" to ed25519, "c" to curve25519,
             "s" to sealing, "g" to signature, "d" to name
-        ) + listOfNotNull(invite?.let { "i" to it }))
+        ) + listOfNotNull(invite?.let { "i" to it }, orgId?.let { "og" to it }, orgName?.let { "on" to it }))
             .joinToString("&") { (k, v) -> "$k=${java.net.URLEncoder.encode(v, "UTF-8")}" }
         return "aegis:v1?$q"
     }
@@ -263,7 +325,9 @@ data class PairingCode(
                 sealing = params["s"] ?: return null,
                 signature = params["g"] ?: return null,
                 name = params["d"] ?: "",
-                invite = params["i"]?.takeIf { INVITE_CODE.matches(it) }
+                invite = params["i"]?.takeIf { INVITE_CODE.matches(it) },
+                orgId = params["og"]?.takeIf { it.isNotBlank() },
+                orgName = params["on"]?.takeIf { it.isNotBlank() }
             )
         }
 

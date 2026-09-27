@@ -26,6 +26,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -100,12 +101,15 @@ import com.xat.aegis.comms.formatAegisNumber
 import com.xat.aegis.comms.parseAegisNumber
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 // ── Colour tokens local to this file ──────────────────────────────────────────
 
@@ -131,6 +135,114 @@ private const val KEY_MIC_ASKED = "microphone_asked"
 
 private const val NOT_A_PHONE = "Aegis numbers are not phone numbers. They only reach other Aegis apps on the same relay; they cannot call or text a phone."
 
+/** Per-group switch: whether threats this phone confirms are sent to the group. Suffixed with the group id. */
+private const val KEY_SHARE_THREATS = "share_threats_"
+
+// ── Groups: temporary local model and repository stand-ins ───────────────────
+//
+// The group (organisation) model and the CommsRepository methods behind it are
+// being added separately. Until they land, these in-memory stand-ins keep this
+// file compiling and let the group screens below be exercised end to end on
+// one phone. To switch over: delete this block, import Group, GroupMember,
+// GroupThread, OrgRole and SharedThreat from com.xat.aegis.comms, and point
+// [groupsVersionFlow] at CommsRepository.version. The screens call the
+// repository by the same names and shapes as the real methods.
+
+private enum class OrgRole { ADMIN, MEMBER }
+
+private data class Group(val id: String, val name: String, val createdBy: String, val createdTs: Long)
+
+private data class GroupMember(val groupId: String, val number: String, val name: String, val role: OrgRole, val joinedTs: Long)
+
+private data class GroupThread(val group: Group, val lastMessage: ChatMessage?, val unread: Int, val memberCount: Int)
+
+/** Bumped whenever anything about a group changes, the way [CommsRepository.version] is for conversations. */
+private val groupsVersionFlow: StateFlow<Long> get() = GroupStub.version
+
+private object GroupStub {
+    val version = MutableStateFlow(0L)
+    private val groups = LinkedHashMap<String, Group>()
+    private val members = HashMap<String, MutableList<GroupMember>>()
+    private val messages = HashMap<String, List<ChatMessage>>()
+
+    private fun changed() { version.value = version.value + 1 }
+    private fun me(): String = CommsRepository.state.value.number ?: ""
+
+    @Synchronized fun groups(): List<Group> = groups.values.toList()
+    @Synchronized fun members(gid: String): List<GroupMember> = members[gid]?.toList() ?: emptyList()
+    @Synchronized fun messages(gid: String, limit: Int): List<ChatMessage> = messages[gid].orEmpty().takeLast(limit)
+    @Synchronized fun threads(): List<GroupThread> = groups.values.map { g ->
+        val ms = messages[g.id].orEmpty()
+        GroupThread(g, ms.lastOrNull(), ms.count { it.direction == Direction.IN && !it.read }, members[g.id]?.size ?: 0)
+    }.sortedByDescending { it.lastMessage?.ts ?: it.group.createdTs }
+
+    @Synchronized fun markRead(gid: String) {
+        val ms = messages[gid] ?: return
+        if (ms.none { !it.read }) return
+        messages[gid] = ms.map { if (it.read) it else it.copy(read = true) }
+        changed()
+    }
+
+    @Synchronized fun create(name: String): String {
+        val id = UUID.randomUUID().toString()
+        val now = System.currentTimeMillis()
+        groups[id] = Group(id, name, me(), now)
+        members[id] = mutableListOf(GroupMember(id, me(), CommsRepository.state.value.displayName, OrgRole.ADMIN, now))
+        changed()
+        return id
+    }
+
+    @Synchronized fun addMember(gid: String, number: String, name: String) {
+        val list = members.getOrPut(gid) { mutableListOf() }
+        if (list.any { it.number == number }) return
+        list += GroupMember(gid, number, name, OrgRole.MEMBER, System.currentTimeMillis())
+        changed()
+    }
+
+    @Synchronized fun removeMember(gid: String, number: String) {
+        if (members[gid]?.removeAll { it.number == number } == true) changed()
+    }
+
+    @Synchronized fun send(gid: String, body: String) {
+        messages[gid] = messages[gid].orEmpty() + ChatMessage(UUID.randomUUID().toString(), me(), Direction.OUT, body, System.currentTimeMillis(), "sent", true)
+        changed()
+    }
+
+    @Synchronized fun delete(gid: String) {
+        groups.remove(gid)
+        members.remove(gid)
+        messages.remove(gid)
+        changed()
+    }
+}
+
+private fun CommsRepository.groups(): List<Group> = GroupStub.groups()
+private fun CommsRepository.groupThreads(): List<GroupThread> = GroupStub.threads()
+private fun CommsRepository.groupMembers(gid: String): List<GroupMember> = GroupStub.members(gid)
+private fun CommsRepository.groupMessages(gid: String, limit: Int = 100): List<ChatMessage> = GroupStub.messages(gid, limit)
+private fun CommsRepository.markGroupRead(gid: String) = GroupStub.markRead(gid)
+private suspend fun CommsRepository.createGroup(name: String): String = withContext(Dispatchers.IO) { GroupStub.create(name) }
+private suspend fun CommsRepository.sendGroupMessage(gid: String, body: String): Result<Unit> = withContext(Dispatchers.IO) {
+    val text = body.trim()
+    if (text.isEmpty()) Result.failure(IllegalArgumentException("Empty message")) else Result.success(GroupStub.send(gid, text))
+}
+private suspend fun CommsRepository.addGroupMember(gid: String, number: String): Result<Unit> = withContext(Dispatchers.IO) {
+    Result.success(GroupStub.addMember(gid, number, contact(number)?.name ?: ""))
+}
+private suspend fun CommsRepository.removeGroupMember(gid: String, number: String): Result<Unit> = withContext(Dispatchers.IO) {
+    Result.success(GroupStub.removeMember(gid, number))
+}
+private suspend fun CommsRepository.leaveGroup(gid: String): Result<Unit> = withContext(Dispatchers.IO) { Result.success(GroupStub.delete(gid)) }
+@Suppress("UNUSED_PARAMETER")
+private suspend fun CommsRepository.shareThreats(
+    gid: String, kind: String, severity: String, lat: Double?, lon: Double?, title: String, detail: String
+): Result<Unit> = withContext(Dispatchers.IO) {
+    val where = if (lat != null && lon != null) String.format(Locale.US, " · at %.4f, %.4f", lat, lon) else ""
+    Result.success(GroupStub.send(gid, "⚠ Threat status: $severity · $title$where\n$detail"))
+}
+
+// ── End of stand-ins ─────────────────────────────────────────────────────────
+
 /** Where the COMMS tab is, apart from the conversation list. */
 private sealed class CommsPage {
     object List : CommsPage()
@@ -139,6 +251,10 @@ private sealed class CommsPage {
     object MyCode : CommsPage()
     object Invite : CommsPage()
     object Settings : CommsPage()
+    /** A group's conversation. */
+    data class Group(val groupId: String) : CommsPage()
+    /** A group's members and settings. */
+    data class OrgManage(val groupId: String) : CommsPage()
 }
 
 /**
@@ -218,9 +334,20 @@ fun CommsScreen(
     when (val p = page) {
         CommsPage.List -> ThreadListScreen(
             onOpen = { page = CommsPage.Thread(it) },
+            onOpenGroup = { page = CommsPage.Group(it) },
             onMyCode = { page = CommsPage.MyCode },
             onInvite = { page = CommsPage.Invite },
             onSettings = { page = CommsPage.Settings }
+        )
+        is CommsPage.Group -> GroupThreadScreen(
+            groupId = p.groupId,
+            onBack = { page = CommsPage.List },
+            onMembers = { page = CommsPage.OrgManage(p.groupId) }
+        )
+        is CommsPage.OrgManage -> OrgScreen(
+            groupId = p.groupId,
+            onBack = { page = CommsPage.Group(p.groupId) },
+            onLeft = { page = CommsPage.List }
         )
         is CommsPage.Thread -> ThreadScreen(
             peer = p.peer,
@@ -295,6 +422,25 @@ private fun ToggleRow(label: String, detail: String, checked: Boolean, enabled: 
             colors = SwitchDefaults.colors(checkedThumbColor = CGround, checkedTrackColor = CAccent, uncheckedThumbColor = CInkDim, uncheckedTrackColor = CPanelHi, uncheckedBorderColor = CRule)
         )
     }
+}
+
+@Composable
+private fun SectionLabel(text: String, colour: Color = CMuted) {
+    Text(text, color = colour, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
+}
+
+@Composable
+private fun Hairline() {
+    Box(Modifier.fillMaxWidth().height(1.dp).background(CRule))
+}
+
+/** A short upper-case tag, such as a member's role. */
+@Composable
+private fun Badge(label: String, colour: Color) {
+    Text(
+        label, color = colour, fontSize = 10.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, letterSpacing = 1.sp,
+        modifier = Modifier.background(colour.copy(alpha = 0.12f), RoundedCornerShape(3.dp)).padding(horizontal = 6.dp, vertical = 2.dp)
+    )
 }
 
 private fun hasMicrophone(context: Context) =
@@ -545,17 +691,23 @@ private fun SetupScreen(invite: PairingCode?, linkError: String?, onInvite: (Pai
 // ── Conversation list ────────────────────────────────────────────────────────
 
 @Composable
-private fun ThreadListScreen(onOpen: (String) -> Unit, onMyCode: () -> Unit, onInvite: () -> Unit, onSettings: () -> Unit) {
+private fun ThreadListScreen(onOpen: (String) -> Unit, onOpenGroup: (String) -> Unit, onMyCode: () -> Unit, onInvite: () -> Unit, onSettings: () -> Unit) {
     val state by CommsRepository.state.collectAsStateWithLifecycle()
     val version by CommsRepository.version.collectAsStateWithLifecycle()
+    val groupsVersion by groupsVersionFlow.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     val threads by produceState(initialValue = emptyList<ChatThread>(), version) {
         value = withContext(Dispatchers.IO) { CommsRepository.threads() }
     }
+    val groupThreads by produceState(initialValue = emptyList<GroupThread>(), version, groupsVersion) {
+        value = withContext(Dispatchers.IO) { CommsRepository.groupThreads() }
+    }
     var addContact by remember { mutableStateOf(false) }
+    var createGroup by remember { mutableStateOf(false) }
     val now = rememberTick()
 
     if (addContact) AddContactDialog(onDismiss = { addContact = false }, onAdded = { addContact = false; onOpen(it) })
+    if (createGroup) CreateGroupDialog(onDismiss = { createGroup = false }, onCreated = { createGroup = false; onOpenGroup(it) })
     // The coin balance is the relay's figure; it is asked for when the list comes up.
     LaunchedEffect(state.registered) { if (state.registered) CommsRepository.refreshBalance() }
 
@@ -563,6 +715,7 @@ private fun ThreadListScreen(onOpen: (String) -> Unit, onMyCode: () -> Unit, onI
         Spacer(Modifier.height(20.dp))
         Header("COMMS") {
             SmallButton("INVITE", CAccent, onClick = onInvite)
+            SmallButton("GROUP", CAccent, onClick = { createGroup = true })
             SmallButton("MY CODE", CInkDim, onClick = onMyCode)
             SmallButton("+ ADD", CClear, onClick = { addContact = true })
         }
@@ -624,21 +777,84 @@ private fun ThreadListScreen(onOpen: (String) -> Unit, onMyCode: () -> Unit, onI
         }
         Spacer(Modifier.height(8.dp))
 
-        if (threads.isEmpty()) {
-            Card {
-                Text("No contacts yet", color = CInkDim, fontSize = 14.sp)
-                Text(
-                    "Tap + ADD and scan a contact's Aegis code, or enter their listed Aegis number. Show yours under MY CODE.",
-                    color = CMuted, fontSize = 12.sp, lineHeight = 17.sp
-                )
-            }
+        if (threads.isEmpty() && groupThreads.isEmpty()) {
+            NoContactsCard()
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.weight(1f)) {
+                // Groups first: a group's stripe is always the accent colour, so
+                // the section label keeps them apart from a contact with unread messages.
+                if (groupThreads.isNotEmpty()) {
+                    item(key = "§groups") { SectionLabel("GROUPS") }
+                    items(groupThreads, key = { "g:${it.group.id}" }) { gt -> GroupRow(gt, onClick = { onOpenGroup(gt.group.id) }) }
+                    item(key = "§groups-end") { Hairline() }
+                    item(key = "§contacts") { SectionLabel("CONTACTS") }
+                }
+                if (threads.isEmpty()) {
+                    item(key = "§no-contacts") { NoContactsCard() }
+                }
                 items(threads, key = { it.contact.number }) { t -> ThreadRow(t, onClick = { onOpen(t.contact.number) }) }
                 item(key = "§footer") { Spacer(Modifier.height(8.dp)) }
             }
         }
     }
+}
+
+@Composable
+private fun NoContactsCard() {
+    Card {
+        Text("No contacts yet", color = CInkDim, fontSize = 14.sp)
+        Text(
+            "Tap + ADD and scan a contact's Aegis code, or enter their listed Aegis number. Show yours under MY CODE.",
+            color = CMuted, fontSize = 12.sp, lineHeight = 17.sp
+        )
+    }
+}
+
+/** Names a new group; the phone that makes it is its first member and admin. */
+@Composable
+private fun CreateGroupDialog(onDismiss: () -> Unit, onCreated: (String) -> Unit) {
+    val scope = rememberCoroutineScope()
+    var groupName by rememberSaveable { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val create = {
+        val name = groupName.trim()
+        if (name.isNotEmpty() && !busy) {
+            busy = true
+            error = null
+            scope.launch {
+                runCatching { CommsRepository.createGroup(name) }
+                    .onSuccess { onCreated(it) }
+                    .onFailure { busy = false; error = it.message ?: "Could not create the group" }
+            }
+        }
+    }
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        containerColor = CPanel,
+        title = { Text("Create a group", color = CInk, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "A group is a conversation with several contacts at once, each message encrypted for every member. " +
+                        "You start as its admin and add members from your contacts.",
+                    color = CMuted, fontSize = 12.sp, lineHeight = 17.sp
+                )
+                OutlinedTextField(
+                    value = groupName, onValueChange = { groupName = it.take(60) },
+                    label = { Text("Group name", fontSize = 12.sp) }, singleLine = true, enabled = !busy,
+                    modifier = Modifier.fillMaxWidth(), colors = fieldColors()
+                )
+                error?.let { Text(it, color = CCritical, fontSize = 12.sp) }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = create, enabled = groupName.isNotBlank() && !busy) {
+                Text(if (busy) "CREATING…" else "CREATE", color = if (groupName.isNotBlank() && !busy) CAccent else CMuted, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("CANCEL", color = CMuted, letterSpacing = 1.sp) } }
+    )
 }
 
 @Composable
@@ -685,6 +901,57 @@ private fun ThreadRow(t: ChatThread, onClick: () -> Unit) {
                 if (m.failed) Text(m.error ?: "Not sent", color = CCritical, fontSize = 11.sp)
             }
         }
+    }
+}
+
+/** A group in the conversation list. The stripe is always the accent colour: groups carry no per-contact trust state. */
+@Composable
+private fun GroupRow(gt: GroupThread, onClick: () -> Unit) {
+    val m = gt.lastMessage
+    val unread = gt.unread > 0
+    Row(Modifier.fillMaxWidth().clip(CShape).background(CPanel).clickable(onClick = onClick).height(IntrinsicSize.Min)) {
+        Box(Modifier.width(3.dp).fillMaxHeight().background(CAccent))
+        Box(Modifier.padding(start = 12.dp, top = 12.dp).size(28.dp), contentAlignment = Alignment.Center) {
+            GroupGlyph(if (unread) CAccent else CInkDim, Modifier.size(24.dp))
+        }
+        Column(Modifier.weight(1f).padding(12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    gt.group.name, color = if (unread) CAccent else CInk, fontSize = 14.sp,
+                    fontWeight = if (unread) FontWeight.Bold else FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+                if (unread) {
+                    Text(
+                        gt.unread.toString(), color = Color(0xFF12161D), fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.background(CAccent, RoundedCornerShape(8.dp)).padding(horizontal = 6.dp, vertical = 1.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
+                if (m != null) Text(dateTimeFmt.format(Date(m.ts)), color = CMuted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            }
+            Text("${gt.memberCount} member${if (gt.memberCount == 1) "" else "s"}", color = CMuted, fontSize = 12.sp)
+            if (m != null) {
+                Text(
+                    (if (m.direction == Direction.OUT) "You: " else "") + m.preview(),
+                    color = if (unread) CInkDim else CMuted, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+/** Two people, one behind the other: the group icon. */
+@Composable
+private fun GroupGlyph(colour: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val back = colour.copy(alpha = 0.5f)
+        drawCircle(back, radius = w * 0.13f, center = Offset(w * 0.68f, h * 0.32f))
+        drawArc(back, startAngle = 180f, sweepAngle = 180f, useCenter = true, topLeft = Offset(w * 0.44f, h * 0.5f), size = Size(w * 0.48f, h * 0.46f))
+        drawCircle(colour, radius = w * 0.15f, center = Offset(w * 0.36f, h * 0.36f))
+        drawArc(colour, startAngle = 180f, sweepAngle = 180f, useCenter = true, topLeft = Offset(w * 0.06f, h * 0.56f), size = Size(w * 0.6f, h * 0.5f))
     }
 }
 
@@ -1992,6 +2259,369 @@ private fun rememberBatteryUnrestricted(): State<Boolean> {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     return unrestricted
+}
+
+// ── Group conversation ───────────────────────────────────────────────────────
+
+@Composable
+private fun GroupThreadScreen(groupId: String, onBack: () -> Unit, onMembers: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    val groupsVersion by groupsVersionFlow.collectAsStateWithLifecycle()
+    val state by CommsRepository.state.collectAsStateWithLifecycle()
+    val myNumber = state.number ?: ""
+
+    val group by produceState<Group?>(null, groupId, groupsVersion) {
+        value = withContext(Dispatchers.IO) { CommsRepository.groups().find { it.id == groupId } }
+    }
+    val messages by produceState(emptyList<ChatMessage>(), groupId, groupsVersion) {
+        value = withContext(Dispatchers.IO) { CommsRepository.groupMessages(groupId) }
+    }
+    val members by produceState(emptyList<GroupMember>(), groupId, groupsVersion) {
+        value = withContext(Dispatchers.IO) { CommsRepository.groupMembers(groupId) }
+    }
+
+    LaunchedEffect(groupId, groupsVersion) {
+        withContext(Dispatchers.IO) { CommsRepository.markGroupRead(groupId) }
+    }
+
+    var draft by rememberSaveable(groupId) { mutableStateOf("") }
+    var sendError by remember(groupId) { mutableStateOf<String?>(null) }
+    val listState = rememberLazyListState()
+
+    fun senderName(number: String): String =
+        members.find { it.number == number }?.name?.takeIf { it.isNotBlank() }
+            ?: formatAegisNumber(number)
+
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
+    }
+
+    val detections by Registry.detections.collectAsStateWithLifecycle()
+    val status by Registry.status.collectAsStateWithLifecycle()
+    val topThreat = detections.filter { it.following }.maxByOrNull { it.threat.ordinal }
+
+    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+        Spacer(Modifier.height(20.dp))
+        Header(group?.name ?: "Group", onBack = onBack) {
+            SmallButton("MEMBERS", CInkDim, onClick = onMembers)
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "${members.size} member${if (members.size == 1) "" else "s"} · end-to-end encrypted",
+            color = CMuted, fontSize = 11.sp
+        )
+        Spacer(Modifier.height(8.dp))
+
+        LazyColumn(state = listState, modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (messages.isEmpty()) {
+                item {
+                    Card {
+                        Text("No messages yet", color = CInkDim, fontSize = 13.sp)
+                        Text(
+                            "Messages are encrypted for every member individually and sent to the relay once per member.",
+                            color = CMuted, fontSize = 11.sp, lineHeight = 15.sp
+                        )
+                    }
+                }
+            }
+            items(messages, key = { it.id }) { msg ->
+                val isOut = msg.direction == Direction.OUT
+                Column(
+                    Modifier.fillMaxWidth(),
+                    horizontalAlignment = if (isOut) Alignment.End else Alignment.Start
+                ) {
+                    if (!isOut && msg.sender != null) {
+                        Text(
+                            senderName(msg.sender),
+                            color = CMuted, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.padding(start = 4.dp, bottom = 2.dp)
+                        )
+                    }
+                    Box(
+                        Modifier
+                            .widthIn(max = 280.dp)
+                            .background(
+                                if (isOut) CAccent.copy(alpha = 0.20f) else CPanel,
+                                CShape
+                            )
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text(msg.body, color = CInk, fontSize = 14.sp, lineHeight = 20.sp)
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                                Text(
+                                    timeFmt.format(Date(msg.ts)),
+                                    color = CMuted, fontSize = 10.sp, fontFamily = FontFamily.Monospace
+                                )
+                                if (isOut && msg.status == "failed") {
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("✕", color = CCritical, fontSize = 10.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            item { Spacer(Modifier.height(4.dp)) }
+        }
+
+        sendError?.let {
+            Text(it, color = CCritical, fontSize = 12.sp, modifier = Modifier.padding(vertical = 4.dp))
+        }
+
+        if (topThreat != null) {
+            Spacer(Modifier.height(4.dp))
+            Row(
+                Modifier.fillMaxWidth().background(CCritical.copy(alpha = 0.10f), CShape).padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Active tracker: ${topThreat.tracker?.label ?: topThreat.name}", color = CCritical, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Tap to share with the group", color = CMuted, fontSize = 10.sp)
+                }
+                SmallButton("SHARE THREAT", CCritical) {
+                    scope.launch {
+                        CommsRepository.shareThreats(
+                            gid = groupId,
+                            kind = "FOLLOWING",
+                            severity = topThreat.threat.name,
+                            lat = status.lat,
+                            lon = status.lon,
+                            title = topThreat.tracker?.label ?: topThreat.name,
+                            detail = "Aegis has detected a possible following tracker."
+                        ).onFailure { sendError = it.message }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(6.dp))
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
+            OutlinedTextField(
+                value = draft, onValueChange = { draft = it },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("Message", color = CMuted, fontSize = 14.sp) },
+                maxLines = 4,
+                colors = fieldColors()
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = {
+                    val text = draft.trim()
+                    if (text.isEmpty()) return@Button
+                    val toSend = text
+                    sendError = null
+                    draft = ""
+                    scope.launch {
+                        CommsRepository.sendGroupMessage(groupId, toSend)
+                            .onFailure { sendError = it.message ?: "Could not send" }
+                    }
+                },
+                enabled = draft.isNotBlank(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = CAccent, contentColor = Color(0xFF12161D),
+                    disabledContainerColor = CPanelHi, disabledContentColor = CMuted
+                ),
+                shape = CShape,
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)
+            ) { Text("SEND", fontWeight = FontWeight.Bold, letterSpacing = 1.sp, fontSize = 12.sp) }
+        }
+        Spacer(Modifier.height(16.dp))
+    }
+}
+
+// ── Group member management ───────────────────────────────────────────────────
+
+@Composable
+private fun OrgScreen(groupId: String, onBack: () -> Unit, onLeft: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    val groupsVersion by groupsVersionFlow.collectAsStateWithLifecycle()
+    val myNumber = CommsRepository.state.value.number ?: ""
+
+    val group by produceState<Group?>(null, groupId, groupsVersion) {
+        value = withContext(Dispatchers.IO) { CommsRepository.groups().find { it.id == groupId } }
+    }
+    val members by produceState(emptyList<GroupMember>(), groupId, groupsVersion) {
+        value = withContext(Dispatchers.IO) { CommsRepository.groupMembers(groupId) }
+    }
+
+    val myRole = members.find { it.number == myNumber }?.role ?: OrgRole.MEMBER
+    var addMember by remember { mutableStateOf(false) }
+    var leaveConfirm by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    if (addMember) {
+        AddGroupMemberDialog(
+            groupId = groupId,
+            existing = members.map { it.number },
+            onDismiss = { addMember = false }
+        )
+    }
+
+    if (leaveConfirm) {
+        AlertDialog(
+            onDismissRequest = { leaveConfirm = false },
+            containerColor = CPanel,
+            title = { Text("Leave group?", color = CInk, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "You will leave \"${group?.name ?: "this group"}\" and will no longer receive its messages.",
+                    color = CMuted, fontSize = 13.sp, lineHeight = 18.sp
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    leaveConfirm = false
+                    scope.launch {
+                        CommsRepository.leaveGroup(groupId)
+                            .onSuccess { onLeft() }
+                            .onFailure { error = it.message }
+                    }
+                }) { Text("LEAVE", color = CCritical, fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
+            },
+            dismissButton = { TextButton(onClick = { leaveConfirm = false }) { Text("CANCEL", color = CMuted) } }
+        )
+    }
+
+    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp).verticalScroll(rememberScrollState())) {
+        Spacer(Modifier.height(20.dp))
+        Header(group?.name ?: "Group", onBack = onBack) {
+            if (myRole == OrgRole.ADMIN) SmallButton("+ ADD", CClear) { addMember = true }
+        }
+        Spacer(Modifier.height(4.dp))
+        Text("${members.size} member${if (members.size == 1) "" else "s"}", color = CMuted, fontSize = 11.sp)
+        Spacer(Modifier.height(12.dp))
+
+        error?.let {
+            Text(it, color = CCritical, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
+        }
+
+        SectionLabel("MEMBERS")
+        Spacer(Modifier.height(6.dp))
+        Card {
+            if (members.isEmpty()) {
+                Text("No members yet.", color = CMuted, fontSize = 13.sp)
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    members.forEach { member ->
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    member.name.ifBlank { formatAegisNumber(member.number) },
+                                    color = CInk, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    formatAegisNumber(member.number),
+                                    color = CMuted, fontSize = 10.sp, fontFamily = FontFamily.Monospace
+                                )
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Badge(member.role.name, if (member.role == OrgRole.ADMIN) CAccent else CInkDim)
+                            if (myRole == OrgRole.ADMIN && member.number != myNumber) {
+                                SmallButton("REMOVE", CCritical) {
+                                    scope.launch {
+                                        CommsRepository.removeGroupMember(groupId, member.number)
+                                            .onFailure { error = it.message }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        SectionLabel("ACTIONS")
+        Spacer(Modifier.height(6.dp))
+        Card {
+            Row(
+                Modifier.fillMaxWidth().clickable { leaveConfirm = true }.padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Leave group", color = CCritical, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                Text("›", color = CCritical, fontSize = 16.sp)
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun AddGroupMemberDialog(groupId: String, existing: List<String>, onDismiss: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    val version by CommsRepository.version.collectAsStateWithLifecycle()
+    val contacts by produceState(emptyList<Contact>(), version) {
+        value = withContext(Dispatchers.IO) { CommsRepository.contacts() }
+    }
+    val available = contacts.filter { it.number !in existing }
+    var selected by remember { mutableStateOf<Contact?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        containerColor = CPanel,
+        title = { Text("Add member", color = CInk, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (available.isEmpty()) {
+                    Text(
+                        if (contacts.isEmpty()) "Add contacts first, then add them to groups."
+                        else "All your contacts are already in this group.",
+                        color = CMuted, fontSize = 13.sp
+                    )
+                } else {
+                    Text("Choose a contact to add:", color = CMuted, fontSize = 12.sp)
+                    LazyColumn(modifier = Modifier.heightIn(max = 240.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        items(available, key = { it.number }) { c ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(CShape)
+                                    .background(if (selected?.number == c.number) CAccent.copy(alpha = 0.15f) else CPanelHi)
+                                    .clickable { selected = c }
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(c.name, color = CInk, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text(formatAegisNumber(c.number), color = CMuted, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                                }
+                                if (selected?.number == c.number) {
+                                    Text("✓", color = CAccent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                }
+                error?.let { Text(it, color = CCritical, fontSize = 12.sp) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val c = selected ?: return@TextButton
+                    busy = true
+                    error = null
+                    scope.launch {
+                        CommsRepository.addGroupMember(groupId, c.number)
+                            .onSuccess { onDismiss() }
+                            .onFailure { busy = false; error = it.message ?: "Could not add member" }
+                    }
+                },
+                enabled = selected != null && !busy
+            ) {
+                Text(
+                    if (busy) "ADDING…" else "ADD",
+                    color = if (selected != null && !busy) CAccent else CMuted,
+                    fontWeight = FontWeight.Bold, letterSpacing = 1.sp
+                )
+            }
+        },
+        dismissButton = { TextButton(onClick = { if (!busy) onDismiss() }, enabled = !busy) { Text("CANCEL", color = CMuted) } }
+    )
 }
 
 /**

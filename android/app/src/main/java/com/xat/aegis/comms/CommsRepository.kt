@@ -1,12 +1,16 @@
 package com.xat.aegis.comms
 
 import android.app.Activity
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.net.Network
 import android.net.ConnectivityManager
 import android.util.Log
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.xat.aegis.MainActivity
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -21,6 +25,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import org.unifiedpush.android.connector.UnifiedPush
 import uniffi.aegis_comms_crypto.CryptoException
@@ -49,6 +54,10 @@ import java.util.UUID
  *   {"v":1,"t":"voicemail","id":uuid,"ts":ms,"audio":base64 AMR-NB,"dur":ms,...}
  *   {"v":1,"t":"media","id":uuid,"ts":ms,"mime":..,"w":..,"h":..,"dur":ms,"size":bytes,"n":chunks,"cap":..,"thumb":b64,...}
  *   {"v":1,"t":"mchunk","id":media uuid,"i":index,"data":base64,...}   — one of "n" pieces of the file
+ *   {"v":1,"t":"gmsg","gid":group,"id":uuid,"ts":ms,"body":text,...}   — a group message, one envelope per member
+ *   {"v":1,"t":"gctl","gid":group,"op":roster|add|remove|join,...}      — a group's roster, kept by its admins
+ *   {"v":1,"t":"threat","gid":group,"id":uuid,"ts":ms,"kind":..,"sev":..,"lat":..,"lon":..,"title":..,"detail":..,"exp":ms,...}
+ *   {"v":1,"t":"panic","gid":group,"id":uuid,"ts":ms,"lat":..,"lon":..,"note":text,...}
  * The sender's keys ride along so a first message from someone who has our
  * number pins their identity without trusting the relay for it; the relay's
  * record for that number must still match before the message is accepted.
@@ -69,6 +78,19 @@ object CommsRepository {
     private const val MEDIA_RECEIVE_TIMEOUT_MS = 10L * 60_000L
     private const val HOLD_FOREGROUND = "foreground"
     private const val HOLD_CALL = "call"
+
+    // Organisation groups. Every group message is one envelope per member, so groups stay modest.
+    private const val MAX_GROUP_MEMBERS = 200
+    private const val MAX_GROUP_NAME = 60
+    private const val MAX_THREAT_TEXT = 500
+    private val THREAT_KINDS = setOf("FOLLOWING", "CATCHER", "WIFI_ANOMALY", "CORRELATED")
+    private val THREAT_SEVERITIES = setOf("CRITICAL", "HIGH", "MEDIUM", "LOW")
+    /** How long a shared threat stays on members' maps; a catcher sits still, a follower moves on. */
+    private const val THREAT_TTL_MS = 3600_000L
+    private const val CATCHER_TTL_MS = 24 * 3600_000L
+    /** Intent extra naming the group conversation MainActivity should open (with [CommsNotifications.EXTRA_TAB]). */
+    const val EXTRA_GROUP = "com.xat.aegis.GROUP"
+    const val ACTION_OPEN_GROUP = "com.xat.aegis.OPEN_GROUP"
 
     private lateinit var appContext: Context
     private lateinit var config: CommsConfig

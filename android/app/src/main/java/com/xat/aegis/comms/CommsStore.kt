@@ -62,6 +62,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         createVersion2(db)
         createVersion3(db)
         createVersion4(db)
+        createVersion5(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -70,6 +71,63 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         if (oldVersion < 2) createVersion2(db)
         if (oldVersion < 3) createVersion3(db)
         if (oldVersion < 4) createVersion4(db)
+        if (oldVersion < 5) createVersion5(db)
+    }
+
+    /** Names of the columns [table] has, so a migration can add one only when it is missing. */
+    private fun columnsOf(db: SQLiteDatabase, table: String): Set<String> =
+        db.rawQuery("PRAGMA table_info($table)", null).use { c ->
+            generateSequence { if (c.moveToNext()) c.getString(c.getColumnIndexOrThrow("name")) else null }.toSet()
+        }
+
+    /**
+     * Organisation groups: the groups this identity is in, their rosters, the
+     * threats members shared, and two columns on messages so a group
+     * conversation (peer = group id) knows its group and who in it sent what.
+     */
+    private fun createVersion5(db: SQLiteDatabase) {
+        val columns = columnsOf(db, "messages")
+        if ("gid" !in columns) db.execSQL("ALTER TABLE messages ADD COLUMN gid TEXT")
+        if ("sender" !in columns) db.execSQL("ALTER TABLE messages ADD COLUMN sender TEXT")
+        db.execSQL("CREATE INDEX IF NOT EXISTS messages_gid_ts ON messages (gid, ts)")
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                my_role TEXT NOT NULL DEFAULT 'MEMBER'
+            )"""
+        )
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS group_members (
+                gid TEXT NOT NULL,
+                number TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT 'MEMBER',
+                ed25519 TEXT NOT NULL DEFAULT '',
+                added_by TEXT NOT NULL DEFAULT '',
+                added_ts INTEGER NOT NULL,
+                PRIMARY KEY (gid, number)
+            )"""
+        )
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS shared_threats (
+                id TEXT PRIMARY KEY,
+                gid TEXT NOT NULL,
+                from_number TEXT NOT NULL,
+                from_name TEXT NOT NULL DEFAULT '',
+                ts INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                expires_at INTEGER NOT NULL
+            )"""
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS shared_threats_gid_ts ON shared_threats (gid, ts)")
     }
 
     /**
@@ -190,10 +248,15 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
 
     // ── Messages ─────────────────────────────────────────────────────────
 
-    fun insertMessage(m: ChatMessage) {
+    /**
+     * Stores a message; a second copy of the same id is ignored. With [gid] it is
+     * a group message: its row belongs to the group conversation (peer is the
+     * group id, whatever [m.peer] says), and [ChatMessage.sender] names the member.
+     */
+    fun insertMessage(m: ChatMessage, gid: String? = null) {
         val values = ContentValues().apply {
             put("id", m.id)
-            put("peer", m.peer)
+            put("peer", gid ?: m.peer)
             put("direction", m.direction.name)
             put("body_enc", KeystoreBox.encryptString(m.body))
             put("ts", m.ts)
@@ -201,9 +264,14 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             put("read", if (m.read) 1 else 0)
             put("error", m.error)
             put("kind", m.kind)
+            put("gid", gid)
+            put("sender", m.sender)
         }
         writableDatabase.insertWithOnConflict("messages", null, values, SQLiteDatabase.CONFLICT_IGNORE)
     }
+
+    /** Stores a message in group [gid]'s conversation; see [insertMessage]. */
+    fun insertGroupMessage(gid: String, m: ChatMessage) = insertMessage(m, gid)
 
     fun hasMessage(id: String): Boolean =
         readableDatabase.rawQuery("SELECT 1 FROM messages WHERE id = ?", arrayOf(id)).use { it.moveToFirst() }
@@ -406,6 +474,185 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
         readableDatabase.rawQuery("SELECT COUNT(*) FROM messages WHERE direction = 'IN' AND read = 0", null).use { c ->
             if (c.moveToFirst()) c.getInt(0) else 0
         }
+
+    // ── Organisation groups ──────────────────────────────────────────────
+
+    /** Inserts or updates a group (name and role); its members are kept as they are. */
+    fun insertGroup(group: Group) {
+        val values = ContentValues().apply {
+            put("id", group.id)
+            put("name", group.name)
+            put("created_by", group.createdBy)
+            put("created_ts", group.createdTs)
+            put("my_role", group.myRole.name)
+        }
+        writableDatabase.insertWithOnConflict("groups", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun groups(): List<Group> =
+        readableDatabase.query("groups", null, null, null, null, null, "name COLLATE NOCASE ASC").use { c ->
+            val out = ArrayList<Group>()
+            while (c.moveToNext()) out += readGroup(c)
+            out
+        }
+
+    fun group(id: String): Group? =
+        readableDatabase.query("groups", null, "id = ?", arrayOf(id), null, null, null).use { c ->
+            if (c.moveToFirst()) readGroup(c) else null
+        }
+
+    /** Deletes the group, its roster, its conversation and the threats shared in it; returns the ids of its media messages. */
+    fun deleteGroup(id: String): List<String> {
+        val media = mediaIds(id)
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            for (m in media) db.delete("media_chunks", "id = ?", arrayOf(m))
+            db.delete("messages", "gid = ? OR peer = ?", arrayOf(id, id))
+            db.delete("shared_threats", "gid = ?", arrayOf(id))
+            db.delete("group_members", "gid = ?", arrayOf(id))
+            db.delete("groups", "id = ?", arrayOf(id))
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return media
+    }
+
+    fun setGroupRole(gid: String, myRole: OrgRole) {
+        writableDatabase.update("groups", ContentValues().apply { put("my_role", myRole.name) }, "id = ?", arrayOf(gid))
+    }
+
+    /** Inserts or updates a member; the same number in the same group is one row. */
+    fun insertGroupMember(member: GroupMember) {
+        val values = ContentValues().apply {
+            put("gid", member.gid)
+            put("number", member.number)
+            put("name", member.name)
+            put("role", member.role.name)
+            put("ed25519", member.ed25519)
+            put("added_by", member.addedBy)
+            put("added_ts", member.addedTs)
+        }
+        writableDatabase.insertWithOnConflict("group_members", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun groupMembers(gid: String): List<GroupMember> =
+        readableDatabase.query("group_members", null, "gid = ?", arrayOf(gid), null, null, "role ASC, name COLLATE NOCASE ASC").use { c ->
+            val out = ArrayList<GroupMember>()
+            while (c.moveToNext()) out += readGroupMember(c)
+            out
+        }
+
+    fun groupMember(gid: String, number: String): GroupMember? =
+        readableDatabase.query("group_members", null, "gid = ? AND number = ?", arrayOf(gid, number), null, null, null).use { c ->
+            if (c.moveToFirst()) readGroupMember(c) else null
+        }
+
+    fun removeGroupMember(gid: String, number: String) {
+        writableDatabase.delete("group_members", "gid = ? AND number = ?", arrayOf(gid, number))
+    }
+
+    /** Records a shared threat; a second copy of the same id (a re-sent envelope) is ignored. */
+    fun insertSharedThreat(threat: SharedThreat) {
+        val values = ContentValues().apply {
+            put("id", threat.id)
+            put("gid", threat.gid)
+            put("from_number", threat.fromNumber)
+            put("from_name", threat.fromName)
+            put("ts", threat.ts)
+            put("kind", threat.kind)
+            put("severity", threat.severity)
+            put("lat", threat.lat)
+            put("lon", threat.lon)
+            put("title", threat.title)
+            put("detail", threat.detail)
+            put("expires_at", threat.expiresAt)
+        }
+        writableDatabase.insertWithOnConflict("shared_threats", null, values, SQLiteDatabase.CONFLICT_IGNORE)
+    }
+
+    fun hasSharedThreat(id: String): Boolean =
+        readableDatabase.rawQuery("SELECT 1 FROM shared_threats WHERE id = ?", arrayOf(id)).use { it.moveToFirst() }
+
+    /** Threats shared in [gid] (or in every group, when null), newest first. */
+    fun sharedThreats(gid: String? = null): List<SharedThreat> =
+        readableDatabase.query(
+            "shared_threats", null, if (gid != null) "gid = ?" else null, if (gid != null) arrayOf(gid) else null,
+            null, null, "ts DESC"
+        ).use { c ->
+            val out = ArrayList<SharedThreat>()
+            while (c.moveToNext()) out += readSharedThreat(c)
+            out
+        }
+
+    /** Forgets threats whose time is up; returns how many. */
+    fun expireSharedThreats(now: Long): Int =
+        writableDatabase.compileStatement("DELETE FROM shared_threats WHERE expires_at < ?").use { s ->
+            s.bindLong(1, now)
+            s.executeUpdateDelete()
+        }
+
+    /** The newest [limit] messages in group [gid]'s conversation, newest first. */
+    fun groupMessages(gid: String, limit: Int = 100): List<ChatMessage> =
+        readableDatabase.query("messages", null, "gid = ?", arrayOf(gid), null, null, "ts DESC", limit.toString()).use { c ->
+            val out = ArrayList<ChatMessage>()
+            while (c.moveToNext()) readMessage(c)?.let { out += it }
+            out
+        }
+
+    /** Marks a group conversation read; group messages are not receipted, so nothing is returned. */
+    fun markGroupRead(gid: String) {
+        writableDatabase.execSQL("UPDATE messages SET read = 1 WHERE gid = ? AND direction = 'IN' AND read = 0", arrayOf(gid))
+    }
+
+    fun groupUnread(gid: String): Int =
+        readableDatabase.rawQuery(
+            "SELECT COUNT(*) FROM messages WHERE gid = ? AND direction = 'IN' AND read = 0", arrayOf(gid)
+        ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+
+    /** The newest unread inbound messages in group [gid], oldest first, for the notification. */
+    fun unreadGroupInbound(gid: String, limit: Int): List<ChatMessage> =
+        readableDatabase.query(
+            "messages", null, "gid = ? AND direction = 'IN' AND read = 0", arrayOf(gid), null, null, "ts DESC", limit.toString()
+        ).use { c ->
+            val out = ArrayList<ChatMessage>()
+            while (c.moveToNext()) readMessage(c)?.let { out += it }
+            out.reversed()
+        }
+
+    private fun readGroup(c: Cursor) = Group(
+        id = c.getString(c.getColumnIndexOrThrow("id")),
+        name = c.getString(c.getColumnIndexOrThrow("name")),
+        createdBy = c.getString(c.getColumnIndexOrThrow("created_by")),
+        createdTs = c.getLong(c.getColumnIndexOrThrow("created_ts")),
+        myRole = runCatching { OrgRole.valueOf(c.getString(c.getColumnIndexOrThrow("my_role"))) }.getOrDefault(OrgRole.MEMBER)
+    )
+
+    private fun readGroupMember(c: Cursor) = GroupMember(
+        gid = c.getString(c.getColumnIndexOrThrow("gid")),
+        number = c.getString(c.getColumnIndexOrThrow("number")),
+        name = c.getString(c.getColumnIndexOrThrow("name")),
+        role = runCatching { OrgRole.valueOf(c.getString(c.getColumnIndexOrThrow("role"))) }.getOrDefault(OrgRole.MEMBER),
+        ed25519 = c.getString(c.getColumnIndexOrThrow("ed25519")),
+        addedBy = c.getString(c.getColumnIndexOrThrow("added_by")),
+        addedTs = c.getLong(c.getColumnIndexOrThrow("added_ts"))
+    )
+
+    private fun readSharedThreat(c: Cursor) = SharedThreat(
+        id = c.getString(c.getColumnIndexOrThrow("id")),
+        gid = c.getString(c.getColumnIndexOrThrow("gid")),
+        fromNumber = c.getString(c.getColumnIndexOrThrow("from_number")),
+        fromName = c.getString(c.getColumnIndexOrThrow("from_name")),
+        ts = c.getLong(c.getColumnIndexOrThrow("ts")),
+        kind = c.getString(c.getColumnIndexOrThrow("kind")),
+        severity = c.getString(c.getColumnIndexOrThrow("severity")),
+        lat = c.getDouble(c.getColumnIndexOrThrow("lat")),
+        lon = c.getDouble(c.getColumnIndexOrThrow("lon")),
+        title = c.getString(c.getColumnIndexOrThrow("title")),
+        detail = c.getString(c.getColumnIndexOrThrow("detail")),
+        expiresAt = c.getLong(c.getColumnIndexOrThrow("expires_at"))
+    )
 
     // ── Media chunks on their way in ─────────────────────────────────────
 
@@ -651,6 +898,9 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             db.delete("receipts", null, null)
             db.delete("transactions", null, null)
             db.delete("media_chunks", null, null)
+            db.delete("groups", null, null)
+            db.delete("group_members", null, null)
+            db.delete("shared_threats", null, null)
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
@@ -674,6 +924,7 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             .getOrElse { return null }
         val errorIdx = c.getColumnIndexOrThrow("error")
         val kindIdx = c.getColumnIndex("kind")
+        val senderIdx = c.getColumnIndex("sender")
         return ChatMessage(
             id = c.getString(c.getColumnIndexOrThrow("id")),
             peer = c.getString(c.getColumnIndexOrThrow("peer")),
@@ -683,12 +934,13 @@ class CommsStore(context: Context) : SQLiteOpenHelper(context.applicationContext
             status = c.getString(c.getColumnIndexOrThrow("status")),
             read = c.getInt(c.getColumnIndexOrThrow("read")) != 0,
             error = if (c.isNull(errorIdx)) null else c.getString(errorIdx),
-            kind = if (kindIdx >= 0 && !c.isNull(kindIdx)) c.getString(kindIdx) else KIND_TEXT
+            kind = if (kindIdx >= 0 && !c.isNull(kindIdx)) c.getString(kindIdx) else KIND_TEXT,
+            sender = if (senderIdx >= 0 && !c.isNull(senderIdx)) c.getString(senderIdx) else null
         )
     }
 
     private companion object {
         const val DB_NAME = "comms_e2ee.db"
-        const val DB_VERSION = 4
+        const val DB_VERSION = 5
     }
 }
