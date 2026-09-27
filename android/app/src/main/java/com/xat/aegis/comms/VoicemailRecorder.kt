@@ -2,6 +2,7 @@ package com.xat.aegis.comms
 
 import android.content.Context
 import android.media.MediaRecorder
+import com.xat.aegis.analysis.PhoneHealthMonitor
 import java.io.File
 import java.util.Base64
 
@@ -23,6 +24,8 @@ class VoicemailRecorder(context: Context) {
     private var recorder: MediaRecorder? = null
     private var file: File? = null
     private var startedAt = 0L
+    /** The recording's audio session, registered with [PhoneHealthMonitor] as our own. */
+    private var sessionId: Int? = null
 
     val isRecording: Boolean get() = recorder != null
 
@@ -57,6 +60,14 @@ class VoicemailRecorder(context: Context) {
         file = f
         startedAt = System.currentTimeMillis()
         recorder = r
+        // Otherwise the Device tab reports this very recording as another app on the mic.
+        sessionId = runCatching { r.activeRecordingConfiguration?.clientAudioSessionId }.getOrNull()
+            ?.also { PhoneHealthMonitor.ownRecordingStarted(it) }
+    }
+
+    private fun releaseSession() {
+        sessionId?.let { PhoneHealthMonitor.ownRecordingStopped(it) }
+        sessionId = null
     }
 
     /**
@@ -80,6 +91,7 @@ class VoicemailRecorder(context: Context) {
             null
         } finally {
             runCatching { r.release() }
+            releaseSession()
             f?.delete()
         }
     }
@@ -94,6 +106,7 @@ class VoicemailRecorder(context: Context) {
             runCatching { r.stop() }
             runCatching { r.release() }
         }
+        releaseSession()
         f?.delete()
     }
 

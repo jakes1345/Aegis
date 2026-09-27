@@ -8,6 +8,7 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.AudioRecord
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.media.ToneGenerator
@@ -19,6 +20,7 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.xat.aegis.analysis.PhoneHealthMonitor
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -134,6 +136,10 @@ object CallManager {
     }
 
     private var factory: PeerConnectionFactory? = null
+    /** The audio module behind [factory]; kept to find the microphone session WebRTC opens. */
+    private var audioModule: JavaAudioDeviceModule? = null
+    /** Audio session of the call microphone while it is open, registered as our own. */
+    private var micSessionId: Int? = null
     private var media: Media? = null
     private var pendingOffer: SessionDescription? = null
     /** Candidates for the current call that arrived before its remote description was set. */
@@ -562,13 +568,43 @@ object CallManager {
                 override fun onWebRtcAudioTrackStartError(errorCode: JavaAudioDeviceModule.AudioTrackStartErrorCode, errorMessage: String) { CommsLog.add("Call audio could not start: $errorMessage") }
                 override fun onWebRtcAudioTrackError(errorMessage: String) { CommsLog.add("Call audio error: $errorMessage") }
             })
+            // The call microphone is a recording like any other to the platform, and
+            // the Device tab's microphone monitor counted it as some other app
+            // listening in on every call. Tell the monitor which session is ours.
+            .setAudioRecordStateCallback(object : JavaAudioDeviceModule.AudioRecordStateCallback {
+                override fun onWebRtcAudioRecordStart() {
+                    val id = audioModule?.let { micSessionId(it) } ?: return
+                    micSessionId = id
+                    PhoneHealthMonitor.ownRecordingStarted(id)
+                }
+
+                override fun onWebRtcAudioRecordStop() {
+                    micSessionId?.let { PhoneHealthMonitor.ownRecordingStopped(it) }
+                    micSessionId = null
+                }
+            })
             .createAudioDeviceModule()
+        audioModule = adm
         val created = PeerConnectionFactory.builder().setAudioDeviceModule(adm).createPeerConnectionFactory()
-        // The factory keeps its own reference; ours is not needed any more.
+        // The factory keeps its own reference to the native module; releasing ours
+        // leaves the Java-side audioInput intact, which is all the callback reads.
         adm.release()
         factory = created
         return created
     }
+
+    /**
+     * The audio session of the AudioRecord WebRTC captures from. The module exposes
+     * its [org.webrtc.audio.WebRtcAudioRecord] but not the record inside it, so this
+     * reads the private field; `org.webrtc.**` is kept whole by the library's own
+     * consumer rules, so the name survives shrinking. Null when it cannot be read —
+     * then the call is simply counted as before, never a crash.
+     */
+    private fun micSessionId(adm: JavaAudioDeviceModule): Int? = runCatching {
+        val input = adm.audioInput
+        val field = input.javaClass.getDeclaredField("audioRecord").apply { isAccessible = true }
+        (field.get(input) as? AudioRecord)?.audioSessionId
+    }.getOrNull()
 
     private suspend fun createPeerConnection(callId: String): Media {
         val servers = withContext(Dispatchers.IO) {

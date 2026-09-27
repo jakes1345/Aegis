@@ -460,10 +460,10 @@ class ScanService : LifecycleService() {
 
                 // WiFi anomaly scan: immediately on first cycle, then every ~60s
                 if (publishCycle == 1 || publishCycle % 40 == 0) {
-                    // The picture the WIFI tab shows, then the judgement on it. A fresh
-                    // scan is requested first so the next cycle reads new beacons rather
-                    // than whatever the platform cached before the scanner started.
-                    WifiScanner.requestScan(this@ScanService)
+                    // The picture the WIFI tab shows, then the judgement on it. The
+                    // snapshot requests a fresh scan and waits for its results, so both
+                    // it and the anomaly scan below read this cycle's beacons rather than
+                    // whatever the platform cached last time.
                     runCatching { WifiScanner.snapshot(this@ScanService) }.getOrNull()?.let { Registry.publishWifiStatus(it) }
                     val wifiAnomalies = WifiScanner.scan(this@ScanService)
                     Registry.publishWifi(wifiAnomalies)

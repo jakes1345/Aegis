@@ -1,7 +1,10 @@
 package com.xat.aegis.analysis
 
 import android.Manifest
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -17,6 +20,8 @@ import com.xat.aegis.WifiConnection
 import com.xat.aegis.WifiNetwork
 import com.xat.aegis.WifiSecurity
 import com.xat.aegis.WifiStatus
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.Inet4Address
 import java.net.Inet6Address
 
@@ -178,24 +183,59 @@ object WifiScanner {
     // ── Live picture: connected network, IP stack, everything in range ───────
 
     /**
-     * Asks the platform for a fresh scan. Throttled by Android to four requests per
-     * two minutes in the foreground; a refused request is not an error, the cached
-     * results are simply what [snapshot] reads next.
+     * Asks the platform for a fresh scan and waits for it to land, up to
+     * [SCAN_TIMEOUT_MS]. `startScan` only *starts* a scan — the results arrive two to
+     * five seconds later with [WifiManager.SCAN_RESULTS_AVAILABLE_ACTION] — so a caller
+     * that read the cache straight after it always saw the previous refresh. The
+     * broadcast is what says the cache is new.
+     *
+     * Returns true when the cache now holds fresh results. Android throttles scans to
+     * four requests per two minutes in the foreground; a refused request is not an
+     * error, the cached results are simply what [snapshot] reads.
      */
-    fun requestScan(context: Context) {
-        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
-        if (!wifi.isWifiEnabled) return
-        @Suppress("DEPRECATION")
-        runCatching { wifi.startScan() }
+    suspend fun requestScan(context: Context): Boolean {
+        val app = context.applicationContext
+        val wifi = app.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return false
+        if (!wifi.isWifiEnabled) return false
+        val fresh = CompletableDeferred<Boolean>()
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                fresh.complete(intent.getBooleanExtra(WifiManager.EXTRA_RESULTS_UPDATED, false))
+            }
+        }
+        // A protected system broadcast: only the platform can send it, so the
+        // receiver need not be exported. Same flag the service uses for SCREEN_ON.
+        val registered = runCatching {
+            ContextCompat.registerReceiver(
+                app, receiver, IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+        }.isSuccess
+        if (!registered) return false
+        try {
+            @Suppress("DEPRECATION")
+            val started = runCatching { wifi.startScan() }.getOrDefault(false)
+            if (!started) return false
+            return withTimeoutOrNull(SCAN_TIMEOUT_MS) { fresh.await() } ?: false
+        } finally {
+            // One unregister on every path — success, timeout or cancellation. A
+            // second call on the same receiver throws, hence not in onReceive too.
+            runCatching { app.unregisterReceiver(receiver) }
+        }
     }
+
+    /** Longest wait for scan results before falling back to the cache. */
+    private const val SCAN_TIMEOUT_MS = 5_000L
 
     /**
      * What the WIFI tab shows: the network the phone is on, with its addressing, and
-     * every access point in the scan cache sorted strongest first. Each nearby
-     * network carries the flags that make it worth a look — open, WEP, hidden, a
-     * twin of the connected network — so the list is a judgement, not a dump.
+     * every access point in range sorted strongest first. A fresh scan is requested
+     * and awaited first, so the list is this refresh, not the previous one. Each
+     * nearby network carries the flags that make it worth a look — open, WEP,
+     * hidden, a twin of the connected network — so the list is a judgement, not a
+     * dump.
      */
-    fun snapshot(context: Context): WifiStatus {
+    suspend fun snapshot(context: Context): WifiStatus {
         val app = context.applicationContext
         val wifi = app.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             ?: return WifiStatus(available = false, reason = "No Wi-Fi service on this device")
@@ -205,6 +245,10 @@ object WifiScanner {
         if (!wifi.isWifiEnabled) {
             return WifiStatus(available = false, reason = "Wi-Fi is turned off", wifiEnabled = false)
         }
+
+        // Waits for the results broadcast (or the timeout) before reading the cache;
+        // when the platform refuses the request, the cache is what there is.
+        requestScan(app)
 
         val now = System.currentTimeMillis()
         val connection = connection(app, wifi)

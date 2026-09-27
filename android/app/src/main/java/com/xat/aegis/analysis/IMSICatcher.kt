@@ -24,6 +24,14 @@ class IMSICatcher(private val store: Store) {
     private data class Ephemeral(
         val cell: ServingCell,
         val registeredAt: Long,
+        /**
+         * When the cell stopped being the serving cell, or null while it still is.
+         * The ephemeral-tower heuristics measure a cell's lifetime to here, not to
+         * "now": [gone] is only confirmed five minutes after the cell was last seen,
+         * so a lifetime measured at that point always read as five minutes or more
+         * and neither heuristic could ever fire.
+         */
+        var vanishedAt: Long? = null,
         var gone: Boolean = false,
         var reported: Boolean = false,
         var reportedLoose: Boolean = false
@@ -80,11 +88,17 @@ class IMSICatcher(private val store: Store) {
     }
 
     private fun isStationary(fix: Fix?): Boolean {
-        val speed = fix?.speed
+        // LocationTrack.current is never expired, so when GPS stops (subway, indoors)
+        // the last fix lingers with zero speed and read as "standing still", arming
+        // every motion-gated heuristic while the user was in fact travelling. No fix,
+        // or one older than FIX_STALE_MS, means movement is unknown — and unknown is
+        // not stationary.
+        if (fix == null || System.currentTimeMillis() - fix.time > FIX_STALE_MS) return false
+        val speed = fix.speed
         val previousFix = prevFix
         return when {
             speed != null -> speed < MOVING_SPEED_MS
-            previousFix != null && fix != null -> haversine(previousFix, fix) < 200.0
+            previousFix != null -> haversine(previousFix, fix) < 200.0
             else -> true
         }
     }
@@ -99,13 +113,16 @@ class IMSICatcher(private val store: Store) {
     private fun updateEphemeral(current: ServingCell, now: Long) {
         val activeKeys = recent.map { it.cell.key }.toSet()
         for (e in ephemeral.values) {
-            if (!e.gone && e.cell.key != current.key && !activeKeys.contains(e.cell.key) &&
-                now - e.registeredAt > 60_000L
-            ) {
+            if (e.cell.key == current.key) continue
+            // Not serving any more: this is where its lifetime ends. `gone` below is
+            // the later confirmation that it stayed away, not the end of the stint.
+            if (e.vanishedAt == null) e.vanishedAt = now
+            if (!e.gone && !activeKeys.contains(e.cell.key) && now - e.registeredAt > 60_000L) {
                 e.gone = true
             }
         }
-        ephemeral.getOrPut(current.key) { Ephemeral(current, now) }
+        // Serving again (or for the first time): the stint is open, so no vanish time.
+        ephemeral.getOrPut(current.key) { Ephemeral(current, now) }.vanishedAt = null
         if (ephemeral.size > 200) {
             val iter = ephemeral.iterator()
             var n = 0
@@ -162,11 +179,20 @@ class IMSICatcher(private val store: Store) {
             )
         }
 
-        // 3 — TAC change while stationary
+        // 3 — TAC change while stationary.
+        // Only when both readings use the same number space: the `tac` field holds
+        // the LTE/NR tracking area code, but on 2G/3G the modem reports the location
+        // area code there instead — a different number — so an ordinary LTE → 3G
+        // reselection while sitting still read as an "area change" and stacked a
+        // MEDIUM on top of the downgrade finding. Same RAT, or both LTE-or-better
+        // (LTE and NR share the TAC space), is the comparison that means something.
+        // Gated on [stationary] rather than on a distance between the last two fixes,
+        // which two copies of one stale fix put at zero.
         val p = prev
         if (p != null && p.tac != null && cell.tac != null && p.tac != cell.tac) {
-            val moved = if (prevFix != null && fix != null) haversine(prevFix!!, fix) > 200.0 else true
-            if (!moved) {
+            val sameTacSpace = p.rat == cell.rat ||
+                (p.rat.rank >= Rat.LTE.rank && cell.rat.rank >= Rat.LTE.rank)
+            if (stationary && sameTacSpace) {
                 findings += CatcherFinding(
                     id = "tac_change_stationary", severity = Severity.MEDIUM,
                     title = "Area change while stationary",
@@ -205,7 +231,8 @@ class IMSICatcher(private val store: Store) {
         // lists findings by id and duplicates used to take the Cell tab down.
         for ((key, e) in ephemeral) {
             if (e.gone && !e.reportedLoose && key != cell.key) {
-                val lifetime = now - e.registeredAt
+                val vanishedAt = e.vanishedAt ?: continue
+                val lifetime = vanishedAt - e.registeredAt
                 if (lifetime < 5 * 60_000L) {
                     findings += CatcherFinding(
                         id = "ephemeral_cell:${e.cell.cellId}", severity = Severity.MEDIUM,
@@ -291,7 +318,8 @@ class IMSICatcher(private val store: Store) {
         // 12 — Cell active for < 90s then replaced (ephemeral, stricter threshold)
         for ((key, e) in ephemeral) {
             if (e.gone && key != cell.key && !e.reported) {
-                val lifetime = now - e.registeredAt
+                val vanishedAt = e.vanishedAt ?: continue
+                val lifetime = vanishedAt - e.registeredAt
                 if (lifetime in 30_000L..90_000L) {
                     findings += CatcherFinding(
                         id = "ephemeral_cell_strict:${e.cell.cellId}", severity = Severity.HIGH,
@@ -402,6 +430,8 @@ class IMSICatcher(private val store: Store) {
         const val VISIT_GAP_MS = 30 * 60_000L
         /** How long a better radio technology counts as "available here" while still. */
         const val RAT_WINDOW_MS = 30 * 60_000L
+        /** A GPS fix older than this says nothing about whether the user is moving now. */
+        const val FIX_STALE_MS = 90_000L
         /** Store key for the last tracking area observed, so "away" survives restarts. */
         const val LAST_TAC_KEY = "lastTac"
         /** Visits across all areas at which the baseline bar reads full. */

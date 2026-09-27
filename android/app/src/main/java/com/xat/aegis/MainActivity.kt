@@ -446,11 +446,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Reads the connected network and the scan cache for the WIFI tab. */
+    /** Refreshes the scan and reads the connected network and what is in range for the WIFI tab. */
     private fun refreshWifi() {
         lifecycleScope.launch(Dispatchers.IO) {
             runCatching {
-                WifiScanner.requestScan(applicationContext)
+                // The snapshot requests a scan and waits for its results itself.
                 Registry.publishWifiStatus(WifiScanner.snapshot(applicationContext))
                 // The judgement on what is in range is cheap and service-free too.
                 if (!Registry.status.value.scanning) Registry.publishWifi(WifiScanner.scan(applicationContext))

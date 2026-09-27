@@ -75,6 +75,7 @@ class PhoneHealthMonitor(private val context: Context) {
     }
 
     fun start() {
+        active = this
         runCatching {
             audioManager?.registerAudioRecordingCallback(recordingCallback, null)
             // The callback only fires on change; pick up anything already recording.
@@ -87,6 +88,7 @@ class PhoneHealthMonitor(private val context: Context) {
     }
 
     fun stop() {
+        if (active === this) active = null
         runCatching { audioManager?.unregisterAudioRecordingCallback(recordingCallback) }
         runCatching { cameraManager?.unregisterAvailabilityCallback(cameraCallback) }
         unavailableCameras.clear()
@@ -97,8 +99,19 @@ class PhoneHealthMonitor(private val context: Context) {
         // A silenced client is one Android has muted — a background app, or one that
         // lost the microphone to a higher-priority recorder. It hears nothing, so it
         // is not "an app recording audio".
-        val live = configs?.count { !it.isClientSilenced } ?: 0
+        //
+        // The list also includes this app's own recordings — an Aegis call, a voicemail
+        // being recorded — which lit the MICROPHONE ACTIVE banner for the user's own
+        // call. They are told apart by audio session id: `getClientUid()` is not in
+        // the public SDK, and the platform hands a third-party app an anonymised copy
+        // with the uid blanked anyway, so the recorders register their sessions here.
+        val live = configs?.count { !it.isClientSilenced && it.clientAudioSessionId !in ownSessions } ?: 0
         Registry.updatePhoneHealth { it.copy(activeRecordings = live) }
+    }
+
+    /** Re-reads the recording list; for when the set of own sessions has changed. */
+    private fun republishRecordings() {
+        runCatching { publishRecordings(audioManager?.activeRecordingConfigurations) }
     }
 
     private fun publishCameras() {
@@ -486,6 +499,29 @@ class PhoneHealthMonitor(private val context: Context) {
     }
 
     companion object {
+        /** The monitor currently registered for callbacks, if the service is running. */
+        @Volatile
+        private var active: PhoneHealthMonitor? = null
+
+        /**
+         * Audio session ids of recordings this app is making itself, so they are not
+         * counted as another app listening. Recorders call [ownRecordingStarted] once
+         * their capture is running and [ownRecordingStopped] when it ends.
+         */
+        private val ownSessions: MutableSet<Int> = Collections.synchronizedSet(HashSet())
+
+        fun ownRecordingStarted(sessionId: Int) {
+            ownSessions.add(sessionId)
+            // The platform's callback may already have fired with this session in the
+            // list, counted as foreign; recount now that it is known to be ours.
+            active?.republishRecordings()
+        }
+
+        fun ownRecordingStopped(sessionId: Int) {
+            ownSessions.remove(sessionId)
+            active?.republishRecordings()
+        }
+
         private val SU_PATHS = listOf(
             "/system/bin/su", "/system/xbin/su", "/sbin/su", "/su/bin/su", "/system/su",
             "/data/local/xbin/su", "/data/local/bin/su", "/system/sd/xbin/su",
