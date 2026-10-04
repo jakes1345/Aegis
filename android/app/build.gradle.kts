@@ -114,6 +114,30 @@ android {
         versionName = "2.5.0"
     }
 
+    // Two APKs from one codebase, for handing to two circles of people:
+    //
+    //   full   the whole app: scanner, map, cell/NFC/Wi-Fi/device tabs, tools, COMMS
+    //   comms  COMMS only: encrypted messages, calls, groups and SOS, nothing else
+    //
+    // Both carry the same applicationId and are signed with the same key, so a
+    // comms install upgrades to full in place (install the full APK over it) and
+    // keeps its Aegis number, contacts and message history. The comms manifest
+    // (src/main) declares only what COMMS needs; the scanner's permissions and
+    // components are added by src/full/AndroidManifest.xml. FULL_ACCESS is what
+    // the code reads to decide which screens exist.
+    flavorDimensions += "tier"
+    productFlavors {
+        create("full") {
+            dimension = "tier"
+            buildConfigField("boolean", "FULL_ACCESS", "true")
+        }
+        create("comms") {
+            dimension = "tier"
+            versionNameSuffix = "-comms"
+            buildConfigField("boolean", "FULL_ACCESS", "false")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false

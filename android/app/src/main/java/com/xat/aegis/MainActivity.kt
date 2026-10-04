@@ -1,6 +1,7 @@
 package com.xat.aegis
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.nfc.NfcAdapter
@@ -94,6 +95,11 @@ import com.xat.aegis.comms.CallPhase
 import com.xat.aegis.comms.CommsNotifications
 import com.xat.aegis.comms.CommsRepository
 import android.nfc.cardemulation.CardEmulation
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
+import com.google.android.gms.tasks.Tasks
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -164,10 +170,34 @@ private val ESSENTIAL = arrayOf(
     Manifest.permission.ACCESS_COARSE_LOCATION
 )
 
-/** The tab indices MainApp lays out, for code outside it that needs to name one. */
+/** What the comms-only build asks for on its onboarding: alerts, and a position for SOS. */
+private val COMMS_ESSENTIAL = arrayOf(
+    Manifest.permission.POST_NOTIFICATIONS,
+    Manifest.permission.ACCESS_FINE_LOCATION,
+    Manifest.permission.ACCESS_COARSE_LOCATION
+)
+
+/**
+ * Tab ids. They are stable across flavours — a notification asks for
+ * [TAB_COMMS] by this number whichever build it is in — and MainApp lays out
+ * whichever of them the flavour has.
+ */
+private const val TAB_SCAN = 0
+private const val TAB_MAP = 1
+private const val TAB_LOG = 2
+private const val TAB_CELL = 3
 private const val TAB_NFC = 4
+private const val TAB_WIFI = 5
 private const val TAB_DEVICE = 6
 private const val TAB_COMMS = CommsNotifications.COMMS_TAB_INDEX
+
+private class TabSpec(val id: Int, val label: String)
+
+private val FULL_TABS = listOf(
+    TabSpec(TAB_SCAN, "SCAN"), TabSpec(TAB_MAP, "MAP"), TabSpec(TAB_LOG, "LOG"), TabSpec(TAB_CELL, "CELL"),
+    TabSpec(TAB_NFC, "NFC"), TabSpec(TAB_WIFI, "WIFI"), TabSpec(TAB_DEVICE, "DEVICE"), TabSpec(TAB_COMMS, "COMMS")
+)
+private val COMMS_TABS = listOf(TabSpec(TAB_COMMS, "COMMS"))
 
 // ── Activity ───────────────────────────────────────────────────────────
 
@@ -223,24 +253,28 @@ class MainActivity : AppCompatActivity() {
         }
         Registry.bindTrustStore(this)
 
-        // Platform hardening. The unlock ledger opens so the Device tab can read
-        // it; this Activity's window is watched for being recorded; and the
-        // enrolment tripwire is tested once per launch — Keystore work, off the
-        // main thread. Each publishes straight into the Registry.
-        UnlockLedger.init(this)
-        ScreenRecordingMonitor.start(this, windowManager)
-        lifecycleScope.launch(Dispatchers.IO) { runCatching { BiometricTripwire.check(applicationContext) } }
+        if (BuildConfig.FULL_ACCESS) {
+            // Platform hardening. The unlock ledger opens so the Device tab can read
+            // it; this Activity's window is watched for being recorded; and the
+            // enrolment tripwire is tested once per launch — Keystore work, off the
+            // main thread. Each publishes straight into the Registry.
+            UnlockLedger.init(this)
+            ScreenRecordingMonitor.start(this, windowManager)
+            lifecycleScope.launch(Dispatchers.IO) { runCatching { BiometricTripwire.check(applicationContext) } }
 
-        nfcAdapter = runCatching { NfcAdapter.getDefaultAdapter(this) }.getOrNull()
-        cardEmulation = nfcAdapter?.let { runCatching { CardEmulation.getInstance(it) }.getOrNull() }
+            // The comms-only build declares no NFC permission or HCE service, so its
+            // adapter stays null and every NFC path below is a no-op.
+            nfcAdapter = runCatching { NfcAdapter.getDefaultAdapter(this) }.getOrNull()
+            cardEmulation = nfcAdapter?.let { runCatching { CardEmulation.getInstance(it) }.getOrNull() }
 
-        // Emulation state lives only in this process, so if nothing is armed now,
-        // any AIDs still registered belong to a previous process — they survive
-        // reboots — and would keep routing readers to the service. Drop them.
-        if (Registry.emulating.value == null) clearHceAids()
+            // Emulation state lives only in this process, so if nothing is armed now,
+            // any AIDs still registered belong to a previous process — they survive
+            // reboots — and would keep routing readers to the service. Drop them.
+            if (Registry.emulating.value == null) clearHceAids()
 
-        // Show the stored timeline even before the scanner has run this session.
-        lifecycleScope.launch(Dispatchers.IO) { runCatching { TimelineLog.publish(applicationContext) } }
+            // Show the stored timeline even before the scanner has run this session.
+            lifecycleScope.launch(Dispatchers.IO) { runCatching { TimelineLog.publish(applicationContext) } }
+        }
 
         // Results of BiometricPrompt arrive through the Registry, so that whichever
         // Activity instance is on screen when they land carries the operation out.
@@ -299,7 +333,7 @@ class MainActivity : AppCompatActivity() {
                             val onboardingPermissions = rememberLauncherForActivityResult(
                                 ActivityResultContracts.RequestMultiplePermissions()
                             ) { grants ->
-                                if (ESSENTIAL.all { grants[it] == true }) startScanning()
+                                if (BuildConfig.FULL_ACCESS && ESSENTIAL.all { grants[it] == true }) startScanning()
                             }
 
                             if (!onboardingDone) {
@@ -310,9 +344,14 @@ class MainActivity : AppCompatActivity() {
                                     // access and stopped itself. Tapping "Start" appeared to
                                     // do nothing at all on a fresh install.
                                     startScanService = {
-                                        val missing = REQUIRED.filterNot { granted(it) }
-                                        if (missing.isEmpty()) startScanning()
-                                        else onboardingPermissions.launch(missing.toTypedArray())
+                                        if (BuildConfig.FULL_ACCESS) {
+                                            val missing = REQUIRED.filterNot { granted(it) }
+                                            if (missing.isEmpty()) startScanning()
+                                            else onboardingPermissions.launch(missing.toTypedArray())
+                                        } else {
+                                            val missing = COMMS_ESSENTIAL.filterNot { granted(it) }
+                                            if (missing.isNotEmpty()) onboardingPermissions.launch(missing.toTypedArray())
+                                        }
                                     },
                                     onComplete = { onboardingDone = true }
                                 )
@@ -376,7 +415,7 @@ class MainActivity : AppCompatActivity() {
         resumed = true
         AppLock.onForeground(this)
         applyNfcMode()
-        refreshDeviceHealth()
+        if (BuildConfig.FULL_ACCESS) refreshDeviceHealth()
         // Envelopes that arrived while the app was closed are pulled on every
         // return to the foreground; the push endpoint is renewed if it was lost.
         // While the app stays on screen the relay socket is held open, so what
@@ -1227,8 +1266,9 @@ private fun MainApp(
     onRefreshCell: () -> Unit,
     onRefreshWifi: () -> Unit
 ) {
-    var tab by remember { mutableIntStateOf(0) }
-    val tabs = listOf("SCAN", "MAP", "LOG", "CELL", "NFC", "WIFI", "DEVICE", "COMMS")
+    // The comms-only build has the one tab and draws no tab bar under it.
+    val tabs = if (BuildConfig.FULL_ACCESS) FULL_TABS else COMMS_TABS
+    var tab by remember { mutableIntStateOf(tabs.first().id) }
 
     val detections by Registry.detections.collectAsStateWithLifecycle()
     val trusted by Registry.trusted.collectAsStateWithLifecycle()
@@ -1265,7 +1305,7 @@ private fun MainApp(
     // notification lands on the COMMS tab.
     val tabRequest by Registry.tabRequest.collectAsStateWithLifecycle()
     LaunchedEffect(tabRequest) {
-        if (tabRequest != null) Registry.takeTabRequest()?.let { tab = it.coerceIn(0, tabs.size - 1) }
+        if (tabRequest != null) Registry.takeTabRequest()?.let { id -> if (tabs.any { it.id == id }) tab = id }
     }
     val threadRequest by Registry.threadRequest.collectAsStateWithLifecycle()
     val groupRequest by Registry.groupRequest.collectAsStateWithLifecycle()
@@ -1289,33 +1329,39 @@ private fun MainApp(
 
     // One red dot per tab that currently holds something worth looking at.
     val followingLive = detections.any { it.following && it.address !in trusted }
-    val alerts = listOf(
-        followingLive,
-        followingLive && detections.any { it.following && it.points.isNotEmpty() },
-        false,
-        cell.available && cell.analysing && cell.level.ordinal >= Threat.HIGH.ordinal,
-        nfc.any { it.suspicious },
-        wifi.any { it.threat.ordinal >= Threat.HIGH.ordinal },
-        phoneHealth.level.ordinal >= Threat.HIGH.ordinal,
-        unreadMessages > 0
-    )
+    fun alertFor(id: Int): Boolean = when (id) {
+        TAB_SCAN -> followingLive
+        TAB_MAP -> followingLive && detections.any { it.following && it.points.isNotEmpty() }
+        TAB_CELL -> cell.available && cell.analysing && cell.level.ordinal >= Threat.HIGH.ordinal
+        TAB_NFC -> nfc.any { it.suspicious }
+        TAB_WIFI -> wifi.any { it.threat.ordinal >= Threat.HIGH.ordinal }
+        TAB_DEVICE -> phoneHealth.level.ordinal >= Threat.HIGH.ordinal
+        TAB_COMMS -> unreadMessages > 0
+        else -> false
+    }
 
     Column(Modifier.fillMaxSize()) {
-        Box(Modifier.weight(1f).statusBarsPadding()) {
+        Box(
+            Modifier
+                .weight(1f)
+                .statusBarsPadding()
+                // Without a tab bar the content reaches the bottom edge itself.
+                .then(if (tabs.size == 1) Modifier.navigationBarsPadding() else Modifier)
+        ) {
             when (tab) {
-                0 -> ScanScreen(
+                TAB_SCAN -> ScanScreen(
                     onStart, onStop, hasPermissions,
                     onSettingsClick = { showSettings = true },
                     onToolsClick = { showTools = true },
                     onShowExplainer = { d -> explainerTarget = ExplainerTarget.BleDevice(d) }
                 )
-                1 -> MapScreen()
-                2 -> TimelineScreen()
-                3 -> CellScreen(
+                TAB_MAP -> MapScreen()
+                TAB_LOG -> TimelineScreen()
+                TAB_CELL -> CellScreen(
                     onShowExplainer = { f -> explainerTarget = ExplainerTarget.CellIndicator(f) },
                     onShown = onRefreshCell
                 )
-                4 -> NfcScreen(
+                TAB_NFC -> NfcScreen(
                     onAddToVault = onAddToVault,
                     onRemoveVault = onRemoveVault,
                     onEmulate = onEmulate,
@@ -1323,7 +1369,7 @@ private fun MainApp(
                     onLockVault = onLockVault,
                     onEraseVault = onEraseVault
                 )
-                5 -> WifiScreen(onShown = onRefreshWifi)
+                TAB_WIFI -> WifiScreen(onShown = onRefreshWifi)
                 TAB_DEVICE -> DeviceScreen(onShown = onRefreshDeviceHealth)
                 TAB_COMMS -> CommsScreen(
                     openPeer = threadRequest,
@@ -1331,7 +1377,8 @@ private fun MainApp(
                     openInvite = inviteRequest,
                     onInviteConsumed = { Registry.takeInviteRequest() },
                     openGroup = groupRequest,
-                    onGroupConsumed = { Registry.takeGroupRequest() }
+                    onGroupConsumed = { Registry.takeGroupRequest() },
+                    onAppSettings = { showSettings = true }
                 )
             }
 
@@ -1341,9 +1388,8 @@ private fun MainApp(
             if (!showSettings && !showTools && !locked) {
                 Box(Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 16.dp)) {
                     SosButton(onConfirmed = {
-                        val s = Registry.status.value
-                        val loc = if (s.lat != null && s.lon != null) Pair(s.lat, s.lon) else null
                         scope.launch(Dispatchers.IO) {
+                            val loc = sosLocation(context)
                             Registry.setPanicActive(true)
                             withContext(Dispatchers.Main) {
                                 Toast.makeText(
@@ -1357,19 +1403,20 @@ private fun MainApp(
                 }
             }
         }
-        NavigationBar(
+        if (tabs.size > 1) NavigationBar(
             containerColor = Panel,
             tonalElevation = 0.dp,
             modifier = Modifier.fillMaxWidth().navigationBarsPadding()
         ) {
-            tabs.forEachIndexed { i, label ->
+            tabs.forEach { spec ->
+                val i = spec.id
                 NavigationBarItem(
                     selected = tab == i,
                     onClick = { tab = i },
                     icon = {
                         Box {
                             TabIcon(index = i, selected = tab == i)
-                            if (alerts[i]) {
+                            if (alertFor(i)) {
                                 Box(
                                     Modifier
                                         .size(7.dp)
@@ -1381,7 +1428,7 @@ private fun MainApp(
                         }
                     },
                     label = {
-                        Text(label, fontSize = 10.sp, letterSpacing = 0.3.sp, maxLines = 1)
+                        Text(spec.label, fontSize = 10.sp, letterSpacing = 0.3.sp, maxLines = 1)
                     },
                     colors = NavigationBarItemDefaults.colors(
                         selectedIconColor = Accent,
@@ -1406,6 +1453,32 @@ private fun MainApp(
             ThreatExplainerSheet(target = target, onDismiss = { explainerTarget = null })
         }
     }
+}
+
+/**
+ * The position an SOS carries. The scanner's live fix when it has one; otherwise
+ * — scanner off, or the comms-only build, which has no scanner — the platform's
+ * last known position, else a fresh fix with a short wait, so the alert is not
+ * held up long. Whatever is found is put in the status the panic broadcast
+ * reads. Null when location is not granted or nothing could be found in time.
+ */
+private fun sosLocation(context: Context): LatLon? {
+    val s = Registry.status.value
+    if (s.lat != null && s.lon != null) return LatLon(s.lat, s.lon)
+    val granted = arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+        .any { ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }
+    if (!granted) return null
+    val client = LocationServices.getFusedLocationProviderClient(context)
+    val fix = runCatching { Tasks.await(client.lastLocation, 2, TimeUnit.SECONDS) }.getOrNull()
+        ?: runCatching {
+            Tasks.await(
+                client.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, CancellationTokenSource().token),
+                6, TimeUnit.SECONDS
+            )
+        }.getOrNull()
+        ?: return null
+    Registry.update { it.copy(lat = fix.latitude, lon = fix.longitude) }
+    return LatLon(fix.latitude, fix.longitude)
 }
 
 // ── Tab icons ──────────────────────────────────────────────────────────

@@ -33,7 +33,8 @@ class BootReceiver : BroadcastReceiver() {
         // (which stops it), instead of missing every call until they happen to
         // open Aegis. init() starts it only in that case.
         runCatching { CommsRepository.init(context.applicationContext) }
-        if (action != Intent.ACTION_BOOT_COMPLETED) return
+        // The comms-only build has no scanner service to bring back.
+        if (!BuildConfig.FULL_ACCESS || action != Intent.ACTION_BOOT_COMPLETED) return
 
         AppSettings.load(context)
         if (!AppSettings.scanEnabled || !AppSettings.resumeAfterReboot) return

@@ -1,7 +1,7 @@
 name: Release
 
-# Three ways to cut a release, all producing the same signed APK and GitHub
-# Release:
+# Three ways to cut a release, all producing the same two signed APKs (the full
+# app and the comms-only build) and GitHub Release:
 #   - push a tag            v2.2.0
 #   - push a branch         release/v2.2.0   (the tag is created at its head)
 #   - Actions → Run workflow with the tag as input
@@ -84,7 +84,8 @@ jobs:
 
       # ANDROID_NDK_LATEST_HOME is a runner environment variable, not a workflow
       # `env.` value, so it is read in the shell rather than in an expression.
-      - name: Build release APK
+      # assembleRelease builds both flavours: full and comms-only.
+      - name: Build release APKs
         working-directory: android
         run: |
           export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
@@ -127,7 +128,10 @@ jobs:
             echo "::warning::ANDROID_KEYSTORE_BASE64 is not set, so this APK is signed with a throwaway key and cannot be installed over an earlier release."
           fi
 
-      - name: Sign APK
+      # Both APKs are signed with the same key and share one applicationId, so a
+      # comms-only install upgrades to the full app in place and keeps its number,
+      # contacts and messages.
+      - name: Sign APKs
         env:
           KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'android' }}
           KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD || 'android' }}
@@ -136,19 +140,24 @@ jobs:
         run: |
           BUILD_TOOLS=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
           APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner"
-          OUT="android/app/build/outputs/apk/release/aegis-${TAG}.apk"
-          "$APKSIGNER" sign \
-            --ks "$RUNNER_TEMP/signing/release.keystore" \
-            --ks-pass env:KS_PASS \
-            --key-pass env:KEY_PASS \
-            --ks-key-alias "$KEY_ALIAS" \
-            --out "$OUT" \
-            android/app/build/outputs/apk/release/app-release-unsigned.apk
-          # The certificate digest is what decides whether a phone will accept this
-          # as an update to the installed build, so print it: two releases that
-          # share this value will install over each other, and two that do not
-          # never will, whatever their version numbers say.
-          "$APKSIGNER" verify --print-certs "$OUT"
+          mkdir -p android/app/build/outputs/apk/signed
+          sign() { # flavour, output name
+            OUT="android/app/build/outputs/apk/signed/$2"
+            "$APKSIGNER" sign \
+              --ks "$RUNNER_TEMP/signing/release.keystore" \
+              --ks-pass env:KS_PASS \
+              --key-pass env:KEY_PASS \
+              --ks-key-alias "$KEY_ALIAS" \
+              --out "$OUT" \
+              "android/app/build/outputs/apk/$1/release/app-$1-release-unsigned.apk"
+            # The certificate digest is what decides whether a phone will accept this
+            # as an update to the installed build, so print it: two releases that
+            # share this value will install over each other, and two that do not
+            # never will, whatever their version numbers say.
+            "$APKSIGNER" verify --print-certs "$OUT"
+          }
+          sign full  "aegis-${TAG}.apk"
+          sign comms "aegis-comms-${TAG}.apk"
 
       - name: Compose release notes
         env:
@@ -157,6 +166,13 @@ jobs:
         run: |
           {
             echo "## Aegis ${TAG}"
+            echo
+            echo "**Two APKs.** \`aegis-${TAG}.apk\` is the whole app. \`aegis-comms-${TAG}.apk\`"
+            echo "is **Aegis Comms**: the encrypted messages, calls, groups and SOS and nothing else —"
+            echo "no scanner, no tools, and none of their permissions — for people you want to be able"
+            echo "to reach but not to hand the full toolkit. Both share one package name and one"
+            echo "signing key, so the full APK installs straight over a comms install and keeps its"
+            echo "number, contacts and messages."
             echo
             echo "Aegis — defensive security monitor for Android. Detects BLE tracker tags,"
             echo "Wi-Fi bait networks, IMSI-catcher anomalies, and sweeps NFC/RFID cards."
@@ -212,6 +228,8 @@ jobs:
           name: Aegis ${{ steps.tag.outputs.name }}
           body_path: ${{ runner.temp }}/notes.md
           generate_release_notes: true
-          files: android/app/build/outputs/apk/release/aegis-${{ steps.tag.outputs.name }}.apk
+          files: |
+            android/app/build/outputs/apk/signed/aegis-${{ steps.tag.outputs.name }}.apk
+            android/app/build/outputs/apk/signed/aegis-comms-${{ steps.tag.outputs.name }}.apk
           draft: false
           prerelease: false

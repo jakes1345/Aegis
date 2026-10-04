@@ -167,7 +167,8 @@ fun CommsScreen(
     openInvite: String? = null,
     onInviteConsumed: () -> Unit = {},
     openGroup: String? = null,
-    onGroupConsumed: () -> Unit = {}
+    onGroupConsumed: () -> Unit = {},
+    onAppSettings: (() -> Unit)? = null
 ) {
     val state by CommsRepository.state.collectAsStateWithLifecycle()
     val activeCall by CallManager.call.collectAsStateWithLifecycle()
@@ -265,7 +266,7 @@ fun CommsScreen(
         )
         CommsPage.MyCode -> MyCodeScreen(onBack = { page = CommsPage.List })
         CommsPage.Invite -> InviteScreen(onBack = { page = CommsPage.List })
-        CommsPage.Settings -> CommsSettingsScreen(onBack = { page = CommsPage.List })
+        CommsPage.Settings -> CommsSettingsScreen(onBack = { page = CommsPage.List }, onAppSettings = onAppSettings)
     }
 }
 
@@ -1952,7 +1953,7 @@ private fun MyCodeScreen(onBack: () -> Unit) {
 // ── Settings ─────────────────────────────────────────────────────────────────
 
 @Composable
-private fun CommsSettingsScreen(onBack: () -> Unit) {
+private fun CommsSettingsScreen(onBack: () -> Unit, onAppSettings: (() -> Unit)? = null) {
     val context = LocalContext.current
     val state by CommsRepository.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
@@ -2113,6 +2114,24 @@ private fun CommsSettingsScreen(onBack: () -> Unit) {
                 else "Unlisted: only people who scanned your code can reach you. Lookups by number fail.",
                 state.listed, enabled = !state.busy
             ) { scope.launch { CommsRepository.setListed(it) } }
+        }
+
+        // The app-wide settings — passcode, biometric unlock, duress code — live on
+        // their own screen. In the full app that is reached from the Scan header
+        // too; in the comms-only build this row is the only way to it.
+        if (onAppSettings != null) {
+            Card {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("App passcode and lock", color = CInk, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "A passcode for the app itself, biometric unlock, a duress code that wipes everything, and the version.",
+                            color = CMuted, fontSize = 11.sp, lineHeight = 15.sp
+                        )
+                    }
+                    SmallButton("OPEN", CAccent, onClick = onAppSettings)
+                }
+            }
         }
 
         Card {

@@ -351,9 +351,11 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}, onOpenTools
         // ── Tools ────────────────────────────────────────────────────────────
         //
         // The tab bar is full, so the on-demand checks and defences live behind
-        // this row (and the TOOLS button on the Scan header).
+        // this row (and the TOOLS button on the Scan header). The comms-only build
+        // has neither the tools nor the scanner, so from here to the passcode
+        // section is the full app's alone.
 
-        item(key = "§tools") {
+        if (BuildConfig.FULL_ACCESS) item(key = "§tools") {
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -379,260 +381,262 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}, onOpenTools
 
         // ── Scan settings ────────────────────────────────────────────────────
 
-        item(key = "§scan-hdr") { SSettingsSectionLabel("SCAN SETTINGS") }
+        if (BuildConfig.FULL_ACCESS) {
+            item(key = "§scan-hdr") { SSettingsSectionLabel("SCAN SETTINGS") }
 
-        item(key = "§aggressive") {
-            Column(
-                Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(Modifier.weight(1f).padding(end = 8.dp)) {
-                        Text(
-                            "Aggressive scan mode", color = SInkClr,
-                            fontSize = 14.sp, fontWeight = FontWeight.SemiBold
-                        )
-                        Text(
-                            "Higher detection rate at the cost of battery life",
-                            color = SMutedClr, fontSize = 12.sp
-                        )
-                    }
-                    Switch(
-                        checked = aggressiveScan,
-                        onCheckedChange = { v ->
-                            aggressiveScan = v
-                            AppSettings.setAggressiveScan(context, v)
-                        },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = SAccentClr,
-                            checkedTrackColor = SAccentClr.copy(alpha = 0.4f)
-                        )
-                    )
-                }
-                Text(
-                    if (aggressiveScan) "SCAN_MODE_LOW_LATENCY — faster detection, higher battery drain"
-                    else "SCAN_MODE_BALANCED — standard detection, recommended for field use",
-                    color = SMutedClr, fontSize = 11.sp, fontFamily = FontFamily.Monospace
-                )
-            }
-        }
-
-        item(key = "§resume-reboot") {
-            val active = resumeWanted && backgroundGranted
-            Column(
-                Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(Modifier.weight(1f).padding(end = 8.dp)) {
-                        Text(
-                            "Resume scanning after reboot", color = SInkClr,
-                            fontSize = 14.sp, fontWeight = FontWeight.SemiBold
-                        )
-                        Text(
-                            "Restarts the scanner when the phone boots, if it was running before",
-                            color = SMutedClr, fontSize = 12.sp
-                        )
-                    }
-                    Switch(
-                        checked = active,
-                        onCheckedChange = { v ->
-                            if (!v) {
-                                awaitingBackground = false
-                                persistResume(false)
-                            } else if (backgroundGranted) {
-                                persistResume(true)
-                            } else {
-                                awaitingBackground = true
-                                showBackgroundDialog = true
-                            }
-                        },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = SAccentClr,
-                            checkedTrackColor = SAccentClr.copy(alpha = 0.4f)
-                        )
-                    )
-                }
-                if (!backgroundGranted) {
-                    Text(
-                        "Needs location access set to \"Allow all the time\". Android asks for this " +
-                        "separately: turning this on sends you to the location permission page for " +
-                        "Aegis, where you pick \"Allow all the time\".",
-                        color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
-                    )
-                    if (awaitingBackground) {
-                        // After a refusal Android stops opening the page on request, so
-                        // offer the app's own settings page as the way there. The
-                        // grant is picked up on return and only then stored as wanted.
-                        TextButton(
-                            onClick = {
-                                context.startActivity(
-                                    Intent(
-                                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                        Uri.fromParts("package", context.packageName, null)
-                                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                )
-                            },
-                            contentPadding = PaddingValues(0.dp)
-                        ) {
-                            Text("OPEN APP SETTINGS", color = SAccentClr, fontSize = 11.sp, letterSpacing = 1.sp)
-                        }
-                    }
-                } else if (!resumeWanted) {
-                    Text(
-                        "\"Allow all the time\" is granted but not used while this is off. You can " +
-                        "reduce it to \"Only while using the app\" in Android settings.",
-                        color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
-                    )
-                }
-            }
-        }
-
-        item(key = "§follow-thresh") {
-            Column(
-                Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "Following confirmation threshold",
-                        color = SInkClr, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Text(
-                        "${followThreshold.toInt()} m",
-                        color = SAccentClr, fontSize = 14.sp,
-                        fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold
-                    )
-                }
-                Text(
-                    "Minimum displacement required to confirm a device is following you",
-                    color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
-                )
-                Slider(
-                    value = followThreshold,
-                    onValueChange = { followThreshold = it },
-                    onValueChangeFinished = { AppSettings.setFollowThreshold(context, followThreshold) },
-                    valueRange = 100f..500f,
-                    steps = 7,
-                    colors = SliderDefaults.colors(
-                        thumbColor = SAccentClr,
-                        activeTrackColor = SAccentClr,
-                        inactiveTrackColor = SRuleClr
-                    )
-                )
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("100 m", color = SMutedClr, fontSize = 11.sp)
-                    Text("Default: 300 m", color = SMutedClr, fontSize = 11.sp)
-                    Text("500 m", color = SMutedClr, fontSize = 11.sp)
-                }
-            }
-        }
-
-        item(key = "§persist-thresh") {
-            Column(
-                Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "Persistence threshold",
-                        color = SInkClr, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Text(
-                        "${persistenceThreshold.toInt()} min",
-                        color = SAccentClr, fontSize = 14.sp,
-                        fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold
-                    )
-                }
-                Text(
-                    "Minutes of continuous presence before a device is flagged as persistent",
-                    color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
-                )
-                Slider(
-                    value = persistenceThreshold,
-                    onValueChange = { persistenceThreshold = it },
-                    onValueChangeFinished = {
-                        AppSettings.setPersistenceThreshold(context, persistenceThreshold)
-                    },
-                    valueRange = 5f..30f,
-                    steps = 4,
-                    colors = SliderDefaults.colors(
-                        thumbColor = SAccentClr,
-                        activeTrackColor = SAccentClr,
-                        inactiveTrackColor = SRuleClr
-                    )
-                )
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("5 min", color = SMutedClr, fontSize = 11.sp)
-                    Text("Default: 10 min", color = SMutedClr, fontSize = 11.sp)
-                    Text("30 min", color = SMutedClr, fontSize = 11.sp)
-                }
-            }
-        }
-
-        // ── Trusted devices ──────────────────────────────────────────────────
-
-        item(key = "§trusted-hdr") { SSettingsSectionLabel("TRUSTED DEVICES") }
-
-        if (trusted.isEmpty()) {
-            item(key = "§trusted-empty") {
+            item(key = "§aggressive") {
                 Column(
                     Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text("No trusted devices yet", color = SInkDimClr, fontSize = 13.sp)
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                "Aggressive scan mode", color = SInkClr,
+                                fontSize = 14.sp, fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                "Higher detection rate at the cost of battery life",
+                                color = SMutedClr, fontSize = 12.sp
+                            )
+                        }
+                        Switch(
+                            checked = aggressiveScan,
+                            onCheckedChange = { v ->
+                                aggressiveScan = v
+                                AppSettings.setAggressiveScan(context, v)
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = SAccentClr,
+                                checkedTrackColor = SAccentClr.copy(alpha = 0.4f)
+                            )
+                        )
+                    }
                     Text(
-                        "Mark any detection card as safe on the SCAN tab. " +
-                        "Its Bluetooth address is automatically added here.",
-                        color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
+                        if (aggressiveScan) "SCAN_MODE_LOW_LATENCY — faster detection, higher battery drain"
+                        else "SCAN_MODE_BALANCED — standard detection, recommended for field use",
+                        color = SMutedClr, fontSize = 11.sp, fontFamily = FontFamily.Monospace
                     )
                 }
             }
-        } else {
-            items(trusted.sorted(), key = { "trusted|$it" }) { addr ->
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .background(SPanelClr, SCardShape)
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+
+            item(key = "§resume-reboot") {
+                val active = resumeWanted && backgroundGranted
+                Column(
+                    Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text(
-                        addr, color = SInkDimClr, fontSize = 13.sp,
-                        fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f)
-                    )
-                    TextButton(
-                        onClick = { Registry.untrust(addr) },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("REMOVE", color = SCriticalClr, fontSize = 11.sp, letterSpacing = 1.sp)
+                        Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                "Resume scanning after reboot", color = SInkClr,
+                                fontSize = 14.sp, fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                "Restarts the scanner when the phone boots, if it was running before",
+                                color = SMutedClr, fontSize = 12.sp
+                            )
+                        }
+                        Switch(
+                            checked = active,
+                            onCheckedChange = { v ->
+                                if (!v) {
+                                    awaitingBackground = false
+                                    persistResume(false)
+                                } else if (backgroundGranted) {
+                                    persistResume(true)
+                                } else {
+                                    awaitingBackground = true
+                                    showBackgroundDialog = true
+                                }
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = SAccentClr,
+                                checkedTrackColor = SAccentClr.copy(alpha = 0.4f)
+                            )
+                        )
+                    }
+                    if (!backgroundGranted) {
+                        Text(
+                            "Needs location access set to \"Allow all the time\". Android asks for this " +
+                            "separately: turning this on sends you to the location permission page for " +
+                            "Aegis, where you pick \"Allow all the time\".",
+                            color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
+                        )
+                        if (awaitingBackground) {
+                            // After a refusal Android stops opening the page on request, so
+                            // offer the app's own settings page as the way there. The
+                            // grant is picked up on return and only then stored as wanted.
+                            TextButton(
+                                onClick = {
+                                    context.startActivity(
+                                        Intent(
+                                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                            Uri.fromParts("package", context.packageName, null)
+                                        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    )
+                                },
+                                contentPadding = PaddingValues(0.dp)
+                            ) {
+                                Text("OPEN APP SETTINGS", color = SAccentClr, fontSize = 11.sp, letterSpacing = 1.sp)
+                            }
+                        }
+                    } else if (!resumeWanted) {
+                        Text(
+                            "\"Allow all the time\" is granted but not used while this is off. You can " +
+                            "reduce it to \"Only while using the app\" in Android settings.",
+                            color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
+                        )
                     }
                 }
             }
-            item(key = "§trusted-hint") {
-                Text(
-                    "Tap MARK SAFE on a detection card on the Scan tab to add a device here.",
-                    color = SMutedClr, fontSize = 12.sp
-                )
+
+            item(key = "§follow-thresh") {
+                Column(
+                    Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Following confirmation threshold",
+                            color = SInkClr, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            "${followThreshold.toInt()} m",
+                            color = SAccentClr, fontSize = 14.sp,
+                            fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Text(
+                        "Minimum displacement required to confirm a device is following you",
+                        color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
+                    )
+                    Slider(
+                        value = followThreshold,
+                        onValueChange = { followThreshold = it },
+                        onValueChangeFinished = { AppSettings.setFollowThreshold(context, followThreshold) },
+                        valueRange = 100f..500f,
+                        steps = 7,
+                        colors = SliderDefaults.colors(
+                            thumbColor = SAccentClr,
+                            activeTrackColor = SAccentClr,
+                            inactiveTrackColor = SRuleClr
+                        )
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("100 m", color = SMutedClr, fontSize = 11.sp)
+                        Text("Default: 300 m", color = SMutedClr, fontSize = 11.sp)
+                        Text("500 m", color = SMutedClr, fontSize = 11.sp)
+                    }
+                }
+            }
+
+            item(key = "§persist-thresh") {
+                Column(
+                    Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Persistence threshold",
+                            color = SInkClr, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            "${persistenceThreshold.toInt()} min",
+                            color = SAccentClr, fontSize = 14.sp,
+                            fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Text(
+                        "Minutes of continuous presence before a device is flagged as persistent",
+                        color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
+                    )
+                    Slider(
+                        value = persistenceThreshold,
+                        onValueChange = { persistenceThreshold = it },
+                        onValueChangeFinished = {
+                            AppSettings.setPersistenceThreshold(context, persistenceThreshold)
+                        },
+                        valueRange = 5f..30f,
+                        steps = 4,
+                        colors = SliderDefaults.colors(
+                            thumbColor = SAccentClr,
+                            activeTrackColor = SAccentClr,
+                            inactiveTrackColor = SRuleClr
+                        )
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("5 min", color = SMutedClr, fontSize = 11.sp)
+                        Text("Default: 10 min", color = SMutedClr, fontSize = 11.sp)
+                        Text("30 min", color = SMutedClr, fontSize = 11.sp)
+                    }
+                }
+            }
+
+            // ── Trusted devices ──────────────────────────────────────────────────
+
+            item(key = "§trusted-hdr") { SSettingsSectionLabel("TRUSTED DEVICES") }
+
+            if (trusted.isEmpty()) {
+                item(key = "§trusted-empty") {
+                    Column(
+                        Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("No trusted devices yet", color = SInkDimClr, fontSize = 13.sp)
+                        Text(
+                            "Mark any detection card as safe on the SCAN tab. " +
+                            "Its Bluetooth address is automatically added here.",
+                            color = SMutedClr, fontSize = 12.sp, lineHeight = 17.sp
+                        )
+                    }
+                }
+            } else {
+                items(trusted.sorted(), key = { "trusted|$it" }) { addr ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .background(SPanelClr, SCardShape)
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            addr, color = SInkDimClr, fontSize = 13.sp,
+                            fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f)
+                        )
+                        TextButton(
+                            onClick = { Registry.untrust(addr) },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                        ) {
+                            Text("REMOVE", color = SCriticalClr, fontSize = 11.sp, letterSpacing = 1.sp)
+                        }
+                    }
+                }
+                item(key = "§trusted-hint") {
+                    Text(
+                        "Tap MARK SAFE on a detection card on the Scan tab to add a device here.",
+                        color = SMutedClr, fontSize = 12.sp
+                    )
+                }
             }
         }
 
@@ -846,10 +850,13 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}, onOpenTools
         }
 
         // ── Data management ──────────────────────────────────────────────────
+        //
+        // Evidence export and the scanner's clear-all; COMMS keeps its own delete
+        // (DELETE IDENTITY AND NUMBER in COMMS settings).
 
-        item(key = "§data-hdr") { SSettingsSectionLabel("DATA") }
+        if (BuildConfig.FULL_ACCESS) item(key = "§data-hdr") { SSettingsSectionLabel("DATA") }
 
-        item(key = "§data-actions") {
+        if (BuildConfig.FULL_ACCESS) item(key = "§data-actions") {
             Column(
                 Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -891,27 +898,30 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}, onOpenTools
                 Modifier.fillMaxWidth().background(SPanelClr, SCardShape).padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                SSettingsKv("App", "Aegis")
+                SSettingsKv("App", context.getString(R.string.app_name))
                 SSettingsKv(
                     "Version",
                     "${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})"
                 )
                 SSettingsKv("Package", BuildConfig.APPLICATION_ID)
+                SSettingsKv("Edition", if (BuildConfig.FULL_ACCESS) "Full — scanner, tools and COMMS" else "COMMS only")
 
-                Box(Modifier.fillMaxWidth().height(1.dp).background(SRuleClr))
+                if (BuildConfig.FULL_ACCESS) {
+                    Box(Modifier.fillMaxWidth().height(1.dp).background(SRuleClr))
 
-                Text(
-                    "Legal disclaimer",
-                    color = SInkClr, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
-                )
-                Text(
-                    "Aegis is a counter-surveillance research tool intended for lawful personal " +
-                    "and professional security use. Detection of a device is not conclusive evidence of " +
-                    "surveillance. Always verify findings through multiple methods before acting. " +
-                    "Users are responsible for complying with all applicable laws regarding electronic " +
-                    "surveillance detection in their jurisdiction.",
-                    color = SMutedClr, fontSize = 12.sp, lineHeight = 18.sp
-                )
+                    Text(
+                        "Legal disclaimer",
+                        color = SInkClr, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        "Aegis is a counter-surveillance research tool intended for lawful personal " +
+                        "and professional security use. Detection of a device is not conclusive evidence of " +
+                        "surveillance. Always verify findings through multiple methods before acting. " +
+                        "Users are responsible for complying with all applicable laws regarding electronic " +
+                        "surveillance detection in their jurisdiction.",
+                        color = SMutedClr, fontSize = 12.sp, lineHeight = 18.sp
+                    )
+                }
 
                 Box(Modifier.fillMaxWidth().height(1.dp).background(SRuleClr))
 
@@ -920,11 +930,17 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}, onOpenTools
                     color = SInkClr, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    "Detection data stays on this device. Location history, device identifiers, " +
-                    "cellular baselines, the timeline and the card vault are stored locally and are " +
-                    "never uploaded. The Map tab downloads map tiles from OpenStreetMap, which sees " +
-                    "your IP address and the area you're viewing. Evidence exports are shared only " +
-                    "when you explicitly trigger an export.",
+                    if (BuildConfig.FULL_ACCESS)
+                        "Detection data stays on this device. Location history, device identifiers, " +
+                        "cellular baselines, the timeline and the card vault are stored locally and are " +
+                        "never uploaded. The Map tab downloads map tiles from OpenStreetMap, which sees " +
+                        "your IP address and the area you're viewing. Evidence exports are shared only " +
+                        "when you explicitly trigger an export."
+                    else
+                        "Messages and calls are end-to-end encrypted; the relay sees neither their content " +
+                        "nor who sent them. Your keys, contacts and message history are stored on this " +
+                        "device only. Location is read at the moment you press SOS, to attach to that " +
+                        "alert, and at no other time.",
                     color = SMutedClr, fontSize = 12.sp, lineHeight = 18.sp
                 )
             }

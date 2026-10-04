@@ -21,7 +21,9 @@ import kotlinx.coroutines.launch
 
 private const val ONBOARDING_PREFS = "prefs"
 private const val ONBOARDING_DONE_KEY = "onboarding_done"
-private const val TOTAL_PAGES = 4
+// The full app walks through the scanner; the comms-only build has three pages
+// about encrypted messaging and ends on GET STARTED instead of START SCANNING.
+private val TOTAL_PAGES = if (BuildConfig.FULL_ACCESS) 4 else 3
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -65,11 +67,19 @@ fun OnboardingScreen(startScanService: () -> Unit, onComplete: () -> Unit) {
             state = pagerState,
             modifier = Modifier.fillMaxSize()
         ) { page ->
-            when (page) {
-                0 -> OPage1()
-                1 -> OPage2()
-                2 -> OPage3()
-                else -> OPage4(onStart = { finish() })
+            if (BuildConfig.FULL_ACCESS) {
+                when (page) {
+                    0 -> OPage1()
+                    1 -> OPage2()
+                    2 -> OPage3()
+                    else -> OPage4(onStart = { finish() })
+                }
+            } else {
+                when (page) {
+                    0 -> OCommsPage1()
+                    1 -> OCommsPage2()
+                    else -> OCommsPage3(onStart = { finish() })
+                }
             }
         }
 
@@ -325,6 +335,161 @@ private fun OHowItWorksItem(color: Color, title: String, text: String) {
             Text(title, color = color, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             Text(text, color = OInkDimClr, fontSize = 12.sp, lineHeight = 17.sp)
         }
+    }
+}
+
+// ── Comms-only build: page 1, what this is ────────────────────────────────────
+
+@Composable
+private fun OCommsPage1() {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Box(
+            Modifier
+                .size(120.dp)
+                .background(OPanelClr, RoundedCornerShape(60.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("A", color = OAccentClr, fontSize = 44.sp, fontWeight = FontWeight.Black)
+        }
+        Spacer(Modifier.height(36.dp))
+        Text(
+            "Aegis Comms",
+            color = OInkClr, fontSize = 30.sp, fontWeight = FontWeight.Black,
+            letterSpacing = 1.sp, textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "Private messages and calls for your circle",
+            color = OAccentClr, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(24.dp))
+        Text(
+            "Everything you send is encrypted on this phone and only the person you send it to " +
+            "can read it. The relay that carries it sees neither what a message says nor who " +
+            "sent it. Calls are encrypted the same way. No phone number, no Google account and " +
+            "no carrier are involved.",
+            color = OInkDimClr, fontSize = 14.sp, textAlign = TextAlign.Center,
+            lineHeight = 22.sp
+        )
+        Spacer(Modifier.height(20.dp))
+        Text(
+            "Your keys, contacts and message history stay on this device.",
+            color = OMutedClr, fontSize = 12.sp, textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(120.dp))
+    }
+}
+
+// ── Comms-only build: page 2, permissions ─────────────────────────────────────
+
+@Composable
+private fun OCommsPage2() {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 28.dp)
+            .padding(top = 72.dp, bottom = 140.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            "Permissions",
+            color = OInkClr, fontSize = 26.sp, fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Each one is asked for when it is first needed:",
+            color = OMutedClr, fontSize = 13.sp, textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(24.dp))
+
+        OPermissionItem(
+            label = "Notifications",
+            desc = "So a new message shows and an incoming call rings while the app is closed."
+        )
+        Spacer(Modifier.height(10.dp))
+        OPermissionItem(
+            label = "Microphone",
+            desc = "For calls. Asked once you have a number, so the first call is not also the first question."
+        )
+        Spacer(Modifier.height(10.dp))
+        OPermissionItem(
+            label = "Camera",
+            desc = "To scan a contact's pairing code. Asked when you tap SCAN; nothing is recorded."
+        )
+        Spacer(Modifier.height(10.dp))
+        OPermissionItem(
+            label = "Location",
+            desc = "Attached to an SOS so your group knows where you are. Read at the moment you press SOS and at no other time."
+        )
+    }
+}
+
+// ── Comms-only build: page 3, ready ───────────────────────────────────────────
+
+@Composable
+private fun OCommsPage3(onStart: () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Box(
+            Modifier
+                .size(120.dp)
+                .background(OPanelClr, RoundedCornerShape(60.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("✓", color = OClearClr, fontSize = 54.sp, fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.height(36.dp))
+        Text(
+            "You need an invite",
+            color = OInkClr, fontSize = 28.sp, fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(16.dp))
+        Text(
+            "The person who gave you this app sends you an invite link or shows you a QR code. " +
+            "Opening it registers you with their relay and gives you an Aegis number; it also adds " +
+            "them as your first contact.",
+            color = OInkDimClr, fontSize = 14.sp, textAlign = TextAlign.Center,
+            lineHeight = 21.sp
+        )
+        Spacer(Modifier.height(14.dp))
+        Text(
+            "An Aegis number is not a phone number. It reaches other Aegis apps on the same relay " +
+            "and nothing else. Keep COMMS set to Online so calls ring while the app is closed.",
+            color = OMutedClr, fontSize = 12.sp, textAlign = TextAlign.Center,
+            lineHeight = 18.sp
+        )
+        Spacer(Modifier.height(44.dp))
+        Button(
+            onClick = onStart,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = OAccentClr,
+                contentColor = Color(0xFF12161D)
+            ),
+            shape = RoundedCornerShape(6.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                "GET STARTED",
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp,
+                letterSpacing = 1.sp
+            )
+        }
+        Spacer(Modifier.height(140.dp))
     }
 }
 

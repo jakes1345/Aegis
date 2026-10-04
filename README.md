@@ -36,6 +36,18 @@ Android 12 or newer. Download the latest `aegis-vX.Y.Z.apk` from
 [Releases](https://github.com/jakes1345/Aegis/releases/latest) and tap it. Updates install
 over the previous version.
 
+### Two editions
+
+Every release ships two APKs from the same code, so you can decide who gets what:
+
+| APK | Who it is for | What is in it |
+|---|---|---|
+| `aegis-vX.Y.Z.apk` | Your inner circle | Everything on this page: the scanner tabs, the tools, the card vault and COMMS. |
+| `aegis-comms-vX.Y.Z.apk` (**Aegis Comms**) | People you want to reach securely, and nothing more | COMMS only: encrypted messages, calls, groups, shared threats and the SOS button, plus the app passcode and duress code. No scanner, no tools, and none of their permissions — it asks for notifications, microphone, camera (for the pairing code) and location (read only when SOS is pressed). |
+
+Both share one package name and one signing key. To promote someone, send them the full APK:
+it installs over Aegis Comms and keeps their Aegis number, contacts and message history.
+
 ### Tabs
 
 | Tab | What it does |
@@ -181,15 +193,21 @@ in `.github/workflows/android.yml`):
 
 ```bash
 cd android
-gradle assembleDebug          # builds the Rust crate for every ABI, then the app
-gradle :app:testDebugUnitTest # wire-format and invite tests
+gradle assembleDebug              # builds the Rust crate for every ABI, then both editions
+gradle assembleFullDebug          # just the full app   → app/build/outputs/apk/full/debug/
+gradle assembleCommsDebug         # just Aegis Comms    → app/build/outputs/apk/comms/debug/
+gradle :app:testFullDebugUnitTest # wire-format and invite tests
 ```
+
+The two editions are Gradle product flavours (`full` and `comms`). `src/main/AndroidManifest.xml`
+declares only what COMMS needs; `src/full/AndroidManifest.xml` adds the scanner's permissions and
+components. The code reads `BuildConfig.FULL_ACCESS` to decide which screens exist.
 
 The relay round-trip tests run two simulated phones against a real relay. They are skipped
 unless you point them at one:
 
 ```bash
-AEGIS_RELAY_URL=https://your-relay.workers.dev AEGIS_ENROLL_SECRET=… gradle :app:testDebugUnitTest
+AEGIS_RELAY_URL=https://your-relay.workers.dev AEGIS_ENROLL_SECRET=… gradle :app:testFullDebugUnitTest
 ```
 
 Crypto library: `cd comms-crypto && cargo test`. Relay: `cd comms-worker && npm run typecheck`.

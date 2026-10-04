@@ -69,9 +69,10 @@ jobs:
           echo "NDK: $ANDROID_NDK_HOME"
           gradle assembleDebug --no-daemon --stacktrace
 
-      - name: Upload APK
+      # Both flavours: full (app-full-debug.apk) and comms-only (app-comms-debug.apk).
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
           name: aegis-debug-apk
-          path: android/app/build/outputs/apk/debug/*.apk
+          path: android/app/build/outputs/apk/*/debug/*.apk
           if-no-files-found: error

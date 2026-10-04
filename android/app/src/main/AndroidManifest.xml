@@ -1,23 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    What every flavour declares: COMMS and the app shell. This on its own is the
+    comms-only APK. The scanner, the tools and the card vault — their permissions,
+    hardware features, package queries and components — are added by
+    src/full/AndroidManifest.xml, which the manifest merger folds in for the full
+    flavour only.
+-->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <!-- Detector self-test: the phone briefly advertises a fake AirTag payload that
-         the scanner must pick up. Nothing is advertised outside that test. -->
-    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <!-- SOS: the position attached to a panic message. In the full app the scanner
+         holds a live fix; without one, a fresh fix is taken at the moment SOS is
+         pressed and at no other time. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- Vehicle context: the scanner switches to an intensive sweep when the phone
-         is detected to be in a vehicle, and compares what rides along across trips.
-         A runtime permission; without it the scanner simply never knows. -->
-    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
 
     <!-- COMMS: the camera scans a contact's pairing QR code; the relay connection
          runs in a foreground service of the remote-messaging type while the
@@ -34,14 +33,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
-    <!-- Fake incoming call: rings at the exact moment the owner picked, even in Doze. -->
-    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-
-    <!-- Stalkerware scan: Android 11+ hides most installed apps from a package
-         listing without this, and an app hiding on the phone is the whole point. -->
-    <uses-permission
-        android:name="android.permission.QUERY_ALL_PACKAGES"
-        tools:ignore="QueryAllPackagesPermission" />
     <!-- COMMS: lets the owner exempt Aegis from battery optimisation, which on
          many phones (Samsung especially) otherwise cuts the background relay
          connection so incoming calls never ring. Asked for from COMMS settings. -->
@@ -49,98 +40,12 @@
     <!-- COMMS calls: the proximity sensor switches the screen off at the ear. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <!-- Wi-Fi tab: reads the connected network and the scan cache, and asks the
-         platform for a fresh scan when the tab is open (throttled by Android). -->
-    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
-
-    <!-- Cell tab: the data network type (LTE / NR / HSPA+). A normal permission on
-         Android 13+, granted at install; on 12 the read is skipped. -->
-    <uses-permission android:name="android.permission.READ_BASIC_PHONE_STATE" />
-
-    <!-- NFC / HF RFID passive tag sweep -->
-    <uses-permission android:name="android.permission.NFC" />
-
-    <!-- Restart scanning after reboot -->
+    <!-- Bring the relay connection back after a reboot or an update. -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
-    <!-- Unlock ledger: the platform's own record of the keyguard going away and
-         the screen turning on, which fills in unlocks from before Aegis's device
-         admin was enabled (and any while it was switched off). A special-access
-         permission the owner grants in Settings → Usage access; nothing is read
-         without it. -->
-    <uses-permission
-        android:name="android.permission.PACKAGE_USAGE_STATS"
-        tools:ignore="ProtectedPermissions" />
-
-    <!-- Screen-recording detection on Android 15+: a normal permission that lets
-         the window manager tell Aegis when its own screen is inside a recording. -->
-    <uses-permission android:name="android.permission.DETECT_SCREEN_RECORDING" />
-
-    <!-- Map tile downloads from OpenStreetMap. The tile server sees the device's IP
-         address and which map area is being viewed; no detection data is sent. -->
+    <!-- The relay (and, in the full app, map tile downloads from OpenStreetMap). -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-
-    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
-    <uses-feature android:name="android.hardware.nfc" android:required="false" />
-
-    <!--
-        Device tab: the packages the security check looks for. Package visibility
-        filtering hides every other app from getPackageInfo unless it is named here;
-        this is the list of root managers, hooking frameworks and known stalkerware
-        that PhoneHealthMonitor reports when installed. Nothing else is visible.
-    -->
-    <queries>
-        <package android:name="com.topjohnwu.magisk" />
-        <package android:name="io.github.vvb2060.magisk" />
-        <package android:name="io.github.huskydg.magisk" />
-        <package android:name="me.weishu.kernelsu" />
-        <package android:name="me.bmax.apatch" />
-        <package android:name="eu.chainfire.supersu" />
-        <package android:name="com.koushikdutta.superuser" />
-        <package android:name="com.noshufou.android.su" />
-        <package android:name="com.thirdparty.superuser" />
-        <package android:name="com.kingroot.kinguser" />
-        <package android:name="com.kingo.root" />
-        <package android:name="com.zachspong.temprootremovejb" />
-        <package android:name="de.robv.android.xposed.installer" />
-        <package android:name="org.meowcat.edxposed.manager" />
-        <package android:name="org.lsposed.manager" />
-        <package android:name="com.saurik.substrate" />
-        <package android:name="re.frida.server" />
-        <package android:name="com.mspy.lite" />
-        <package android:name="com.mspy.android" />
-        <package android:name="com.flexispy.android" />
-        <package android:name="com.hellospy.system" />
-        <package android:name="com.spyzie.android" />
-        <package android:name="com.cocospy.android" />
-        <package android:name="com.spyic.android" />
-        <package android:name="com.hoverwatch.android" />
-        <package android:name="com.thetruthspy.android" />
-        <package android:name="com.spyhuman.android" />
-        <package android:name="com.xnspy.android" />
-        <package android:name="com.mobistealth.android" />
-        <package android:name="com.ikeymonitor.android" />
-        <package android:name="com.cerberusapp" />
-        <package android:name="com.lsdroid.cerberus" />
-        <package android:name="com.spy2mobile.light" />
-        <package android:name="com.mxspy" />
-        <package android:name="com.pcTattletale" />
-        <package android:name="com.retinax.mobilespy" />
-        <!--
-            Makes every active device admin visible so its label can be resolved
-            through its receiver component; without this the Device tab showed raw
-            package names. Same for accessibility services, whose ResolveInfo the
-            platform supplies but whose package would otherwise stay hidden.
-        -->
-        <intent>
-            <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
-        </intent>
-        <intent>
-            <action android:name="android.accessibilityservice.AccessibilityService" />
-        </intent>
-    </queries>
 
     <application
         android:allowBackup="false"
@@ -166,18 +71,6 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <intent-filter>
-                <action android:name="android.nfc.action.NDEF_DISCOVERED" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
-            <intent-filter>
-                <action android:name="android.nfc.action.TECH_DISCOVERED" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
-            <intent-filter>
-                <action android:name="android.nfc.action.TAG_DISCOVERED" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
             <!-- COMMS invites: the relay's invite page opens aegis://invite?c=… -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
@@ -185,9 +78,6 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="aegis" android:host="invite" />
             </intent-filter>
-            <meta-data
-                android:name="android.nfc.action.TECH_DISCOVERED"
-                android:resource="@xml/nfc_tech_filter" />
         </activity>
 
         <!--
@@ -209,30 +99,6 @@
             android:screenOrientation="portrait"
             android:theme="@style/Theme.Aegis" />
 
-        <service
-            android:name=".ScanService"
-            android:exported="false"
-            android:foregroundServiceType="location" />
-
-        <!--
-            Unlock ledger: a device admin with the watch-login policy only
-            (res/xml/unlock_admin.xml), so the platform reports every lock-screen
-            success, failure and credential change. Exported with the system-only
-            BIND_DEVICE_ADMIN permission, as every admin receiver must be; the owner
-            activates it from the Device tab.
-        -->
-        <receiver
-            android:name=".security.UnlockAdminReceiver"
-            android:exported="true"
-            android:permission="android.permission.BIND_DEVICE_ADMIN">
-            <meta-data
-                android:name="android.app.device_admin"
-                android:resource="@xml/unlock_admin" />
-            <intent-filter>
-                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
-            </intent-filter>
-        </receiver>
-
         <receiver
             android:name=".BootReceiver"
             android:exported="false">
@@ -242,24 +108,6 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
-
-        <!--
-            Host Card Emulation service — replays recorded ISO 14443-4 APDU conversations so
-            the phone can act as a stored access card. Only activates when the user explicitly
-            enables emulation for a vault card; no data is sent until a reader initiates contact.
-        -->
-        <service
-            android:name=".CardEmulationService"
-            android:exported="true"
-            android:permission="android.permission.BIND_NFC_SERVICE">
-            <intent-filter>
-                <action android:name="android.nfc.cardemulation.action.HOST_APDU_SERVICE"/>
-                <category android:name="android.intent.category.DEFAULT"/>
-            </intent-filter>
-            <meta-data
-                android:name="android.nfc.cardemulation.host_apdu_service"
-                android:resource="@xml/hce_service"/>
-        </service>
 
         <!--
             COMMS relay connection. Holds the WebSocket to the owner's relay while
@@ -304,27 +152,6 @@
         <!-- Decline / hang-up buttons on call notifications. -->
         <receiver
             android:name=".comms.CallActionReceiver"
-            android:exported="false" />
-
-        <!--
-            Fake incoming call: a pretend ring the owner schedules as a reason to
-            leave. Its screen shows over the lock screen like a real call and is kept
-            out of recents; only Aegis's own alarm and notification can open it.
-        -->
-        <activity
-            android:name=".security.FakeCallActivity"
-            android:exported="false"
-            android:launchMode="singleTop"
-            android:taskAffinity="com.xat.aegis.fakecall"
-            android:excludeFromRecents="true"
-            android:showOnLockScreen="true"
-            android:showWhenLocked="true"
-            android:turnScreenOn="true"
-            android:theme="@style/Theme.Aegis" />
-
-        <!-- The fake call's alarm and its Decline button. -->
-        <receiver
-            android:name=".security.FakeCallReceiver"
             android:exported="false" />
 
         <!-- Portrait QR scanner for pairing; the library's default is landscape. -->
