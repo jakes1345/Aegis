@@ -35,6 +35,8 @@ object CommsNotifications {
      * Channel settings are fixed once created, hence a new id.
      */
     const val CHANNEL_RINGING = "calls_ringing"
+    /** An SOS from a member of one of the owner's groups: loud, and shown on the lock screen. */
+    const val CHANNEL_SOS = "group_sos"
 
     /** Intent extras naming the tab and conversation MainActivity should open. */
     const val EXTRA_TAB = "com.xat.aegis.TAB"
@@ -85,6 +87,16 @@ object CommsNotifications {
                     // The app rings with the phone's own ringtone; the channel stays quiet.
                     setSound(null, null)
                     enableVibration(false)
+                }
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(CHANNEL_SOS, "Group SOS", NotificationManager.IMPORTANCE_HIGH)
+                .apply {
+                    description = "An SOS sent by a member of one of your groups"
+                    enableVibration(true)
+                    vibrationPattern = longArrayOf(0, 500, 300, 500, 300, 500)
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                    setBypassDnd(true)
                 }
         )
     }
@@ -327,6 +339,80 @@ object CommsNotifications {
         context.getSystemService(NotificationManager::class.java)?.notify(notificationId(contact.number), notification)
     }
 
+    /** The group conversation [gid] in MainActivity; see [CommsRepository.EXTRA_GROUP]. */
+    private fun openGroup(context: Context, gid: String, requestCode: Int): PendingIntent {
+        val open = Intent(context, MainActivity::class.java)
+            .setAction(CommsRepository.ACTION_OPEN_GROUP)
+            .putExtra(EXTRA_TAB, COMMS_TAB_INDEX)
+            .putExtra(CommsRepository.EXTRA_GROUP, gid)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        return PendingIntent.getActivity(context, requestCode, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    }
+
+    /**
+     * Posts (or replaces) the notification for group [group] with its newest
+     * unread messages, each prefixed with its sender as [senderName] gives it.
+     * Keyed on the group id, so [cancel] with that id clears it.
+     */
+    fun notifyGroupInbound(context: Context, group: Group, messages: List<ChatMessage>, senderName: (String) -> String) {
+        if (messages.isEmpty()) return
+        if (!canPost(context)) return
+        ensureChannels(context)
+        val newest = messages.maxBy { it.ts }
+        fun line(m: ChatMessage) = (m.sender?.let { "${senderName(it)}: " } ?: "") + m.preview()
+        val style = NotificationCompat.InboxStyle()
+        messages.sortedBy { it.ts }.takeLast(5).forEach { style.addLine(line(it)) }
+        val notification = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setContentTitle(group.name)
+            .setContentText(line(newest))
+            .setStyle(style)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(openGroup(context, group.id, group.id.hashCode()))
+            .setWhen(newest.ts)
+            .setShowWhen(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(
+                NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+                    .setSmallIcon(android.R.drawable.stat_notify_chat)
+                    .setContentTitle("New group message")
+                    .setContentText("Unlock to read")
+                    .build()
+            )
+            .build()
+        context.getSystemService(NotificationManager::class.java)?.notify(notificationId(group.id), notification)
+    }
+
+    /**
+     * An SOS from [fromName] in [group]: its own notification, never replaced
+     * by a later message, with the position they sent (when they had one).
+     */
+    fun notifyPanic(context: Context, group: Group, panicId: String, fromName: String, lat: Double?, lon: Double?, note: String, ts: Long) {
+        if (!canPost(context)) return
+        ensureChannels(context)
+        val where = if (lat != null && lon != null) String.format(java.util.Locale.US, "at %.5f, %.5f", lat, lon) else "no position attached"
+        val text = buildString {
+            append(group.name).append(" · ").append(where)
+            if (note.isNotBlank()) append("\n").append(note)
+        }
+        val notification = NotificationCompat.Builder(context, CHANNEL_SOS)
+            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setContentTitle("SOS from $fromName")
+            .setContentText(text.lineSequence().first())
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setAutoCancel(true)
+            .setContentIntent(openGroup(context, group.id, panicId.hashCode()))
+            .setWhen(ts)
+            .setShowWhen(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .build()
+        context.getSystemService(NotificationManager::class.java)?.notify(panicId(panicId), notification)
+    }
+
     /** Clears both the message and the missed-call notification for [peer]. */
     fun cancel(context: Context, peer: String) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
@@ -368,4 +454,5 @@ object CommsNotifications {
 
     private fun notificationId(peer: String) = 0x5A00_0000 or (peer.hashCode() and 0x00FF_FFFF)
     private fun missedCallId(peer: String) = 0x5B00_0000 or (peer.hashCode() and 0x00FF_FFFF)
+    private fun panicId(id: String) = 0x5D00_0000 or (id.hashCode() and 0x00FF_FFFF)
 }

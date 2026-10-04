@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Aegis's device admin exists for one thing: the lock-screen callbacks that feed
+    the unlock ledger (password succeeded / failed / changed). watch-login is the
+    only policy it asks for. It never sets a password policy, locks or wipes the
+    device; the owner can revoke it from Settings at any time, and the ledger
+    records that too.
+-->
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies>
+        <watch-login />
+    </uses-policies>
+</device-admin>

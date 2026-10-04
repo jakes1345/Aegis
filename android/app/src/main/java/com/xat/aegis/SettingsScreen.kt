@@ -11,6 +11,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -19,6 +21,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -139,7 +142,7 @@ private val SCardShape   = RoundedCornerShape(4.dp)
 // ── SettingsScreen composable ──────────────────────────────────────────────────
 
 @Composable
-fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
+fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}, onOpenTools: () -> Unit = {}) {
     val context = LocalContext.current
     val trusted by Registry.trusted.collectAsStateWithLifecycle()
     val status by Registry.status.collectAsStateWithLifecycle()
@@ -342,6 +345,35 @@ fun SettingsScreen(onBack: () -> Unit, onClearData: () -> Unit = {}) {
                     fontSize = 18.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp
                 )
                 Spacer(Modifier.width(60.dp))
+            }
+        }
+
+        // ── Tools ────────────────────────────────────────────────────────────
+        //
+        // The tab bar is full, so the on-demand checks and defences live behind
+        // this row (and the TOOLS button on the Scan header).
+
+        item(key = "§tools") {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(SCardShape)
+                    .background(SPanelClr, SCardShape)
+                    .border(1.dp, SAccentClr.copy(alpha = 0.5f), SCardShape)
+                    .clickable(onClick = onOpenTools)
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("TOOLS", color = SAccentClr, fontSize = 14.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                    Text(
+                        "Hidden camera sweep, stalkerware scan, certificate audit, pattern of life, " +
+                        "unlock ledger, fake call, duress phrase, tracker locator and the self-test beacon",
+                        color = SMutedClr, fontSize = 12.sp, lineHeight = 16.sp
+                    )
+                }
+                Text("›", color = SAccentClr, fontSize = 20.sp)
             }
         }
 

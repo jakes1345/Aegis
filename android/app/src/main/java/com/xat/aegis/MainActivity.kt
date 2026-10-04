@@ -84,6 +84,9 @@ import com.xat.aegis.analysis.WifiScanner
 import com.xat.aegis.security.AppLock
 import com.xat.aegis.security.LockScreen
 import com.xat.aegis.analysis.PhoneHealthMonitor
+import com.xat.aegis.security.BiometricTripwire
+import com.xat.aegis.security.ScreenRecordingMonitor
+import com.xat.aegis.security.UnlockLedger
 import com.xat.aegis.analysis.Report
 import com.xat.aegis.detect.BleNames
 import com.xat.aegis.comms.CallManager
@@ -219,6 +222,15 @@ class MainActivity : AppCompatActivity() {
             }
         }
         Registry.bindTrustStore(this)
+
+        // Platform hardening. The unlock ledger opens so the Device tab can read
+        // it; this Activity's window is watched for being recorded; and the
+        // enrolment tripwire is tested once per launch — Keystore work, off the
+        // main thread. Each publishes straight into the Registry.
+        UnlockLedger.init(this)
+        ScreenRecordingMonitor.start(this, windowManager)
+        lifecycleScope.launch(Dispatchers.IO) { runCatching { BiometricTripwire.check(applicationContext) } }
+
         nfcAdapter = runCatching { NfcAdapter.getDefaultAdapter(this) }.getOrNull()
         cardEmulation = nfcAdapter?.let { runCatching { CardEmulation.getInstance(it) }.getOrNull() }
 
@@ -414,11 +426,14 @@ class MainActivity : AppCompatActivity() {
         if (intent == null || !intent.hasExtra(CommsNotifications.EXTRA_TAB)) return
         val tab = intent.getIntExtra(CommsNotifications.EXTRA_TAB, -1)
         val peer = intent.getStringExtra(CommsNotifications.EXTRA_PEER)
+        val group = intent.getStringExtra(CommsRepository.EXTRA_GROUP)
         intent.removeExtra(CommsNotifications.EXTRA_TAB)
         intent.removeExtra(CommsNotifications.EXTRA_PEER)
+        intent.removeExtra(CommsRepository.EXTRA_GROUP)
         if (tab < 0) return
         Registry.requestTab(tab)
         if (peer != null) Registry.requestThread(peer)
+        if (group != null) Registry.requestGroup(group)
     }
 
     /**
@@ -444,9 +459,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Runs the static findings scan off the main thread and publishes the result. */
+    /**
+     * Runs the static findings scan off the main thread and publishes the result,
+     * and brings the unlock ledger up to date from the usage log while it is there.
+     */
     private fun refreshDeviceHealth() {
-        lifecycleScope.launch(Dispatchers.IO) { runCatching { phoneHealthMonitor.scanAndPublish() } }
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching { phoneHealthMonitor.scanAndPublish() }
+            runCatching { UnlockLedger.refresh(applicationContext) }
+        }
     }
 
     /**
@@ -503,6 +524,13 @@ class MainActivity : AppCompatActivity() {
         // armed, keeps running — it is used with Aegis in the background — and the
         // banner and STOP work from the armed card's id and label alone.
         Registry.lockVault()
+    }
+
+    override fun onDestroy() {
+        // The recording callback is registered on this Activity's WindowManager;
+        // a recreated Activity registers its own in onCreate.
+        ScreenRecordingMonitor.stop()
+        super.onDestroy()
     }
 
     // ── NFC: reader mode versus card emulation ───────────────────────────────
@@ -1214,8 +1242,11 @@ private fun MainApp(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    // Settings navigation and threat explainer state
+    // Settings navigation and threat explainer state. TOOLS is reached from the
+    // Scan header and from the top of Settings; it is drawn over the tabs the same
+    // way Settings is, and closing it returns to wherever it was opened from.
     var showSettings by remember { mutableStateOf(false) }
+    var showTools by remember { mutableStateOf(false) }
     var explainerTarget by remember { mutableStateOf<ExplainerTarget?>(null) }
 
     // A call ringing or in progress takes the COMMS tab regardless of where the
@@ -1225,6 +1256,7 @@ private fun MainApp(
         if (activeCall != null && activeCall?.phase != CallPhase.ENDED) {
             tab = TAB_COMMS
             showSettings = false
+            showTools = false
             explainerTarget = null
         }
     }
@@ -1236,12 +1268,22 @@ private fun MainApp(
         if (tabRequest != null) Registry.takeTabRequest()?.let { tab = it.coerceIn(0, tabs.size - 1) }
     }
     val threadRequest by Registry.threadRequest.collectAsStateWithLifecycle()
+    val groupRequest by Registry.groupRequest.collectAsStateWithLifecycle()
     val inviteRequest by Registry.inviteRequest.collectAsStateWithLifecycle()
 
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
+    if (showTools) {
+        ToolsScreen(onBack = { showTools = false })
+        return
+    }
+
     if (showSettings) {
-        SettingsScreen(onBack = { showSettings = false }, onClearData = onClearData)
+        SettingsScreen(
+            onBack = { showSettings = false },
+            onClearData = onClearData,
+            onOpenTools = { showTools = true }
+        )
         return
     }
 
@@ -1264,6 +1306,7 @@ private fun MainApp(
                 0 -> ScanScreen(
                     onStart, onStop, hasPermissions,
                     onSettingsClick = { showSettings = true },
+                    onToolsClick = { showTools = true },
                     onShowExplainer = { d -> explainerTarget = ExplainerTarget.BleDevice(d) }
                 )
                 1 -> MapScreen()
@@ -1286,13 +1329,16 @@ private fun MainApp(
                     openPeer = threadRequest,
                     onPeerConsumed = { Registry.takeThreadRequest() },
                     openInvite = inviteRequest,
-                    onInviteConsumed = { Registry.takeInviteRequest() }
+                    onInviteConsumed = { Registry.takeInviteRequest() },
+                    openGroup = groupRequest,
+                    onGroupConsumed = { Registry.takeGroupRequest() }
                 )
             }
 
-            // SOS panic button, floating over the active tab. Hidden while settings is
-            // open or the phone is locked; no animation needed for a critical safety button.
-            if (!showSettings && !locked) {
+            // SOS panic button, floating over the active tab. Hidden while settings or
+            // tools are open or the phone is locked; no animation needed for a critical
+            // safety button.
+            if (!showSettings && !showTools && !locked) {
                 Box(Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 16.dp)) {
                     SosButton(onConfirmed = {
                         val s = Registry.status.value
@@ -1494,6 +1540,7 @@ private fun ScanScreen(
     onStop: () -> Unit,
     hasPermissions: () -> Boolean,
     onSettingsClick: () -> Unit = {},
+    onToolsClick: () -> Unit = {},
     onShowExplainer: (Detection) -> Unit = {}
 ) {
     val detections by Registry.detections.collectAsStateWithLifecycle()
@@ -1531,6 +1578,9 @@ private fun ScanScreen(
                         val i = Report.share(context, status, detections, timeline, cell, nfc)
                         context.startActivity(Intent.createChooser(i, "Share evidence report"))
                     }) { Text("EXPORT", color = Muted, fontSize = 11.sp, letterSpacing = 1.sp) }
+                    TextButton(onClick = onToolsClick) {
+                        Text("TOOLS", color = Muted, fontSize = 11.sp, letterSpacing = 1.sp)
+                    }
                     TextButton(onClick = onSettingsClick) {
                         Text("⚙", color = Muted, fontSize = 18.sp)
                     }

@@ -4,6 +4,9 @@
 
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Detector self-test: the phone briefly advertises a fake AirTag payload that
+         the scanner must pick up. Nothing is advertised outside that test. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
@@ -11,6 +14,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Vehicle context: the scanner switches to an intensive sweep when the phone
+         is detected to be in a vehicle, and compares what rides along across trips.
+         A runtime permission; without it the scanner simply never knows. -->
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
 
     <!-- COMMS: the camera scans a contact's pairing QR code; the relay connection
          runs in a foreground service of the remote-messaging type while the
@@ -26,6 +33,15 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
+    <!-- Fake incoming call: rings at the exact moment the owner picked, even in Doze. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <!-- Stalkerware scan: Android 11+ hides most installed apps from a package
+         listing without this, and an app hiding on the phone is the whole point. -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
     <!-- COMMS: lets the owner exempt Aegis from battery optimisation, which on
          many phones (Samsung especially) otherwise cuts the background relay
          connection so incoming calls never ring. Asked for from COMMS settings. -->
@@ -47,6 +63,19 @@
 
     <!-- Restart scanning after reboot -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Unlock ledger: the platform's own record of the keyguard going away and
+         the screen turning on, which fills in unlocks from before Aegis's device
+         admin was enabled (and any while it was switched off). A special-access
+         permission the owner grants in Settings → Usage access; nothing is read
+         without it. -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Screen-recording detection on Android 15+: a normal permission that lets
+         the window manager tell Aegis when its own screen is inside a recording. -->
+    <uses-permission android:name="android.permission.DETECT_SCREEN_RECORDING" />
 
     <!-- Map tile downloads from OpenStreetMap. The tile server sees the device's IP
          address and which map area is being viewed; no detection data is sent. -->
@@ -185,6 +214,25 @@
             android:exported="false"
             android:foregroundServiceType="location" />
 
+        <!--
+            Unlock ledger: a device admin with the watch-login policy only
+            (res/xml/unlock_admin.xml), so the platform reports every lock-screen
+            success, failure and credential change. Exported with the system-only
+            BIND_DEVICE_ADMIN permission, as every admin receiver must be; the owner
+            activates it from the Device tab.
+        -->
+        <receiver
+            android:name=".security.UnlockAdminReceiver"
+            android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/unlock_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
+
         <receiver
             android:name=".BootReceiver"
             android:exported="false">
@@ -256,6 +304,27 @@
         <!-- Decline / hang-up buttons on call notifications. -->
         <receiver
             android:name=".comms.CallActionReceiver"
+            android:exported="false" />
+
+        <!--
+            Fake incoming call: a pretend ring the owner schedules as a reason to
+            leave. Its screen shows over the lock screen like a real call and is kept
+            out of recents; only Aegis's own alarm and notification can open it.
+        -->
+        <activity
+            android:name=".security.FakeCallActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:taskAffinity="com.xat.aegis.fakecall"
+            android:excludeFromRecents="true"
+            android:showOnLockScreen="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@style/Theme.Aegis" />
+
+        <!-- The fake call's alarm and its Decline button. -->
+        <receiver
+            android:name=".security.FakeCallReceiver"
             android:exported="false" />
 
         <!-- Portrait QR scanner for pairing; the library's default is landscape. -->

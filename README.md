@@ -2,22 +2,28 @@
 
 Counter-surveillance for your phone, and a private way to talk.
 
-Aegis answers two questions:
+Aegis answers three questions:
 
 1. **Is something tracking me?** It looks for the trackers that matter: Bluetooth tags,
-   Wi-Fi bait networks, fake cell towers (IMSI catchers), and hidden cellular or
-   satellite transmitters. It reports "following" only when it can prove the thing
-   moved with you, not just that it was nearby.
-2. **Can I talk to someone without being watched?** COMMS is end-to-end encrypted
-   messaging and voice calls between Aegis apps. It goes through a relay you run
-   yourself, uses no phone number, no Google services and no phone carrier, and
-   the relay cannot read your messages.
+   Wi-Fi bait networks, fake cell towers (IMSI catchers), hidden cameras, and hidden
+   cellular or satellite transmitters. It reports "following" only when it can prove the
+   thing moved with you, not just that it was nearby.
+2. **Is my own phone working against me?** It checks for stalkerware, a fingerprint
+   someone else enrolled, night-time unlocks, screen recorders, user-installed
+   certificates, intercepted TLS, and a Bluetooth microphone that attached itself.
+3. **Can I talk to someone without being watched?** COMMS is end-to-end encrypted
+   messaging, voice calls and groups between Aegis apps. It goes through a relay you run
+   yourself, uses no phone number, no Google services and no phone carrier, and the relay
+   cannot read your messages.
+
+Everything runs on a stock, unrooted phone with public Android APIs. No root, no custom
+ROM, no special hardware.
 
 There are two ways to run it:
 
 | | What | Where |
 |---|---|---|
-| **Android app** | Tracker, Wi-Fi, cell and NFC detection, device health checks, card vault, and COMMS | `android/`, APK on the [Releases](https://github.com/jakes1345/Aegis/releases) page |
+| **Android app** | Tracker, Wi-Fi, cell, NFC and hidden-camera detection; stalkerware and device health checks; card vault; COMMS with groups, shared threats and SOS | `android/`, APK on the [Releases](https://github.com/jakes1345/Aegis/releases) page |
 | **Desktop tool** (`track-detect`) | Bluetooth, Wi-Fi, SDR radio sweep, cellular and GPS detection from a laptop, including hidden LTE and satellite trackers found by radio sweep | `src/` (Node.js) |
 
 The COMMS relay (`comms-worker/`) and its encryption library (`comms-crypto/`) support the app.
@@ -34,17 +40,35 @@ over the previous version.
 
 | Tab | What it does |
 |---|---|
-| **SCAN** | Bluetooth LE scan for AirTags and Find My items, Tile, SmartTag, Chipolo, Pebblebee and more. Devices are recognised by the parts of their broadcast that don't change, so a tag that keeps changing its address is still recognised as the same device. A device is marked **FOLLOWING** only when it was heard from two places at least 300 m apart; otherwise it stays **PERSISTENT**. Trusted devices can be ignored. |
-| **MAP** | Where each suspicious device was seen, on OpenStreetMap. Loading map tiles shows the tile server your IP address and the area you are viewing; nothing else leaves the phone. |
-| **LOG** | A lasting timeline of the events that matter: confirmed followers, IMSI-catcher findings, scanned tags, and when scans started and stopped. Can be exported as an evidence report. |
+| **SCAN** | Bluetooth LE scan for AirTags and Find My items, Tile, SmartTag, Chipolo, Pebblebee and more. Devices are recognised by the parts of their broadcast that don't change, and by the rhythm of their advertising (each tracker family has its own interval, transmit power and packet shape), so a tag that rotates its address every 15 minutes is still one device. A device is marked **FOLLOWING** only when it was heard from two places at least 300 m apart; otherwise it stays **PERSISTENT**. A recognised tracker is asked, over the standard unwanted-tracker Bluetooth service, for its maker, model and obfuscated serial, which go into the evidence record. In a moving car the scan switches to its most sensitive mode for the first five minutes of every drive, and an address present on three drives from different places is flagged. Trusted devices can be ignored. |
+| **MAP** | Where each suspicious device was seen, on OpenStreetMap, plus ring markers for threats other members of your groups have shared. Loading map tiles shows the tile server your IP address and the area you are viewing; nothing else leaves the phone. |
+| **LOG** | A lasting timeline of the events that matter: confirmed followers, IMSI-catcher findings, scanned tags, shared threats, SOS alerts, device-integrity events, and when scans started and stopped. Can be exported as an evidence report (text or JSON, UTC timestamps). |
 | **CELL** | IMSI-catcher detection. It learns what normal looks like where you actually go, then flags anything unusual: a downgrade to 2G/3G, a cell whose tracking-area code changed, forced re-registration while you're standing still, a signal much stronger than normal, no neighbouring cells, or a cell that appears briefly and then vanishes. It needs no root, no account and no tower database. |
 | **NFC** | Identifies NFC and RFID cards and tags (type, UID, payment network). Cards can be stored in an encrypted **card vault**, protected by AES-256-GCM with a key held in the phone's secure hardware and unlocked by fingerprint or PIN, and **replayed** with Host Card Emulation so the phone can act as a stored access card. |
-| **WIFI** | Looks for Wi-Fi networks that behave like bait rather than normal infrastructure, while avoiding false alarms on ordinary carrier hotspots and dual-band routers. |
-| **DEVICE** | Phone health checks: which apps are using the microphone or camera right now, plus accessibility services, device admins and debug settings that spyware relies on. |
-| **COMMS** | Encrypted messages and calls between Aegis apps (below). |
+| **WIFI** | Looks for Wi-Fi networks that behave like bait rather than normal infrastructure, while avoiding false alarms on ordinary carrier hotspots and dual-band routers. A **canary**: Aegis asks Android to look for a random hidden network name nobody else knows; any access point that answers for it is a Karma/Pineapple-style device impersonating networks on demand. |
+| **DEVICE** | Phone health checks: which apps are using the microphone or camera right now; accessibility services, device admins and debug settings that spyware relies on; whether Android's Advanced Protection is on; whether a **new fingerprint or face was enrolled** since the last check (a hardware key that dies on enrolment); whether something is **recording the screen**; a **Bluetooth or USB microphone** that connected while nothing was playing; what your phone's Bluetooth name gives away and whether Wi-Fi MAC randomisation is off; and whether the clock is wrong or set by hand. |
+| **COMMS** | Encrypted messages, calls, groups, shared threats, SOS and AegisCoin between Aegis apps (below). |
+| **TOOLS** | The investigations you run on purpose rather than in the background. See the next section. |
 
 Scanning runs as a foreground service, and can restart after a reboot if you turn that on.
 Detection data stays on the phone.
+
+A round **SOS** button sits on the main screens. Hold it for a second and a half, confirm,
+and every group you belong to receives an encrypted panic alert with your last position.
+
+### Tools
+
+| Tool | What it does |
+|---|---|
+| **Hidden camera sweep** | A guided sweep of a room you have the right to search (your home, your hotel room, your rental). It combines an optical check with the phone's camera and torch, a look at what is on the Wi-Fi you are connected to, nearby wireless names that belong to camera products, the magnetometer, and a checklist of the usual hiding places. It says plainly what phone hardware cannot see, so a clean result is read correctly. |
+| **Stalkerware scan** | Scores every installed app on the signals monitoring apps share: installed outside a store, no icon in the app drawer, accessibility or notification access switched on, SMS or call-log permissions, running in the background without ever showing a screen. Lists which apps can read every notification or act as the VPN. One tap opens the system page where the app can be removed. |
+| **Certificates and TLS** | Lists certificate authorities added by a person or a management profile (the prerequisite for reading your encrypted traffic), and checks the connection to your relay for a certificate or proxy that is not the real one. |
+| **Pattern of life** | Reads the phone's own location history and tells you how predictable you are: where you stop, when you usually leave home on each weekday, how often you take the same route, and a plain predictability score with concrete suggestions. Nothing leaves the phone. |
+| **Unlock ledger** | With device-admin consent, records every unlock, failed attempt and PIN change, and backfills the system's own record. Flags an unlock during your sleep window. |
+| **Fake call** | A realistic incoming call in 30 seconds, 2 or 5 minutes, as a reason to leave. Answering can connect a real encrypted call to a contact you chose beforehand. |
+| **Duress phrase** | An ordinary sentence that, when you send it in any chat, goes out as a normal message and silently fires the SOS with your position. The phrase is stored encrypted and never shown again. |
+| **Find a tracker** | A compass and signal-strength finder for a device the scan has flagged, with warmer/colder guidance and a distance estimate. When the tracker supports it, a button makes it beep. |
+| **Self-test beacon** | Broadcasts a test tracker advertisement so you can confirm the scan on this or another Aegis phone actually detects it. |
 
 ---
 
@@ -69,6 +93,17 @@ Detection data stays on the phone.
 - **No Google.** A background connection to your relay rings calls while Aegis is closed.
   Optional [UnifiedPush](https://unifiedpush.org) (for example ntfy) can wake the phone
   instead.
+- **Groups.** An organisation or community group is a roster of contacts; every group
+  message is encrypted separately to each member and sent through the normal 1:1 path, so
+  the relay never learns the group exists. Admins add and remove members; members post.
+  Comfortable up to about fifty members.
+- **Shared threats and SOS.** A detection can be shared to a group with its position and
+  expires on its own; members see it as a ring on their MAP. The SOS button and the duress
+  phrase both send a panic alert to every group you are in.
+- **AegisCoin.** Each relay is its own small currency community: a balance per Aegis
+  number, moved between two phones on a signed request, with the note travelling encrypted
+  so the relay only ever sees amounts. Balances start at zero until the relay operator
+  sets a starting balance or mints; see the relay README. It is relay credit, not money.
 
 ### What the relay can and cannot see
 
@@ -112,8 +147,10 @@ which you can copy when something goes wrong.
 
 ### Not yet
 
-- **No iPhone app.** Aegis is Android only for now.
-- **No group chats or video calls.**
+- **No iPhone app.** Aegis is Android only for now. The crypto core is Rust with UniFFI,
+  which also generates Swift bindings, so an iOS client would reuse it unchanged.
+- **No video calls.** Groups are text, media, threats and SOS; group calls are not built.
+- **No real-money payments.** AegisCoin is relay credit with nothing behind it.
 - **One phone per Aegis number.** Reinstalling creates a new identity and a new number.
 
 ---
@@ -123,11 +160,15 @@ which you can copy when something goes wrong.
 ```
 android/        the Android app (Kotlin, Jetpack Compose)
   app/src/main/java/com/xat/aegis/
-    MainActivity.kt, *Screen.kt     tabs and UI
+    MainActivity.kt, *Screen.kt     tabs and UI (CommsScreen, SettingsScreen, ToolsScreen, CameraSweepScreen)
     ScanService.kt                  foreground scanning service
-    analysis/                       cell, IMSI, Wi-Fi, NFC, card vault, device health, geo
-    detect/Signatures.kt            BLE tracker signatures
-    comms/                          COMMS: relay client, live link, calls, store, wire format
+    analysis/                       cell, IMSI, Wi-Fi, NFC, card vault, device health, geo,
+                                    hidden cameras, stalkerware, CA audit, TLS canary, pattern of life
+    detect/                         BLE tracker signatures, cadence fingerprinting across MAC rotation,
+                                    DULT interrogation, RSSI locator, vehicle trips, Karma and BLE canaries
+    security/                       app lock, wiper, biometric tripwire, unlock ledger, screen-recording
+                                    monitor, fake call, duress phrase, relay clock
+    comms/                          COMMS: relay client, live link, calls, groups, store, wire format
 comms-crypto/   Rust library: Olm sessions (vodozemac), sealing, safety numbers; UniFFI → Kotlin
 comms-worker/   Cloudflare Worker + Durable Objects: the COMMS relay (see its README)
 src/, test/     desktop track-detect tool (Node.js)
@@ -340,5 +381,13 @@ who chose to use it.
   illegal in many places. Check local law before operating an SDR.
 - **Cellular monitoring** reads your own modem's status.
 - **Card replay:** only use it with cards you are entitled to use.
+- **Hidden camera sweep and network checks** are for rooms and networks you have the right
+  to inspect: your home, a room you are renting, a network you are a guest on. They look
+  at what is already visible to any device in the room and send nothing to the devices
+  they find beyond a connection attempt.
+- **The stalkerware scan** reads your own phone's app list. It reports signals, not
+  verdicts; a flagged app is yours to look at, not proof of anything.
+- **Groups and shared threats** go only to people who were added to the group by its
+  admin, and only ever as ciphertext.
 
 MIT.

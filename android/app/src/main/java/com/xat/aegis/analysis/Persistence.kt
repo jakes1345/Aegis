@@ -6,6 +6,9 @@ import com.xat.aegis.LatLon
 import com.xat.aegis.Threat
 import com.xat.aegis.TrackerType
 import com.xat.aegis.detect.BleNames
+import com.xat.aegis.detect.DultResult
+import kotlin.math.max
+import kotlin.math.min
 
 const val PERSIST_THRESHOLD_MS = 10 * 60 * 1000L
 const val PERSIST_MIN_SIGHTINGS = 5
@@ -64,6 +67,40 @@ class Tracker(
         val area = ObservationArea()
         /** Our position at the most recent sighting — where the map should mark it. */
         var lastHeardAt: LatLon? = null
+        /** The tracker's own account of itself over DULT, once it has been asked. */
+        var dult: DultResult? = null
+
+        /**
+         * Folds [other] into this entry when two keys turn out to be one device. The
+         * cadence fingerprinter can only prove a rotation after a few packets, by which
+         * time the new address has a few sightings under a key of its own.
+         */
+        fun absorb(other: Entry) {
+            if (address.isEmpty()) address = other.address
+            if (advertisedName == null) advertisedName = other.advertisedName
+            if (manufacturer == null) manufacturer = other.manufacturer
+            if (services.size < MAX_SERVICES) services.addAll(other.services)
+            if (radio == "BLE" && other.radio != "BLE") radio = other.radio
+            if (addressKind == null) addressKind = other.addressKind
+            if (tracker == null) tracker = other.tracker
+            if (dult == null || (other.dult?.answered == true && dult?.answered != true)) dult = other.dult
+            if (other.lastSeen >= lastSeen) {
+                rssi = other.rssi
+                approxMetres = other.approxMetres
+                lastHeardAt = other.lastHeardAt ?: lastHeardAt
+            }
+            firstSeen = if (firstSeen == 0L) other.firstSeen else min(firstSeen, other.firstSeen)
+            lastSeen = max(lastSeen, other.lastSeen)
+            sightings += other.sightings
+            // The merge itself is one more address the device has used.
+            rotations = rotations + other.rotations + 1
+            addresses = addresses + other.addresses
+            following = following || other.following
+            persistent = persistent || other.persistent
+            score = max(score, other.score)
+            other.area.points().forEach { area.add(Fix(it.lat, it.lon, null, 0)) }
+            name = BleNames.displayName(advertisedName, tracker, manufacturer, address)
+        }
     }
 
     data class Observation(val detection: Detection, val becameFollowing: Boolean)
@@ -97,8 +134,10 @@ class Tracker(
         entry.address = address
         entry.rssi = rssi
         entry.approxMetres = approxMetres
-        entry.rotations = rotations
-        entry.addresses = addresses
+        // Never backwards: a cadence stitch can route a fresh identity (zero rotations)
+        // onto an entry that has already been seen through several.
+        entry.rotations = max(entry.rotations, rotations)
+        entry.addresses = max(entry.addresses, addresses)
         entry.lastSeen = now
         entry.sightings++
         // A device only becomes identifiable once it advertises something we match.
@@ -183,10 +222,40 @@ class Tracker(
             manufacturer = entry.manufacturer,
             services = entry.services.toList(),
             radio = entry.radio,
-            addressKind = entry.addressKind
+            addressKind = entry.addressKind,
+            dult = entry.dult
         )
 
         return Observation(detection, entry.following && !wasFollowing)
+    }
+
+    /**
+     * Attaches what a tracker said over DULT to its row. Partial results arrive as
+     * the exchange proceeds; a later one always replaces an earlier one, except that
+     * a final "refused" must not erase answers already received.
+     */
+    @Synchronized
+    fun attachDult(key: String, result: DultResult) {
+        val entry = entries[key] ?: return
+        val current = entry.dult
+        if (current != null && current.answered && !result.answered) {
+            entry.dult = current.copy(complete = result.complete, error = result.error)
+            return
+        }
+        entry.dult = result
+    }
+
+    /**
+     * Moves everything recorded under [fromKey] into [intoKey], creating the target
+     * when it does not exist yet. Returns false when there was nothing to move.
+     */
+    @Synchronized
+    fun merge(fromKey: String, intoKey: String): Boolean {
+        if (fromKey == intoKey) return false
+        val from = entries.remove(fromKey) ?: return false
+        val into = entries.getOrPut(intoKey) { Entry(intoKey) }
+        into.absorb(from)
+        return true
     }
 
     @Synchronized
@@ -222,7 +291,8 @@ class Tracker(
                 manufacturer = entry.manufacturer,
                 services = entry.services.toList(),
                 radio = entry.radio,
-                addressKind = entry.addressKind
+                addressKind = entry.addressKind,
+                dult = entry.dult
             )
         }
 

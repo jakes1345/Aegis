@@ -10,7 +10,14 @@ import android.net.ConnectivityManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.xat.aegis.EventKind
 import com.xat.aegis.MainActivity
+import com.xat.aegis.Registry
+import com.xat.aegis.Severity
+import com.xat.aegis.TimelineEvent
+import com.xat.aegis.TimelineLog
+import com.xat.aegis.security.DuressPhrase
+import com.xat.aegis.security.RelayClock
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -88,6 +95,8 @@ object CommsRepository {
     /** How long a shared threat stays on members' maps; a catcher sits still, a follower moves on. */
     private const val THREAT_TTL_MS = 3600_000L
     private const val CATCHER_TTL_MS = 24 * 3600_000L
+    private const val THREAT_EXPIRE_INTERVAL_MS = 3600_000L
+    private const val MAX_PANIC_NOTE = 280
     /** Intent extra naming the group conversation MainActivity should open (with [CommsNotifications.EXTRA_TAB]). */
     const val EXTRA_GROUP = "com.xat.aegis.GROUP"
     const val ACTION_OPEN_GROUP = "com.xat.aegis.OPEN_GROUP"
@@ -105,6 +114,19 @@ object CommsRepository {
     }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + crashGuard)
     private val lock = Mutex()
+
+    /**
+     * Observers of every outgoing text, called with the body before it is queued.
+     * The message goes out whatever they do; a hook that throws is logged and the
+     * send continues.
+     */
+    private val sendHooks = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
+
+    fun addSendHook(hook: (String) -> Unit) { sendHooks.addIfAbsent(hook) }
+
+    private fun runSendHooks(body: String) {
+        for (hook in sendHooks) runCatching { hook(body) }.onFailure { CommsLog.add("Send hook failed: ${it.message}") }
+    }
 
     /** When a resync was last sent to each contact, so a run of unreadable envelopes asks only once. */
     private val lastResync = HashMap<String, Long>()
@@ -172,6 +194,9 @@ object CommsRepository {
         store = CommsStore(appContext)
         CommsMedia.init(appContext)
         relay = RelayClient({ identities.get() }, { config.relayUrl }, { config.number })
+        // The relay's clock, as the Device tab's clock-integrity row compares it.
+        RelayClock.bind(appContext)
+        relay.clockListener = { serverMs, localMs -> RelayClock.record(serverMs, localMs) }
         LiveLink.init(appContext)
         CallManager.init(appContext)
         // Identities registered before the background connection became the default
@@ -183,12 +208,31 @@ object CommsRepository {
             CommsLog.add("Background connection switched on (calls ring while Aegis is closed)")
         }
         initialised = true
+        // Every entry point that initialises comms also arms the duress phrase.
+        DuressPhrase.install(appContext)
         publishConfig()
         scope.launch { refreshUnread() }
         if (config.isRegistered && config.online) CommsService.start(appContext)
         watchNetwork()
         if (config.isRegistered) scope.launch { pruneSessions() }
         scope.launch { runCatching { store.purgeChunks(System.currentTimeMillis() - CHUNK_TTL_MS) } }
+        // Shared threats on the map are forgotten as their time runs out: now, and every hour.
+        scope.launch {
+            while (true) {
+                runCatching { expireSharedThreats() }.onFailure { CommsLog.add("Could not tidy shared threats: ${it.message}") }
+                delay(THREAT_EXPIRE_INTERVAL_MS)
+            }
+        }
+        // An SOS (the button, or the duress phrase in an outgoing text) goes to
+        // every group this phone is in, with the last known position, and the
+        // flag is lowered once that has been tried.
+        scope.launch {
+            Registry.panicActive.collect { active ->
+                if (!active) return@collect
+                runCatching { broadcastPanic() }.onFailure { CommsLog.add("SOS could not be sent: ${it.message}") }
+                Registry.setPanicActive(false)
+            }
+        }
     }
 
     /**
@@ -550,6 +594,7 @@ object CommsRepository {
         val text = body.trim().take(MAX_BODY)
         if (text.isEmpty()) return@withContext Result.failure(IllegalArgumentException("Empty message"))
         store.contact(peer) ?: return@withContext Result.failure(RelayException("Unknown contact"))
+        runSendHooks(text)
         val id = UUID.randomUUID().toString()
         store.insertMessage(ChatMessage(id, peer, Direction.OUT, text, System.currentTimeMillis(), "queued", read = true))
         bump()
@@ -962,6 +1007,472 @@ object CommsRepository {
     private fun paymentLine(amount: Long, note: String?, sent: Boolean): String =
         "$amount $COIN_SYMBOL ${if (sent) "sent" else "received"}" + (if (!note.isNullOrBlank()) " · $note" else "")
 
+    // ── Organisation groups ───────────────────────────────────────────────
+    //
+    // A group lives on its members' phones only: the relay never sees a group
+    // id, let alone a roster. Every group payload is encrypted separately for
+    // each member and sent along the 1:1 path, so a group message costs one
+    // envelope per member. Admins keep the roster; a change is told to every
+    // member, and each phone applies only what it hears from someone it knows
+    // to be in that group (and, for roster changes, to be an admin of it).
+
+    fun groups(): List<Group> = store.groups().map { it.copy(memberCount = store.groupMembers(it.id).size) }
+
+    fun group(gid: String): Group? = store.group(gid)?.let { it.copy(memberCount = store.groupMembers(gid).size) }
+
+    fun groupMembers(gid: String): List<GroupMember> = store.groupMembers(gid)
+
+    /** The newest [limit] messages in [gid], oldest first, as the conversation shows them. */
+    fun groupMessages(gid: String, limit: Int = 100): List<ChatMessage> = store.groupMessages(gid, limit).asReversed()
+
+    fun sharedThreats(gid: String? = null): List<SharedThreat> = store.sharedThreats(gid)
+
+    /** Every group with its last message, unread count and size, most recently active first. */
+    fun groupThreads(): List<GroupThread> = store.groups().map { g ->
+        val members = store.groupMembers(g.id).size
+        GroupThread(g.copy(memberCount = members), store.groupMessages(g.id, 1).firstOrNull(), store.groupUnread(g.id), members)
+    }.sortedByDescending { it.lastMessage?.ts ?: it.group.createdTs }
+
+    /** Marks a group conversation read; group messages carry no receipts. */
+    suspend fun markGroupRead(gid: String) = withContext(Dispatchers.IO) {
+        if (store.groupUnread(gid) == 0) return@withContext
+        store.markGroupRead(gid)
+        bump()
+    }
+
+    /** Makes a new group with this phone as its admin and first member; returns its id. */
+    suspend fun createGroup(name: String): String = withContext(Dispatchers.IO) {
+        val me = config.number ?: throw RelayException("Not registered with a relay")
+        val title = name.trim().take(MAX_GROUP_NAME)
+        if (title.isEmpty()) throw IllegalArgumentException("Give the group a name")
+        val id = UUID.randomUUID().toString()
+        val now = System.currentTimeMillis()
+        lock.withLock {
+            store.insertGroup(Group(id, title, me, now, OrgRole.ADMIN))
+            store.insertGroupMember(GroupMember(id, me, config.displayName, OrgRole.ADMIN, myEd25519() ?: "", me, now))
+        }
+        CommsLog.add("Group \"$title\" created")
+        bump()
+        id
+    }
+
+    /** The group, its roster and this phone's number, or the reason there is no such group to act on. */
+    private class GroupContext(val me: String, val group: Group, val members: List<GroupMember>) {
+        val myRole: OrgRole get() = members.find { it.number == me }?.role ?: group.myRole
+        fun others(): List<GroupMember> = members.filter { it.number != me }
+        fun has(number: String) = members.any { it.number == number }
+        fun isAdmin(number: String) = members.find { it.number == number }?.role == OrgRole.ADMIN
+    }
+
+    private fun groupContext(gid: String): GroupContext {
+        val me = config.number ?: throw RelayException("Not registered with a relay")
+        val group = store.group(gid) ?: throw RelayException("That group is no longer on this phone")
+        return GroupContext(me, group, store.groupMembers(gid))
+    }
+
+    private fun memberLabel(m: GroupMember) = m.name.ifBlank { formatAegisNumber(m.number) }
+
+    private fun rosterJson(members: List<GroupMember>): JSONArray {
+        val arr = JSONArray()
+        for (m in members) arr.put(CommsWire.rosterEntry(m.number, m.name, m.role.name, m.ed25519))
+        return arr
+    }
+
+    /**
+     * Sends [payload] to every one of [members] who is a contact on this phone,
+     * one envelope each; returns how many the relay took. Failures are logged
+     * per member. Nothing is queued: a group payload is sent once, and the
+     * caller decides what a complete failure means.
+     */
+    private suspend fun fanOut(what: String, members: List<GroupMember>, payload: JSONObject): Int {
+        var sent = 0
+        for (m in members) {
+            val contact = store.contact(m.number)
+            if (contact == null) {
+                CommsLog.add("$what to ${memberLabel(m)} not sent: they are not a contact on this phone")
+                continue
+            }
+            when (val d = deliver(contact, payload)) {
+                Deliver.Sent -> sent++
+                is Deliver.Failed -> CommsLog.add("$what to ${memberLabel(m)} failed: ${d.reason}")
+                is Deliver.TooLarge -> CommsLog.add("$what to ${memberLabel(m)} failed: ${d.reason}")
+                is Deliver.Offline -> CommsLog.add("$what to ${memberLabel(m)} not sent: ${d.reason}")
+            }
+        }
+        return sent
+    }
+
+    /**
+     * Adds a contact to a group this phone administers: the roster here, then
+     * the whole roster to the newcomer (so their phone learns the group) and
+     * the new member to everyone already in it.
+     */
+    suspend fun addGroupMember(gid: String, number: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!config.isRegistered) throw RelayException("Not registered with a relay")
+            val ctx = groupContext(gid)
+            if (ctx.myRole != OrgRole.ADMIN) throw RelayException("Only an admin can add members")
+            if (number == ctx.me) throw IllegalArgumentException("You are already in the group")
+            val contact = store.contact(number) ?: throw RelayException("Add ${formatAegisNumber(number)} as a contact first")
+            if (contact.keyChanged) throw RelayException("${contact.name.ifBlank { formatAegisNumber(number) }}'s keys have changed; verify them before adding them")
+            if (ctx.has(number)) throw IllegalArgumentException("${contact.name.ifBlank { formatAegisNumber(number) }} is already in the group")
+            if (ctx.members.size >= MAX_GROUP_MEMBERS) throw IllegalArgumentException("A group holds at most $MAX_GROUP_MEMBERS members")
+            val now = System.currentTimeMillis()
+            val newcomer = GroupMember(gid, number, contact.name, OrgRole.MEMBER, contact.ed25519, ctx.me, now)
+            lock.withLock { store.insertGroupMember(newcomer) }
+            bump()
+            val roster = ctx.members + newcomer
+            val welcome = CommsWire.groupCtrl(
+                gid, CommsWire.OP_ADD,
+                mapOf(
+                    CommsWire.F_GROUP_NAME to ctx.group.name,
+                    CommsWire.F_CREATED_BY to ctx.group.createdBy,
+                    CommsWire.F_CREATED_TS to ctx.group.createdTs,
+                    CommsWire.F_MEMBERS to rosterJson(roster)
+                )
+            )
+            val welcomed = fanOut("Group invitation", listOf(newcomer), welcome)
+            if (welcomed == 0) {
+                lock.withLock { store.removeGroupMember(gid, number) }
+                bump()
+                throw RelayException("${contact.name.ifBlank { formatAegisNumber(number) }} could not be reached; try again later")
+            }
+            val joined = CommsWire.groupCtrl(
+                gid, CommsWire.OP_JOIN,
+                mapOf(
+                    CommsWire.F_MEMBER to number,
+                    CommsWire.F_MEMBER_NAME to contact.name,
+                    CommsWire.F_ROLE to OrgRole.MEMBER.name,
+                    CommsWire.F_MEMBER_ED25519 to contact.ed25519
+                )
+            )
+            fanOut("Roster update", ctx.others(), joined)
+            CommsLog.add("${contact.name.ifBlank { formatAegisNumber(number) }} added to \"${ctx.group.name}\"")
+            Unit
+        }
+    }
+
+    /** Takes a member out of a group this phone administers; they and everyone else are told. */
+    suspend fun removeGroupMember(gid: String, number: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!config.isRegistered) throw RelayException("Not registered with a relay")
+            val ctx = groupContext(gid)
+            if (ctx.myRole != OrgRole.ADMIN) throw RelayException("Only an admin can remove members")
+            if (number == ctx.me) throw IllegalArgumentException("Leave the group instead")
+            val target = ctx.members.find { it.number == number } ?: throw IllegalArgumentException("They are not in the group")
+            lock.withLock { store.removeGroupMember(gid, number) }
+            bump()
+            val notice = CommsWire.groupCtrl(gid, CommsWire.OP_REMOVE, mapOf(CommsWire.F_MEMBER to number))
+            // The removed member hears it too, so their phone drops the group.
+            fanOut("Roster update", ctx.others(), notice)
+            CommsLog.add("${memberLabel(target)} removed from \"${ctx.group.name}\"")
+            Unit
+        }
+    }
+
+    /** Leaves a group: the other members are told, then everything about it goes from this phone. */
+    suspend fun leaveGroup(gid: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val ctx = groupContext(gid)
+            if (config.isRegistered) fanOut("Leaving notice", ctx.others(), CommsWire.groupCtrl(gid, CommsWire.OP_LEAVE))
+            dropGroupLocally(gid)
+            Registry.publishSharedThreats(store.sharedThreats(null))
+            CommsLog.add("Left \"${ctx.group.name}\"")
+            bump()
+        }
+    }
+
+    private suspend fun dropGroupLocally(gid: String) {
+        lock.withLock { store.deleteGroup(gid).forEach { CommsMedia.delete(it) } }
+        CommsNotifications.cancel(appContext, gid)
+    }
+
+    /**
+     * Sends a text to every member of [gid]. The conversation gets one row at
+     * once; its status is "sent" when at least one member's envelope reached
+     * the relay and "failed" when none did. The fan-out runs on the
+     * repository's scope, so leaving the screen does not cut it short.
+     */
+    suspend fun sendGroupMessage(gid: String, body: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!config.isRegistered) throw RelayException("Not registered with a relay")
+            val text = body.trim().take(MAX_BODY)
+            if (text.isEmpty()) throw IllegalArgumentException("Empty message")
+            val ctx = groupContext(gid)
+            if (!ctx.has(ctx.me)) throw RelayException("You are no longer in this group")
+            runSendHooks(text)
+            val id = UUID.randomUUID().toString()
+            val ts = System.currentTimeMillis()
+            lock.withLock {
+                store.insertGroupMessage(gid, ChatMessage(id, gid, Direction.OUT, text, ts, "queued", read = true, sender = ctx.me))
+            }
+            bump()
+            scope.launch {
+                val recipients = ctx.others()
+                val sent = if (recipients.isEmpty()) 0 else fanOut("Group message", recipients, CommsWire.groupMsg(gid, text, id, ts))
+                if (sent > 0 || recipients.isEmpty()) {
+                    store.markSentIfQueued(id)
+                    if (recipients.isNotEmpty() && sent < recipients.size) {
+                        CommsLog.add("Group message to \"${ctx.group.name}\" reached $sent of ${recipients.size} member(s)")
+                    }
+                } else {
+                    store.setStatus(id, "failed", "No member could be reached")
+                }
+                bump()
+            }
+            Unit
+        }
+    }
+
+    /** How long a shared threat of [kind] stays on members' maps. */
+    private fun threatTtl(kind: String): Long = if (kind == "CATCHER") CATCHER_TTL_MS else THREAT_TTL_MS
+
+    private fun severityOf(name: String): Severity = runCatching { Severity.valueOf(name) }.getOrDefault(Severity.MEDIUM)
+
+    /**
+     * Shares a detection with group [gid]: on this phone's map and timeline at
+     * once, and to every member in one envelope each. [bleJson] and [cellJson]
+     * are optional JSON objects with the raw evidence.
+     */
+    suspend fun shareThreats(
+        gid: String, kind: String, severity: String, lat: Double?, lon: Double?, title: String, detail: String,
+        bleJson: String? = null, cellJson: String? = null
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!config.isRegistered) throw RelayException("Not registered with a relay")
+            if (kind !in THREAT_KINDS) throw IllegalArgumentException("Unknown threat kind \"$kind\"")
+            if (severity !in THREAT_SEVERITIES) throw IllegalArgumentException("Unknown severity \"$severity\"")
+            if (lat == null || lon == null) throw IllegalArgumentException("No GPS fix to attach; a shared threat needs a position")
+            val ctx = groupContext(gid)
+            if (!ctx.has(ctx.me)) throw RelayException("You are no longer in this group")
+            val id = UUID.randomUUID().toString()
+            val ts = System.currentTimeMillis()
+            val heading = title.trim().take(MAX_THREAT_TEXT)
+            val text = detail.trim().take(MAX_THREAT_TEXT)
+            val threat = SharedThreat(id, gid, ctx.me, config.displayName, ts, kind, severity, lat, lon, heading, text, ts + threatTtl(kind))
+            lock.withLock { store.insertSharedThreat(threat) }
+            Registry.publishSharedThreats(store.sharedThreats(null))
+            bump()
+            val sent = fanOut("Shared threat", ctx.others(), CommsWire.threat(gid, id, ts, kind, severity, lat, lon, heading, text, threat.expiresAt, bleJson, cellJson))
+            CommsLog.add("Threat \"$heading\" shared with \"${ctx.group.name}\": $sent of ${ctx.others().size} member(s) reached")
+            if (sent == 0 && ctx.others().isNotEmpty()) throw RelayException("No member could be reached")
+            Unit
+        }
+    }
+
+    /** Sends an SOS to every member of [gid], with this phone's position when it has one. */
+    suspend fun sendPanic(gid: String, lat: Double?, lon: Double?, note: String? = null): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!config.isRegistered) throw RelayException("Not registered with a relay")
+            val ctx = groupContext(gid)
+            val id = UUID.randomUUID().toString()
+            val ts = System.currentTimeMillis()
+            val text = note?.trim()?.take(MAX_PANIC_NOTE)
+            val sent = fanOut("SOS", ctx.others(), CommsWire.panic(gid, id, ts, lat, lon, text))
+            CommsLog.add("SOS sent to \"${ctx.group.name}\": $sent of ${ctx.others().size} member(s) reached" + if (lat == null || lon == null) " (no position)" else "")
+            if (sent == 0 && ctx.others().isNotEmpty()) throw RelayException("No member of \"${ctx.group.name}\" could be reached")
+            Unit
+        }
+    }
+
+    /** The SOS was raised: to every group, with the last known position. */
+    private suspend fun broadcastPanic() {
+        if (!config.isRegistered) return
+        val groups = store.groups()
+        if (groups.isEmpty()) {
+            CommsLog.add("SOS raised, but this phone is in no group to send it to")
+            return
+        }
+        val s = Registry.status.value
+        for (g in groups) sendPanic(g.id, s.lat, s.lon, null)
+    }
+
+    private fun expireSharedThreats() {
+        val gone = store.expireSharedThreats(System.currentTimeMillis())
+        if (gone > 0) CommsLog.add("$gone expired shared threat(s) forgotten")
+        Registry.publishSharedThreats(store.sharedThreats(null))
+    }
+
+    /** A number's name as this phone knows it: the roster's, then the contact's, then the number. */
+    private fun memberName(gid: String, number: String): String =
+        store.groupMember(gid, number)?.name?.takeIf { it.isNotBlank() }
+            ?: store.contact(number)?.name?.takeIf { it.isNotBlank() }
+            ?: formatAegisNumber(number)
+
+    /**
+     * Acts on a group payload from [contact]. Caller holds [lock]. Anything
+     * about a group this phone is not in is dropped, as is anything from
+     * someone not on that group's roster; only an invitation ([CommsWire.OP_ADD])
+     * from a contact may introduce a group.
+     */
+    private fun processGroupPayload(contact: Contact, envelopeTs: Long, json: JSONObject) {
+        val type = CommsWire.type(json)
+        val gid = json.optString(CommsWire.F_GID).takeIf { it.isNotBlank() && it.length <= 64 } ?: return
+        val from = contact.number
+        val label = contact.name.ifBlank { formatAegisNumber(from) }
+        val group = store.group(gid)
+        if (type == CommsWire.T_GROUP_CTRL && json.optString(CommsWire.F_OP) == CommsWire.OP_ADD) {
+            applyGroupAdd(contact, gid, group, json)
+            return
+        }
+        if (group == null) {
+            CommsLog.add("$type from $label about a group this phone is not in; dropped")
+            return
+        }
+        val sender = store.groupMember(gid, from)
+        if (sender == null) {
+            CommsLog.add("$type from $label, who is not in \"${group.name}\"; dropped")
+            return
+        }
+        when (type) {
+            CommsWire.T_GROUP_MSG -> {
+                val id = json.optString(CommsWire.F_ID).takeIf { it.isNotBlank() } ?: return
+                if (store.hasMessage(id)) return
+                val body = json.optString(CommsWire.F_BODY).take(MAX_BODY)
+                if (body.isEmpty()) return
+                val ts = claimedTs(envelopeTs, json.optLong(CommsWire.F_TS, envelopeTs))
+                val onScreen = openPeer == gid
+                store.insertGroupMessage(gid, ChatMessage(id, gid, Direction.IN, body, ts, "received", read = onScreen, sender = from))
+                if (!onScreen) {
+                    CommsNotifications.notifyGroupInbound(appContext, group, store.unreadGroupInbound(gid, 5)) { memberName(gid, it) }
+                }
+            }
+            CommsWire.T_GROUP_CTRL -> applyGroupCtrl(contact, group, sender, json)
+            CommsWire.T_THREAT -> {
+                val id = json.optString(CommsWire.F_ID).takeIf { it.isNotBlank() } ?: return
+                if (store.hasSharedThreat(id)) return
+                val kind = json.optString(CommsWire.F_KIND).takeIf { it in THREAT_KINDS } ?: run {
+                    CommsLog.add("Shared threat from $label dropped: kind \"${json.optString(CommsWire.F_KIND)}\" not understood")
+                    return
+                }
+                val severity = json.optString(CommsWire.F_SEVERITY).takeIf { it in THREAT_SEVERITIES } ?: "MEDIUM"
+                val lat = json.optDouble(CommsWire.F_LAT, Double.NaN)
+                val lon = json.optDouble(CommsWire.F_LON, Double.NaN)
+                if (lat.isNaN() || lon.isNaN() || lat !in -90.0..90.0 || lon !in -180.0..180.0) {
+                    CommsLog.add("Shared threat from $label dropped: no usable position")
+                    return
+                }
+                val ts = claimedTs(envelopeTs, json.optLong(CommsWire.F_TS, envelopeTs))
+                // The sender says how long it lasts, within what this phone would give it.
+                val expiresAt = json.optLong(CommsWire.F_EXPIRES, ts + threatTtl(kind)).coerceIn(ts, ts + threatTtl(kind))
+                val title = json.optString(CommsWire.F_TITLE).trim().take(MAX_THREAT_TEXT).ifBlank { kind }
+                val detail = json.optString(CommsWire.F_DETAIL).trim().take(MAX_THREAT_TEXT)
+                val fromName = memberName(gid, from)
+                store.insertSharedThreat(SharedThreat(id, gid, from, fromName, ts, kind, severity, lat, lon, title, detail, expiresAt))
+                Registry.publishSharedThreats(store.sharedThreats(null))
+                CommsLog.add("Threat \"$title\" shared by $fromName in \"${group.name}\"")
+                val event = TimelineEvent(
+                    id = "shared_threat@$id", kind = EventKind.SHARED_THREAT, ts = ts,
+                    title = "$fromName shared: $title",
+                    detail = "${group.name} · $kind" + (if (detail.isNotBlank()) " · $detail" else ""),
+                    severity = severityOf(severity), lat = lat, lon = lon
+                )
+                scope.launch { runCatching { TimelineLog.record(appContext, event) } }
+            }
+            CommsWire.T_PANIC -> {
+                val id = json.optString(CommsWire.F_ID).takeIf { it.isNotBlank() } ?: return
+                val ts = claimedTs(envelopeTs, json.optLong(CommsWire.F_TS, envelopeTs))
+                val lat = json.optDouble(CommsWire.F_LAT, Double.NaN).takeIf { !it.isNaN() && it in -90.0..90.0 }
+                val lon = json.optDouble(CommsWire.F_LON, Double.NaN).takeIf { !it.isNaN() && it in -180.0..180.0 }
+                val pos = if (lat != null && lon != null) lat to lon else null
+                val note = json.optString(CommsWire.F_NOTE).trim().take(MAX_PANIC_NOTE)
+                val fromName = memberName(gid, from)
+                CommsLog.add("SOS from $fromName in \"${group.name}\"" + (if (pos == null) " (no position)" else ""))
+                val event = TimelineEvent(
+                    id = "panic@$id", kind = EventKind.PANIC, ts = ts,
+                    title = "SOS from $fromName",
+                    detail = group.name + (if (pos != null) String.format(java.util.Locale.US, " · at %.5f, %.5f", pos.first, pos.second) else " · no position attached") +
+                        (if (note.isNotBlank()) " · $note" else ""),
+                    severity = Severity.CRITICAL, lat = pos?.first, lon = pos?.second
+                )
+                scope.launch { runCatching { TimelineLog.record(appContext, event, dedupeKey = "panic@$id") } }
+                CommsNotifications.notifyPanic(appContext, group, id, fromName, pos?.first, pos?.second, note, ts)
+            }
+        }
+    }
+
+    /**
+     * An invitation: [contact] added this phone to a group. The roster must
+     * name them as an admin, or the message is somebody making up a group in
+     * other people's names. For a group already here, only an admin's roster
+     * replaces what this phone has.
+     */
+    private fun applyGroupAdd(contact: Contact, gid: String, existing: Group?, json: JSONObject) {
+        val me = config.number ?: return
+        val from = contact.number
+        val label = contact.name.ifBlank { formatAegisNumber(from) }
+        val roster = CommsWire.rosterEntries(json).filter { parseAegisNumber(it.number) != null }.distinctBy { it.number }
+        if (roster.none { it.number == from && it.role == OrgRole.ADMIN.name }) {
+            CommsLog.add("Group invitation from $label dropped: its roster does not make them an admin")
+            return
+        }
+        if (roster.none { it.number == me }) {
+            CommsLog.add("Group invitation from $label dropped: this phone is not on its roster")
+            return
+        }
+        if (roster.size > MAX_GROUP_MEMBERS) {
+            CommsLog.add("Group invitation from $label dropped: ${roster.size} members is more than a group holds")
+            return
+        }
+        if (existing != null && store.groupMember(gid, from)?.role != OrgRole.ADMIN) {
+            CommsLog.add("Roster for \"${existing.name}\" from $label, who is not one of its admins; dropped")
+            return
+        }
+        val name = json.optString(CommsWire.F_GROUP_NAME).trim().take(MAX_GROUP_NAME).ifBlank { existing?.name ?: "Group" }
+        val createdBy = json.optString(CommsWire.F_CREATED_BY).let { parseAegisNumber(it) } ?: existing?.createdBy ?: from
+        val createdTs = existing?.createdTs ?: json.optLong(CommsWire.F_CREATED_TS, System.currentTimeMillis())
+        val myRole = roster.find { it.number == me }?.let { runCatching { OrgRole.valueOf(it.role) }.getOrNull() } ?: OrgRole.MEMBER
+        val now = System.currentTimeMillis()
+        store.insertGroup(Group(gid, name, createdBy, createdTs, myRole))
+        val known = store.groupMembers(gid).associateBy { it.number }
+        for (e in roster) {
+            val role = runCatching { OrgRole.valueOf(e.role) }.getOrDefault(OrgRole.MEMBER)
+            val ed = e.ed25519.ifBlank { store.contact(e.number)?.ed25519 ?: known[e.number]?.ed25519 ?: "" }
+            val memberName = e.name.trim().take(40).ifBlank { store.contact(e.number)?.name ?: known[e.number]?.name ?: "" }
+            store.insertGroupMember(GroupMember(gid, e.number, memberName, role, ed, known[e.number]?.addedBy ?: from, known[e.number]?.addedTs ?: now))
+        }
+        for (gone in known.keys - roster.map { it.number }.toSet()) store.removeGroupMember(gid, gone)
+        CommsLog.add(if (existing == null) "Added to group \"$name\" by $label (${roster.size} members)" else "Roster of \"$name\" updated by $label (${roster.size} members)")
+    }
+
+    /** A roster change from [sender], already known to be in [group]. Caller holds [lock]. */
+    private fun applyGroupCtrl(contact: Contact, group: Group, sender: GroupMember, json: JSONObject) {
+        val me = config.number ?: return
+        val gid = group.id
+        val label = memberLabel(sender)
+        when (val op = json.optString(CommsWire.F_OP)) {
+            CommsWire.OP_JOIN -> {
+                if (sender.role != OrgRole.ADMIN) { CommsLog.add("Roster change in \"${group.name}\" from $label, who is not an admin; dropped"); return }
+                val number = parseAegisNumber(json.optString(CommsWire.F_MEMBER)) ?: return
+                if (store.groupMember(gid, number) != null) return
+                if (store.groupMembers(gid).size >= MAX_GROUP_MEMBERS) return
+                val role = runCatching { OrgRole.valueOf(json.optString(CommsWire.F_ROLE)) }.getOrDefault(OrgRole.MEMBER)
+                val name = json.optString(CommsWire.F_MEMBER_NAME).trim().take(40).ifBlank { store.contact(number)?.name ?: "" }
+                val ed = json.optString(CommsWire.F_MEMBER_ED25519).ifBlank { store.contact(number)?.ed25519 ?: "" }
+                store.insertGroupMember(GroupMember(gid, number, name, role, ed, sender.number, System.currentTimeMillis()))
+                CommsLog.add("${name.ifBlank { formatAegisNumber(number) }} joined \"${group.name}\" (added by $label)")
+            }
+            CommsWire.OP_REMOVE -> {
+                if (sender.role != OrgRole.ADMIN) { CommsLog.add("Roster change in \"${group.name}\" from $label, who is not an admin; dropped"); return }
+                val number = parseAegisNumber(json.optString(CommsWire.F_MEMBER)) ?: return
+                if (number == me) {
+                    // After the caller releases the lock: the group's rows go with its files.
+                    scope.launch { dropGroupLocally(gid); Registry.publishSharedThreats(store.sharedThreats(null)); bump() }
+                    CommsLog.add("Removed from \"${group.name}\" by $label")
+                    return
+                }
+                val target = store.groupMember(gid, number) ?: return
+                store.removeGroupMember(gid, number)
+                CommsLog.add("${memberLabel(target)} removed from \"${group.name}\" by $label")
+            }
+            CommsWire.OP_LEAVE -> {
+                store.removeGroupMember(gid, sender.number)
+                CommsLog.add("$label left \"${group.name}\"")
+            }
+            else -> CommsLog.add("Group operation \"$op\" from $label not understood; ignored")
+        }
+    }
+
     /**
      * Keeps the relay socket open for a call's signalling even when the app
      * leaves the screen and the owner has comms offline; released when the
@@ -1340,6 +1851,8 @@ object CommsRepository {
                 val body = announced ?: return
                 completeMediaIfWhole(contact, id, body)
             }
+            CommsWire.T_GROUP_MSG, CommsWire.T_GROUP_CTRL, CommsWire.T_THREAT, CommsWire.T_PANIC ->
+                processGroupPayload(contact, envelopeTs, json)
             else -> CommsLog.add("Payload of type \"${CommsWire.type(json)}\" from ${formatAegisNumber(contact.number)} not understood; ignored")
         }
     }

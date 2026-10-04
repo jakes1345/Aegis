@@ -7,6 +7,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
@@ -33,23 +34,36 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import com.xat.aegis.analysis.AudioRouteMonitor
 import com.xat.aegis.analysis.CellMonitor
 import com.xat.aegis.analysis.EventLog
 import com.xat.aegis.analysis.Fingerprint
+import com.xat.aegis.analysis.Fix
 import com.xat.aegis.analysis.IMSICatcher
 import com.xat.aegis.analysis.IdentityResolver
+import com.xat.aegis.analysis.LocationHistory
 import com.xat.aegis.analysis.LocationTrack
 import com.xat.aegis.analysis.Tracker
 import com.xat.aegis.analysis.PhoneHealthMonitor
 import com.xat.aegis.analysis.WifiScanner
 import com.xat.aegis.analysis.toFix
+import com.xat.aegis.detect.BleCanary
 import com.xat.aegis.detect.BleNames
+import com.xat.aegis.detect.CadenceFingerprinter
+import com.xat.aegis.detect.DultInterrogator
+import com.xat.aegis.detect.KarmaCanary
 import com.xat.aegis.detect.Signatures
+import com.xat.aegis.detect.VehicleTrips
+import com.xat.aegis.security.UnlockLedger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 class ScanService : LifecycleService() {
 
@@ -60,6 +74,23 @@ class ScanService : LifecycleService() {
     private lateinit var tracker: Tracker
     private val identities = IdentityResolver()
     private val track = LocationTrack()
+    /** Links address rotations the payload cannot prove, by the rhythm of the radio. */
+    private val cadence = CadenceFingerprinter()
+    private lateinit var vehicleTrips: VehicleTrips
+
+    /** Logical devices already asked over DULT — one exchange each, answered or refused. */
+    private val dultAsked = HashSet<String>()
+    /** One GATT exchange at a time; the stack handles parallel connections badly. */
+    private val dultGate = Mutex()
+
+    /** Wall time until which the scan runs at low latency: the first minutes of a drive. */
+    @Volatile
+    private var intensiveUntil = 0L
+    private var intensiveJob: Job? = null
+    /** Consecutive fixes at driving speed, and when the last of them arrived. */
+    private var drivingFixes = 0
+    @Volatile
+    private var lastDrivingAt = 0L
 
     private lateinit var cellMonitor: CellMonitor
     private lateinit var imsiCatcher: IMSICatcher
@@ -119,7 +150,9 @@ class ScanService : LifecycleService() {
     private val locationCallback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
             val fix = result.lastLocation?.toFix() ?: return
+            LocationHistory.record(this@ScanService, fix)
             track.update(fix)
+            updateVehicle(fix)
             synchronized(gpsTrail) {
                 gpsTrail.add(LatLon(fix.lat, fix.lon))
                 if (gpsTrail.size > 500) gpsTrail.removeAt(0)
@@ -179,11 +212,17 @@ class ScanService : LifecycleService() {
         cellStore = Store(this, "imsi_baseline.json")
         cellMonitor = CellMonitor(this)
         imsiCatcher = IMSICatcher(cellStore)
+        vehicleTrips = VehicleTrips(Store(this, "vehicle_trips.json"))
         // Shared with the activity, which records NFC scans into the same log.
         eventLog = TimelineLog.get(this)
         Registry.publishTimeline(eventLog.snapshot())
         phoneHealthMonitor = PhoneHealthMonitor(this)
         phoneHealthMonitor.start()
+        // A microphone attaching itself over Bluetooth or USB while nothing is
+        // playing is watched for as long as the scanner runs; the unlock ledger
+        // opens here too so the periodic refresh below has it.
+        AudioRouteMonitor.start(this)
+        UnlockLedger.init(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -243,6 +282,9 @@ class ScanService : LifecycleService() {
 
         AppSettings.setScanEnabled(this, true)
         registerSystemReceiver()
+        // The Karma canary is a hidden network suggestion the platform probes for;
+        // registering it is idempotent, and a refusal only means no canary this run.
+        runCatching { KarmaCanary.ensure(this) }
 
         startScanning()
         startLocation()
@@ -299,8 +341,11 @@ class ScanService : LifecycleService() {
             Registry.update { it.copy(scanning = false, error = "Nearby devices permission not granted") }
             return
         }
+        // The first minutes of a drive get the intensive sweep — see [beginTrip].
+        val mode = if (System.currentTimeMillis() < intensiveUntil) ScanSettings.SCAN_MODE_LOW_LATENCY
+        else AppSettings.scanMode
         val settings = ScanSettings.Builder()
-            .setScanMode(AppSettings.scanMode)
+            .setScanMode(mode)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .setLegacy(false).setReportDelay(0).build()
 
@@ -408,6 +453,10 @@ class ScanService : LifecycleService() {
             while (isActive) {
                 val now = System.currentTimeMillis()
                 tracker.prune(now)
+                // Fused location goes quiet once the car is parked (25 m minimum
+                // displacement), so the end of a trip is noticed here, not in the
+                // location callback.
+                if (vehicleTrips.inTrip && now - lastDrivingAt > TRIP_END_MS) endTrip(now)
                 // An identity behind a confirmed follower must outlive the identity
                 // window, or the same device comes back as a stranger and the original
                 // row is orphaned as a permanent "following" ghost.
@@ -456,6 +505,10 @@ class ScanService : LifecycleService() {
                 publishCycle++
                 if (publishCycle == 1 || publishCycle % 20 == 0) {
                     phoneHealthMonitor.scanAndPublish()
+                    // Unlock ledger: pull the platform's keyguard events and judge
+                    // the sleep window, so a night-time unlock is reported while
+                    // the owner is still asleep rather than when they next open Aegis.
+                    withContext(Dispatchers.IO) { runCatching { UnlockLedger.refresh(this@ScanService) } }
                 }
 
                 // WiFi anomaly scan: immediately on first cycle, then every ~60s
@@ -466,7 +519,20 @@ class ScanService : LifecycleService() {
                     // whatever the platform cached last time.
                     runCatching { WifiScanner.snapshot(this@ScanService) }.getOrNull()?.let { Registry.publishWifiStatus(it) }
                     val wifiAnomalies = WifiScanner.scan(this@ScanService)
-                    Registry.publishWifi(wifiAnomalies)
+                    // The same scan cache, checked for the one network name that exists
+                    // nowhere but inside this phone. An answer has no benign explanation.
+                    val karmaHits = KarmaCanary.scan(this@ScanService)
+                    Registry.publishWifi(wifiAnomalies + karmaHits)
+                    for (hit in karmaHits) {
+                        Registry.publishAlert(
+                            Alert(
+                                id = "karma@${hit.bssid}@$now", ts = now, severity = Severity.CRITICAL,
+                                title = "Rogue access point answered the canary probe",
+                                detail = KarmaCanary.describe(hit),
+                                kind = EventKind.WIFI_ANOMALY, dedupeKey = "karma@${hit.bssid}"
+                            )
+                        )
+                    }
                     if (wifiAnomalies.isNotEmpty()) {
                         val top = wifiAnomalies.maxByOrNull { it.threat.ordinal }!!
                         val evt = TimelineEvent(
@@ -514,7 +580,13 @@ class ScanService : LifecycleService() {
     }
 
     private fun handle(result: ScanResult) {
+        // Every packet, unfiltered, for the finder and the self-test that follow the
+        // stream; neither needs a scan of its own.
+        Registry.publishScan(result)
         val record = result.scanRecord
+        // Our own fake AirTag: the canary has just been told; it must not become a
+        // detection or get interrogated.
+        if (BleCanary.isCanary(record)) return
         if (Signatures.isBenign(record)) return
 
         // Skip devices the user has explicitly marked as their own.
@@ -524,6 +596,19 @@ class ScanService : LifecycleService() {
         if (Registry.trusted.value.contains(address)) return
         val fingerprint = Fingerprint.of(record)
         val resolution = identities.resolve(address, result.rssi, fingerprint, now)
+        // The identity resolver links a rotation when the payload matches. When it does
+        // not — a Find My key change rotates the whole payload — the radio's cadence can
+        // still prove the new address is the same device; its sightings then move under
+        // the id the device already had.
+        val stitched = cadence.stitch(result)
+        val key = if (stitched != null && stitched != resolution.identity.id) {
+            tracker.merge(resolution.identity.id, stitched)
+            stitched
+        } else {
+            cadence.assign(address, resolution.identity.id)
+            resolution.identity.id
+        }
+        cadence.supersededKey(address)?.let { tracker.merge(it, key) }
         val tracked = Signatures.match(record)
         val txPower = record?.txPowerLevel?.takeIf { it != Int.MIN_VALUE }
 
@@ -531,7 +616,7 @@ class ScanService : LifecycleService() {
         // SIG assigned numbers: who made it, what it calls itself, what it advertises.
         // The tracker keeps the best of these across packets and derives the row name.
         val observation = tracker.observe(
-            key = resolution.identity.id, address = address,
+            key = key, address = address,
             rssi = result.rssi, tracker = tracked,
             approxMetres = Signatures.approximateMetres(result.rssi, txPower),
             rotations = resolution.identity.rotations,
@@ -560,6 +645,92 @@ class ScanService : LifecycleService() {
                 dedupeKey = "following@${observation.detection.key}"
             )
         }
+
+        val detection = observation.detection
+        if (vehicleTrips.inTrip) {
+            vehicleTrips.sight(key, address, detection.name, detection.tracker, fingerprint, now)
+                ?.let(::publishVehicleFinding)
+        }
+        maybeInterrogate(key, device, detection)
+    }
+
+    /**
+     * Asks a tracker who it is over DULT, once per logical device, the first time it is
+     * recognised as a type whose maker ships the protocol or is confirmed as following.
+     * Runs on the service scope, never on the scan callback; the exchange has its own
+     * budget and the collector a slightly longer one in case the stack never answers.
+     * Making the tracker sound is left to the user — [DultInterrogator.sound].
+     */
+    private fun maybeInterrogate(key: String, device: BluetoothDevice, detection: Detection) {
+        val known = detection.tracker?.id?.let { it in DultInterrogator.SUPPORTED } == true
+        if (!known && !detection.following) return
+        synchronized(dultAsked) { if (key in dultAsked) return }
+        val adapter = getSystemService(BluetoothManager::class.java)?.adapter
+        if (adapter == null || !adapter.isEnabled) return
+        if (!granted(Manifest.permission.BLUETOOTH_CONNECT)) return
+        synchronized(dultAsked) { if (!dultAsked.add(key)) return }
+        lifecycleScope.launch(Dispatchers.IO) {
+            dultGate.withLock {
+                withTimeoutOrNull(DultInterrogator.TIMEOUT_MS + DULT_GRACE_MS) {
+                    DultInterrogator.interrogate(device, this@ScanService).collect { tracker.attachDult(key, it) }
+                }
+            }
+        }
+    }
+
+    /**
+     * Driving is two consecutive fixes at road speed; the trip then runs until no fix
+     * has shown that speed for [TRIP_END_MS]. Walking and cycling never reach it, and a
+     * single spurious speed reading on its own starts nothing.
+     */
+    private fun updateVehicle(fix: Fix) {
+        val speed = fix.speed ?: return
+        if (speed < DRIVING_SPEED_MS) { drivingFixes = 0; return }
+        lastDrivingAt = fix.time
+        drivingFixes++
+        if (drivingFixes >= 2 && !vehicleTrips.inTrip) beginTrip(fix)
+    }
+
+    /**
+     * A tracker on a vehicle advertises from inches away, often only when moving. The
+     * first minutes of a drive are therefore scanned at low latency — a full sweep at
+     * the cost of some battery — before the scan drops back to the configured mode.
+     */
+    private fun beginTrip(fix: Fix) {
+        vehicleTrips.beginTrip(fix.time, fix.lat, fix.lon)
+        intensiveUntil = fix.time + INTENSIVE_SWEEP_MS
+        restartScan()
+        intensiveJob?.cancel()
+        intensiveJob = lifecycleScope.launch {
+            delay(INTENSIVE_SWEEP_MS)
+            intensiveJob = null
+            intensiveUntil = 0L
+            if (running) restartScan()
+        }
+    }
+
+    private fun endTrip(now: Long) {
+        val findings = vehicleTrips.endTrip(now)
+        drivingFixes = 0
+        if (intensiveUntil != 0L) {
+            intensiveUntil = 0L
+            intensiveJob?.cancel()
+            intensiveJob = null
+            // Back to the configured mode on the main thread, where the scan is managed.
+            lifecycleScope.launch { if (running) restartScan() }
+        }
+        findings.forEach(::publishVehicleFinding)
+    }
+
+    /** A device that has ridden along on enough separate drives, through the shared alert path. */
+    private fun publishVehicleFinding(finding: VehicleTrips.Finding) {
+        Registry.publishAlert(
+            Alert(
+                id = finding.id, ts = System.currentTimeMillis(), severity = Severity.HIGH,
+                title = finding.title, detail = finding.detail,
+                kind = EventKind.FOLLOWING, dedupeKey = finding.dedupeKey
+            )
+        )
     }
 
     /** Records an event off the calling thread — [EventLog.record] writes to disk. */
@@ -580,6 +751,10 @@ class ScanService : LifecycleService() {
         imsiCatcher.resetBaseline()
         tracker.clear()
         identities.clear()
+        cadence.clear()
+        vehicleTrips.clear()
+        synchronized(dultAsked) { dultAsked.clear() }
+        LocationHistory.clear(this)
         alerted.clear()
         synchronized(gpsTrail) { gpsTrail.clear() }
         publishCycle = 0
@@ -723,6 +898,8 @@ class ScanService : LifecycleService() {
         if (running) {
             try { unregisterReceiver(systemReceiver) } catch (_: IllegalArgumentException) {}
             location.removeLocationUpdates(locationCallback)
+            // A drive still under way is closed and stored, or the trip count loses it.
+            if (vehicleTrips.inTrip) vehicleTrips.endTrip(System.currentTimeMillis()).forEach(::publishVehicleFinding)
             // Recorded synchronously: the process may not outlive this callback.
             eventLog.record(
                 TimelineEvent(
@@ -738,7 +915,9 @@ class ScanService : LifecycleService() {
         Registry.updateCell { it.copy(analysing = false, findings = emptyList(), score = 0, level = Threat.NONE) }
         cellStore.flush()
         TimelineLog.flush()
+        LocationHistory.flush()
         phoneHealthMonitor.stop()
+        AudioRouteMonitor.stop()
         super.onDestroy()
     }
 
@@ -758,5 +937,14 @@ class ScanService : LifecycleService() {
         private const val SCAN_FAILED_SCANNING_TOO_FREQUENTLY = 6
         private const val RETRY_DELAY_MS = 30_000L
         private const val RETRY_THROTTLED_DELAY_MS = 60_000L
+
+        /** Road speed: about 29 km/h, above anything on foot or a bicycle sustains. */
+        private const val DRIVING_SPEED_MS = 8f
+        /** No fix at road speed for this long and the car is parked. */
+        private const val TRIP_END_MS = 5 * 60_000L
+        /** How long the start of a drive is scanned at low latency. */
+        private const val INTENSIVE_SWEEP_MS = 5 * 60_000L
+        /** Allowance past the interrogator's own budget before its collector is cancelled. */
+        private const val DULT_GRACE_MS = 5_000L
     }
 }

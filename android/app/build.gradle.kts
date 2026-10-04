@@ -171,6 +171,14 @@ dependencies {
 
     implementation("com.google.android.gms:play-services-location:21.3.0")
 
+    // Hidden-camera sweep — CameraX drives the torch-on lens-glint analyser and the
+    // front-camera IR-illuminator view. Frames are read from the Y plane in process
+    // and never stored or transmitted.
+    implementation("androidx.camera:camera-core:1.4.1")
+    implementation("androidx.camera:camera-camera2:1.4.1")
+    implementation("androidx.camera:camera-lifecycle:1.4.1")
+    implementation("androidx.camera:camera-view:1.4.1")
+
     // Live tile map — renders OpenStreetMap tiles. The network is used only for tile
     // downloads, which expose the device's IP and the viewed area to the tile server;
     // no detection data is transmitted.

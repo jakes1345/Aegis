@@ -1,9 +1,12 @@
 package com.xat.aegis.analysis
 
+import android.Manifest
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.KeyguardManager
 import android.app.admin.DeviceAdminInfo
 import android.app.admin.DevicePolicyManager
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -15,19 +18,24 @@ import android.media.AudioManager
 import android.media.AudioRecordingConfiguration
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
+import androidx.core.content.ContextCompat
 import com.xat.aegis.HealthFact
 import com.xat.aegis.PhoneHealthFinding
 import com.xat.aegis.Registry
 import com.xat.aegis.Severity
+import com.xat.aegis.security.RelayClock
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 /**
  * Device-level surveillance indicators: who is using the microphone or a camera
@@ -328,6 +336,9 @@ class PhoneHealthMonitor(private val context: Context) {
             "Apps can be installed from outside an app store without a per-app prompt."
         )
 
+        // ── Protection ──────────────────────────────────────────────────────
+        out += advancedProtectionFact()
+
         // ── Software ────────────────────────────────────────────────────────
         out += HealthFact("android", "Software", "Android", "${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
         val patch = Build.VERSION.SECURITY_PATCH
@@ -354,6 +365,12 @@ class PhoneHealthMonitor(private val context: Context) {
         val alwaysOnVpn = runCatching { Settings.Secure.getString(cr, "always_on_vpn_app") }.getOrNull()
         if (!alwaysOnVpn.isNullOrBlank()) out += HealthFact("vpn_always", "Network", "Always-on VPN", alwaysOnVpn)
 
+        // ── Identity ────────────────────────────────────────────────────────
+        out += identityFacts()
+
+        // ── Clock ───────────────────────────────────────────────────────────
+        out += clockFacts()
+
         // ── Hardware ────────────────────────────────────────────────────────
         out += batteryFacts()
         out += cpuFacts()
@@ -379,6 +396,226 @@ class PhoneHealthMonitor(private val context: Context) {
 
     private fun settingOn(name: String): Boolean =
         runCatching { Settings.Global.getInt(context.contentResolver, name, 0) != 0 }.getOrDefault(false)
+
+    private fun granted(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+
+    // ── Advanced Protection ─────────────────────────────────────────────────
+
+    /**
+     * Android 16's Advanced Protection mode: one switch that turns on the
+     * platform's whole hardened profile (no sideloading, no 2G, no insecure
+     * Wi-Fi, USB data off while locked, memory tagging, theft protection).
+     * `AdvancedProtectionManager` is API 36 and this app compiles against 35,
+     * so it is reached by reflection; a phone on an older release is told the
+     * row does not apply rather than shown a false "off".
+     */
+    private fun advancedProtectionFact(): HealthFact {
+        val id = "adv_protection"
+        val category = "Protection"
+        val label = "Advanced Protection"
+        if (Build.VERSION.SDK_INT < 36) return HealthFact(
+            id, category, label, "Not available on Android ${Build.VERSION.RELEASE}",
+            detail = "Google's Advanced Protection mode arrived with Android 16. On this release the rows above are the individual checks it would enforce."
+        )
+        val enabled: Boolean? = runCatching {
+            val cls = Class.forName("android.security.advancedprotection.AdvancedProtectionManager")
+            // Context.ADVANCED_PROTECTION_SERVICE; the class lookup is the type-safe route when the SDK has it.
+            val manager = context.getSystemService("advanced_protection")
+                ?: runCatching { context.getSystemService(cls) }.getOrNull()
+            manager?.let { cls.getMethod("isAdvancedProtectionEnabled").invoke(it) as? Boolean }
+        }.getOrNull()
+        return when (enabled) {
+            true -> HealthFact(
+                id, category, label, "On",
+                detail = "Sideloading, 2G, insecure Wi-Fi and USB data while locked are all blocked by the platform, and memory tagging is on."
+            )
+            false -> HealthFact(
+                id, category, label, "OFF", Severity.HIGH,
+                "Android 16's one-switch hardened mode is off. Turning it on blocks sideloaded apps, 2G connections " +
+                    "(the IMSI-catcher downgrade path), insecure Wi-Fi, USB data while the phone is locked, and enables " +
+                    "memory tagging against exploits. Settings → Security & privacy → Advanced Protection.",
+                fixAction = Settings.ACTION_SECURITY_SETTINGS
+            )
+            null -> HealthFact(
+                id, category, label, "Unknown",
+                detail = "The phone did not answer whether Advanced Protection is on. Check Settings → Security & privacy → Advanced Protection."
+            )
+        }
+    }
+
+    // ── Identity leaks ──────────────────────────────────────────────────────
+
+    /**
+     * What the phone tells every stranger in radio range about who owns it: the
+     * Bluetooth name, whether it answers discovery, whether the Wi-Fi MAC on the
+     * current network is the hardware one, and whether the radios scan with
+     * Bluetooth and Wi-Fi switched "off".
+     */
+    private fun identityFacts(): List<HealthFact> {
+        val out = ArrayList<HealthFact>(5)
+        val adapter = runCatching { context.getSystemService(BluetoothManager::class.java)?.adapter }.getOrNull()
+        val btConnect = granted(Manifest.permission.BLUETOOTH_CONNECT)
+        val btScan = granted(Manifest.permission.BLUETOOTH_SCAN)
+
+        val btName = if (adapter != null && btConnect) runCatching { adapter.name }.getOrNull() else null
+        out += when {
+            adapter == null -> HealthFact("bt_name", "Identity", "Bluetooth name", "No Bluetooth adapter")
+            !btConnect -> HealthFact("bt_name", "Identity", "Bluetooth name", "Not readable (Nearby devices permission)")
+            btName.isNullOrBlank() -> HealthFact("bt_name", "Identity", "Bluetooth name", "Unknown")
+            looksLikePersonalName(btName) -> HealthFact(
+                "bt_name", "Identity", "Bluetooth name", "\"$btName\"", Severity.HIGH,
+                "The Bluetooth name is broadcast to every device in range whenever Bluetooth is on, and it looks like " +
+                    "it carries a person's name. Anyone with a phone can learn who is in the room — and in a car park, " +
+                    "which car is yours. Rename it to something anonymous: Settings → Connected devices → Device name.",
+                fixAction = Settings.ACTION_BLUETOOTH_SETTINGS
+            )
+            else -> HealthFact("bt_name", "Identity", "Bluetooth name", "\"$btName\"")
+        }
+
+        val scanMode = if (adapter != null && btScan) runCatching { adapter.scanMode }.getOrNull() else null
+        out += when (scanMode) {
+            BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE -> HealthFact(
+                "bt_discoverable", "Identity", "Bluetooth discoverable", "DISCOVERABLE", Severity.MEDIUM,
+                "The phone is answering Bluetooth discovery right now: any device scanning nearby sees it listed by " +
+                    "name. Normally this is only while the Bluetooth settings page is open. Leave that page, or turn Bluetooth off and on.",
+                fixAction = Settings.ACTION_BLUETOOTH_SETTINGS
+            )
+            BluetoothAdapter.SCAN_MODE_CONNECTABLE -> HealthFact("bt_discoverable", "Identity", "Bluetooth discoverable", "No — paired devices only")
+            BluetoothAdapter.SCAN_MODE_NONE -> HealthFact("bt_discoverable", "Identity", "Bluetooth discoverable", "No — radio off or hidden")
+            null -> HealthFact(
+                "bt_discoverable", "Identity", "Bluetooth discoverable",
+                if (adapter == null) "No Bluetooth adapter" else if (!btScan) "Not readable (Nearby devices permission)" else "Unknown"
+            )
+            else -> HealthFact("bt_discoverable", "Identity", "Bluetooth discoverable", "Mode $scanMode")
+        }
+
+        out += wifiMacFact()
+
+        val bleAlways = settingOn(BLE_SCAN_ALWAYS_AVAILABLE)
+        val wifiAlways = runCatching {
+            @Suppress("DEPRECATION")
+            context.getSystemService(WifiManager::class.java)?.isScanAlwaysAvailable
+        }.getOrNull()
+        val scanning = buildList {
+            if (bleAlways) add("Bluetooth")
+            if (wifiAlways == true) add("Wi-Fi")
+        }
+        out += if (scanning.isEmpty()) HealthFact(
+            "scan_always", "Identity", "Scanning while off",
+            if (wifiAlways == null && !bleAlways) "Bluetooth off · Wi-Fi unknown" else "Off"
+        ) else HealthFact(
+            "scan_always", "Identity", "Scanning while off", "${scanning.joinToString(" and ")} scanning stays on",
+            detail = "Location services and apps can scan for ${scanning.joinToString(" and ")} networks and devices even with the " +
+                "switch off. The phone receives rather than transmits during these scans, but it also means \"off\" does not " +
+                "mean silent. Settings → Location → Location services → Bluetooth / Wi-Fi scanning."
+        )
+        return out
+    }
+
+    /**
+     * A name that contains a space is treated as a person's unless it is clearly
+     * the phone's own model or brand ("Galaxy S26 Ultra", "SM-S948B"), which is
+     * what Samsung ships. A possessive ("Jacob's S26") is a name regardless.
+     */
+    private fun looksLikePersonalName(name: String): Boolean {
+        val n = name.trim()
+        val lower = n.lowercase(Locale.US)
+        if (lower.contains("'s ") || lower.endsWith("'s") || lower.contains("’s")) return true
+        if (!n.contains(' ')) return false
+        val defaults = listOfNotNull(Build.MODEL, Build.DEVICE, Build.PRODUCT, Build.MANUFACTURER, Build.BRAND)
+            .map { it.lowercase(Locale.US) }.filter { it.length >= 3 } + listOf("galaxy", "pixel", "phone")
+        return defaults.none { lower.contains(it) }
+    }
+
+    /**
+     * Whether the MAC the phone is using on the current Wi-Fi network is a
+     * randomised one. Bit 1 of the first octet is the IEEE locally-administered
+     * flag: set on every randomised address, clear on the burned-in one. Android
+     * hands most apps the placeholder 02:00:00:00:00:00 instead of the real
+     * value; that case is reported as such rather than as a pass.
+     */
+    private fun wifiMacFact(): HealthFact {
+        val id = "wifi_mac"
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val caps = runCatching { cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) } }.getOrNull()
+        if (caps == null || !caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            return HealthFact(id, "Identity", "Wi-Fi MAC", "Not on Wi-Fi")
+        }
+        val info = runCatching { caps.transportInfo as? WifiInfo }.getOrNull()
+        val mac = runCatching { info?.macAddress }.getOrNull()?.takeIf { it.isNotBlank() }
+        if (mac == null || mac.equals(DEFAULT_MAC, ignoreCase = true)) return HealthFact(
+            id, "Identity", "Wi-Fi MAC", "Hidden by Android",
+            detail = "Android does not show apps the address in use. Check it yourself: Settings → Wi-Fi → this network → " +
+                "Privacy should read \"Use randomised MAC\"."
+        )
+        val first = mac.substringBefore(':').toIntOrNull(16)
+            ?: return HealthFact(id, "Identity", "Wi-Fi MAC", "Unknown ($mac)")
+        return if (first and 0x02 != 0) HealthFact(id, "Identity", "Wi-Fi MAC", "Randomised ($mac)")
+        else HealthFact(
+            id, "Identity", "Wi-Fi MAC", "HARDWARE ADDRESS ($mac)", Severity.MEDIUM,
+            "This network sees the phone's permanent hardware address, so the same address identifies this phone to " +
+                "it, and to anyone capturing its traffic, every time it connects — here and on every other network with " +
+                "randomisation off. Settings → Wi-Fi → this network → Privacy → Use randomised MAC.",
+            fixAction = Settings.ACTION_WIFI_SETTINGS
+        )
+    }
+
+    // ── Clock integrity ─────────────────────────────────────────────────────
+
+    /**
+     * Whether the phone keeps its own time from the network, and how far it is
+     * from the relay's clock as of the last relay response (every one carries a
+     * `Date`; the WebSocket handshake is the one that recurs). A clock moved by
+     * hand breaks certificate validity, one-time codes and message ordering, and
+     * is a way of making "a message from an hour ago" look current.
+     */
+    private fun clockFacts(): List<HealthFact> {
+        val out = ArrayList<HealthFact>(2)
+        val autoTime = runCatching { Settings.Global.getInt(context.contentResolver, Settings.Global.AUTO_TIME, 1) != 0 }.getOrDefault(true)
+        out += if (autoTime) HealthFact("auto_time", "Clock", "Automatic time", "On")
+        else HealthFact(
+            "auto_time", "Clock", "Automatic time", "OFF", Severity.MEDIUM,
+            "The phone's clock is set by hand, not by the network. A wrong clock makes expired certificates look " +
+                "valid, breaks one-time codes, and mis-dates every message and alert. Settings → System → Date & time → Set automatically.",
+            fixAction = Settings.ACTION_DATE_SETTINGS
+        )
+
+        val sample = RelayClock.lastSample(context)
+        out += when {
+            sample == null -> HealthFact(
+                "clock_drift", "Clock", "Clock vs relay", "No relay contact yet",
+                detail = "Compared with your relay's clock once COMMS connects."
+            )
+            sample.drifted -> {
+                val seconds = abs(sample.driftMs) / 1000L
+                val direction = if (sample.driftMs > 0) "behind" else "ahead of"
+                HealthFact(
+                    "clock_drift", "Clock", "Clock vs relay", "${seconds}s $direction the relay", Severity.HIGH,
+                    "When the relay last answered (${ageText(System.currentTimeMillis() - sample.localTs)} ago) this phone's clock " +
+                        "was ${seconds}s $direction its own. More than ${RelayClock.DRIFT_WARN_MS / 1000}s with automatic time on is " +
+                        "not normal drift: either the network time source is wrong or the clock has been set by hand. " +
+                        "Settings → System → Date & time.",
+                    fixAction = Settings.ACTION_DATE_SETTINGS
+                )
+            }
+            else -> HealthFact(
+                "clock_drift", "Clock", "Clock vs relay",
+                "Within ${abs(sample.driftMs) / 1000L}s · checked ${ageText(System.currentTimeMillis() - sample.localTs)} ago"
+            )
+        }
+        return out
+    }
+
+    private fun ageText(ms: Long): String {
+        val minutes = ms / 60_000L
+        return when {
+            minutes < 1 -> "under a minute"
+            minutes < 60 -> "$minutes min"
+            minutes < 48 * 60 -> "${minutes / 60} h"
+            else -> "${minutes / (24 * 60)} days"
+        }
+    }
 
     /** `getprop` is the only unprivileged route to boot properties; a missing key reads "". */
     private fun prop(key: String): String? = runCatching {
@@ -547,6 +784,11 @@ class PhoneHealthMonitor(private val context: Context) {
             ownSessions.remove(sessionId)
             active?.republishRecordings()
         }
+
+        /** What WifiInfo.getMacAddress() returns to an app without the privilege to see the real one. */
+        private const val DEFAULT_MAC = "02:00:00:00:00:00"
+        /** Settings.Global.BLE_SCAN_ALWAYS_AVAILABLE, which is not in the public SDK. */
+        private const val BLE_SCAN_ALWAYS_AVAILABLE = "ble_scan_always_enabled"
 
         private val SU_PATHS = listOf(
             "/system/bin/su", "/system/xbin/su", "/sbin/su", "/su/bin/su", "/system/su",

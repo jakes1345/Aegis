@@ -95,8 +95,14 @@ object CommsWire {
     const val F_GROUP_NAME = "gname"
     const val F_CREATED_BY = "by"
     const val F_CREATED_TS = "cts"
+    /** Sent to a newly added member: the group's name ("gname"), creator, and its whole roster ("members"). */
     const val OP_ADD = "add"
+    /** Sent to the existing members when someone was added: "num", "mname", "role", "med". */
+    const val OP_JOIN = "join"
+    /** Sent by an admin to everyone, the removed member included: "num". */
     const val OP_REMOVE = "remove"
+    /** Sent by a member to everyone else as they go; it carries nothing more. */
+    const val OP_LEAVE = "leave"
     /** Sent to a newly added member: the group's name and its whole roster. */
     const val OP_ROSTER = "roster"
 
@@ -278,10 +284,12 @@ object CommsWire {
         return o
     }
 
-    /** An SOS to group [gid] with the sender's position. */
-    fun panic(gid: String, panicId: String, ts: Long, lat: Double, lon: Double, note: String?): JSONObject =
-        base(T_PANIC).put(F_GID, gid).put(F_ID, panicId).put(F_TS, ts)
-            .put(F_LAT, lat).put(F_LON, lon).put(F_NOTE, note ?: "")
+    /** An SOS to group [gid] with the sender's position; "lat"/"lon" are left out when the phone had no fix. */
+    fun panic(gid: String, panicId: String, ts: Long, lat: Double?, lon: Double?, note: String?): JSONObject {
+        val o = base(T_PANIC).put(F_GID, gid).put(F_ID, panicId).put(F_TS, ts).put(F_NOTE, note ?: "")
+        if (lat != null && lon != null) o.put(F_LAT, lat).put(F_LON, lon)
+        return o
+    }
 
     /**
      * Adds the sender's identity to [payload]. Throws [IllegalStateException]

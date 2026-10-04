@@ -81,7 +81,11 @@ import com.xat.aegis.comms.ChatMessage
 import com.xat.aegis.comms.ChatThread
 import com.xat.aegis.comms.CommsMedia
 import com.xat.aegis.comms.CommsWire
+import com.xat.aegis.comms.Group
+import com.xat.aegis.comms.GroupMember
+import com.xat.aegis.comms.GroupThread
 import com.xat.aegis.comms.MediaBody
+import com.xat.aegis.comms.OrgRole
 import com.xat.aegis.comms.STATUS_CALL
 import com.xat.aegis.comms.STATUS_PAYMENT
 import com.xat.aegis.comms.STATUS_RECEIVING
@@ -101,15 +105,12 @@ import com.xat.aegis.comms.formatAegisNumber
 import com.xat.aegis.comms.parseAegisNumber
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.UUID
 
 // ── Colour tokens local to this file ──────────────────────────────────────────
 
@@ -138,111 +139,6 @@ private const val NOT_A_PHONE = "Aegis numbers are not phone numbers. They only 
 /** Per-group switch: whether threats this phone confirms are sent to the group. Suffixed with the group id. */
 private const val KEY_SHARE_THREATS = "share_threats_"
 
-// ── Groups: temporary local model and repository stand-ins ───────────────────
-//
-// The group (organisation) model and the CommsRepository methods behind it are
-// being added separately. Until they land, these in-memory stand-ins keep this
-// file compiling and let the group screens below be exercised end to end on
-// one phone. To switch over: delete this block, import Group, GroupMember,
-// GroupThread, OrgRole and SharedThreat from com.xat.aegis.comms, and point
-// [groupsVersionFlow] at CommsRepository.version. The screens call the
-// repository by the same names and shapes as the real methods.
-
-private enum class OrgRole { ADMIN, MEMBER }
-
-private data class Group(val id: String, val name: String, val createdBy: String, val createdTs: Long)
-
-private data class GroupMember(val groupId: String, val number: String, val name: String, val role: OrgRole, val joinedTs: Long)
-
-private data class GroupThread(val group: Group, val lastMessage: ChatMessage?, val unread: Int, val memberCount: Int)
-
-/** Bumped whenever anything about a group changes, the way [CommsRepository.version] is for conversations. */
-private val groupsVersionFlow: StateFlow<Long> get() = GroupStub.version
-
-private object GroupStub {
-    val version = MutableStateFlow(0L)
-    private val groups = LinkedHashMap<String, Group>()
-    private val members = HashMap<String, MutableList<GroupMember>>()
-    private val messages = HashMap<String, List<ChatMessage>>()
-
-    private fun changed() { version.value = version.value + 1 }
-    private fun me(): String = CommsRepository.state.value.number ?: ""
-
-    @Synchronized fun groups(): List<Group> = groups.values.toList()
-    @Synchronized fun members(gid: String): List<GroupMember> = members[gid]?.toList() ?: emptyList()
-    @Synchronized fun messages(gid: String, limit: Int): List<ChatMessage> = messages[gid].orEmpty().takeLast(limit)
-    @Synchronized fun threads(): List<GroupThread> = groups.values.map { g ->
-        val ms = messages[g.id].orEmpty()
-        GroupThread(g, ms.lastOrNull(), ms.count { it.direction == Direction.IN && !it.read }, members[g.id]?.size ?: 0)
-    }.sortedByDescending { it.lastMessage?.ts ?: it.group.createdTs }
-
-    @Synchronized fun markRead(gid: String) {
-        val ms = messages[gid] ?: return
-        if (ms.none { !it.read }) return
-        messages[gid] = ms.map { if (it.read) it else it.copy(read = true) }
-        changed()
-    }
-
-    @Synchronized fun create(name: String): String {
-        val id = UUID.randomUUID().toString()
-        val now = System.currentTimeMillis()
-        groups[id] = Group(id, name, me(), now)
-        members[id] = mutableListOf(GroupMember(id, me(), CommsRepository.state.value.displayName, OrgRole.ADMIN, now))
-        changed()
-        return id
-    }
-
-    @Synchronized fun addMember(gid: String, number: String, name: String) {
-        val list = members.getOrPut(gid) { mutableListOf() }
-        if (list.any { it.number == number }) return
-        list += GroupMember(gid, number, name, OrgRole.MEMBER, System.currentTimeMillis())
-        changed()
-    }
-
-    @Synchronized fun removeMember(gid: String, number: String) {
-        if (members[gid]?.removeAll { it.number == number } == true) changed()
-    }
-
-    @Synchronized fun send(gid: String, body: String) {
-        messages[gid] = messages[gid].orEmpty() + ChatMessage(UUID.randomUUID().toString(), me(), Direction.OUT, body, System.currentTimeMillis(), "sent", true)
-        changed()
-    }
-
-    @Synchronized fun delete(gid: String) {
-        groups.remove(gid)
-        members.remove(gid)
-        messages.remove(gid)
-        changed()
-    }
-}
-
-private fun CommsRepository.groups(): List<Group> = GroupStub.groups()
-private fun CommsRepository.groupThreads(): List<GroupThread> = GroupStub.threads()
-private fun CommsRepository.groupMembers(gid: String): List<GroupMember> = GroupStub.members(gid)
-private fun CommsRepository.groupMessages(gid: String, limit: Int = 100): List<ChatMessage> = GroupStub.messages(gid, limit)
-private fun CommsRepository.markGroupRead(gid: String) = GroupStub.markRead(gid)
-private suspend fun CommsRepository.createGroup(name: String): String = withContext(Dispatchers.IO) { GroupStub.create(name) }
-private suspend fun CommsRepository.sendGroupMessage(gid: String, body: String): Result<Unit> = withContext(Dispatchers.IO) {
-    val text = body.trim()
-    if (text.isEmpty()) Result.failure(IllegalArgumentException("Empty message")) else Result.success(GroupStub.send(gid, text))
-}
-private suspend fun CommsRepository.addGroupMember(gid: String, number: String): Result<Unit> = withContext(Dispatchers.IO) {
-    Result.success(GroupStub.addMember(gid, number, contact(number)?.name ?: ""))
-}
-private suspend fun CommsRepository.removeGroupMember(gid: String, number: String): Result<Unit> = withContext(Dispatchers.IO) {
-    Result.success(GroupStub.removeMember(gid, number))
-}
-private suspend fun CommsRepository.leaveGroup(gid: String): Result<Unit> = withContext(Dispatchers.IO) { Result.success(GroupStub.delete(gid)) }
-@Suppress("UNUSED_PARAMETER")
-private suspend fun CommsRepository.shareThreats(
-    gid: String, kind: String, severity: String, lat: Double?, lon: Double?, title: String, detail: String
-): Result<Unit> = withContext(Dispatchers.IO) {
-    val where = if (lat != null && lon != null) String.format(Locale.US, " · at %.4f, %.4f", lat, lon) else ""
-    Result.success(GroupStub.send(gid, "⚠ Threat status: $severity · $title$where\n$detail"))
-}
-
-// ── End of stand-ins ─────────────────────────────────────────────────────────
-
 /** Where the COMMS tab is, apart from the conversation list. */
 private sealed class CommsPage {
     object List : CommsPage()
@@ -262,14 +158,16 @@ private sealed class CommsPage {
  * encrypted conversations, and the registration screen before all that.
  *
  * [openPeer] is a conversation to jump straight into (from a notification),
- * consumed once.
+ * consumed once; [openGroup] is the same for a group conversation.
  */
 @Composable
 fun CommsScreen(
     openPeer: String?,
     onPeerConsumed: () -> Unit,
     openInvite: String? = null,
-    onInviteConsumed: () -> Unit = {}
+    onInviteConsumed: () -> Unit = {},
+    openGroup: String? = null,
+    onGroupConsumed: () -> Unit = {}
 ) {
     val state by CommsRepository.state.collectAsStateWithLifecycle()
     val activeCall by CallManager.call.collectAsStateWithLifecycle()
@@ -295,6 +193,12 @@ fun CommsScreen(
         if (openPeer != null) {
             page = CommsPage.Thread(openPeer)
             onPeerConsumed()
+        }
+    }
+    LaunchedEffect(openGroup) {
+        if (openGroup != null) {
+            page = CommsPage.Group(openGroup)
+            onGroupConsumed()
         }
     }
 
@@ -694,12 +598,11 @@ private fun SetupScreen(invite: PairingCode?, linkError: String?, onInvite: (Pai
 private fun ThreadListScreen(onOpen: (String) -> Unit, onOpenGroup: (String) -> Unit, onMyCode: () -> Unit, onInvite: () -> Unit, onSettings: () -> Unit) {
     val state by CommsRepository.state.collectAsStateWithLifecycle()
     val version by CommsRepository.version.collectAsStateWithLifecycle()
-    val groupsVersion by groupsVersionFlow.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     val threads by produceState(initialValue = emptyList<ChatThread>(), version) {
         value = withContext(Dispatchers.IO) { CommsRepository.threads() }
     }
-    val groupThreads by produceState(initialValue = emptyList<GroupThread>(), version, groupsVersion) {
+    val groupThreads by produceState(initialValue = emptyList<GroupThread>(), version) {
         value = withContext(Dispatchers.IO) { CommsRepository.groupThreads() }
     }
     var addContact by remember { mutableStateOf(false) }
@@ -2266,23 +2169,49 @@ private fun rememberBatteryUnrestricted(): State<Boolean> {
 @Composable
 private fun GroupThreadScreen(groupId: String, onBack: () -> Unit, onMembers: () -> Unit) {
     val scope = rememberCoroutineScope()
-    val groupsVersion by groupsVersionFlow.collectAsStateWithLifecycle()
-    val state by CommsRepository.state.collectAsStateWithLifecycle()
-    val myNumber = state.number ?: ""
+    val context = LocalContext.current
+    val version by CommsRepository.version.collectAsStateWithLifecycle()
 
-    val group by produceState<Group?>(null, groupId, groupsVersion) {
-        value = withContext(Dispatchers.IO) { CommsRepository.groups().find { it.id == groupId } }
+    val group by produceState<Group?>(null, groupId, version) {
+        value = withContext(Dispatchers.IO) { CommsRepository.group(groupId) }
     }
-    val messages by produceState(emptyList<ChatMessage>(), groupId, groupsVersion) {
+    val messages by produceState(emptyList<ChatMessage>(), groupId, version) {
         value = withContext(Dispatchers.IO) { CommsRepository.groupMessages(groupId) }
     }
-    val members by produceState(emptyList<GroupMember>(), groupId, groupsVersion) {
+    val members by produceState(emptyList<GroupMember>(), groupId, version) {
         value = withContext(Dispatchers.IO) { CommsRepository.groupMembers(groupId) }
     }
 
-    LaunchedEffect(groupId, groupsVersion) {
-        withContext(Dispatchers.IO) { CommsRepository.markGroupRead(groupId) }
+    // As in ThreadScreen: while this group is on screen and the app is in the
+    // foreground, its messages arrive read and raise no notification.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var resumed by remember { mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) }
+    DisposableEffect(groupId, lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    resumed = true
+                    CommsRepository.openPeer = groupId
+                    CommsNotifications.cancel(context, groupId)
+                }
+                Lifecycle.Event.ON_PAUSE -> {
+                    resumed = false
+                    if (CommsRepository.openPeer == groupId) CommsRepository.openPeer = null
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        if (resumed) {
+            CommsRepository.openPeer = groupId
+            CommsNotifications.cancel(context, groupId)
+        }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            if (CommsRepository.openPeer == groupId) CommsRepository.openPeer = null
+        }
     }
+    LaunchedEffect(groupId, version, resumed) { if (resumed) CommsRepository.markGroupRead(groupId) }
 
     var draft by rememberSaveable(groupId) { mutableStateOf("") }
     var sendError by remember(groupId) { mutableStateOf<String?>(null) }
@@ -2435,17 +2364,17 @@ private fun GroupThreadScreen(groupId: String, onBack: () -> Unit, onMembers: ()
 @Composable
 private fun OrgScreen(groupId: String, onBack: () -> Unit, onLeft: () -> Unit) {
     val scope = rememberCoroutineScope()
-    val groupsVersion by groupsVersionFlow.collectAsStateWithLifecycle()
+    val version by CommsRepository.version.collectAsStateWithLifecycle()
     val myNumber = CommsRepository.state.value.number ?: ""
 
-    val group by produceState<Group?>(null, groupId, groupsVersion) {
-        value = withContext(Dispatchers.IO) { CommsRepository.groups().find { it.id == groupId } }
+    val group by produceState<Group?>(null, groupId, version) {
+        value = withContext(Dispatchers.IO) { CommsRepository.group(groupId) }
     }
-    val members by produceState(emptyList<GroupMember>(), groupId, groupsVersion) {
+    val members by produceState(emptyList<GroupMember>(), groupId, version) {
         value = withContext(Dispatchers.IO) { CommsRepository.groupMembers(groupId) }
     }
 
-    val myRole = members.find { it.number == myNumber }?.role ?: OrgRole.MEMBER
+    val myRole = members.find { it.number == myNumber }?.role ?: group?.myRole ?: OrgRole.MEMBER
     var addMember by remember { mutableStateOf(false) }
     var leaveConfirm by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }

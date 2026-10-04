@@ -1,12 +1,21 @@
 package com.xat.aegis
 
+import android.bluetooth.le.ScanResult
 import android.content.Context
+import com.xat.aegis.security.PlatformAlerts
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
+import kotlinx.coroutines.launch
 
 /** Shared state between the scanning service, the NFC reader and the UI. */
 object Registry {
@@ -30,6 +39,18 @@ object Registry {
     val nfc: StateFlow<List<NfcTag>> = _nfc.asStateFlow()
 
     fun publish(list: List<Detection>) { _detections.value = list }
+
+    /**
+     * Every raw BLE scan result the service receives, as a hot stream with no replay.
+     * The RSSI locator follows one address through it and the BLE canary watches for
+     * its own advertisement; neither needs its own scan registered with the adapter,
+     * which the platform throttles. A slow collector loses old packets, never new.
+     */
+    private val _scans = MutableSharedFlow<ScanResult>(
+        replay = 0, extraBufferCapacity = 128, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val scans: SharedFlow<ScanResult> = _scans
+    fun publishScan(result: ScanResult) { _scans.tryEmit(result) }
 
     /**
      * Read-modify-write of the scan status, retried if another thread got there
@@ -194,11 +215,92 @@ object Registry {
     val panicActive: StateFlow<Boolean> = _panicActive.asStateFlow()
     fun setPanicActive(active: Boolean) { _panicActive.value = active }
 
+    // --- Platform hardening ----------------------------------------------------
+    //
+    // Each monitor publishes its own typed event so a tab can show exactly what it
+    // saw, and every one of them also goes through publishAlert(), which is the
+    // single path to the timeline and the notification shade.
+
+    private const val ALERT_CAP = 100
+    private const val EVENT_CAP = 50
+
+    /** Timeline and notification work is disk and binder I/O; it runs off the caller's thread. */
+    private val alertScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Alerts this process has raised, newest first. */
+    private val _alerts = MutableStateFlow<List<Alert>>(emptyList())
+    val alerts: StateFlow<List<Alert>> = _alerts.asStateFlow()
+
+    /**
+     * Raises [alert]: onto [alerts], onto the timeline as an event of [Alert.kind]
+     * (deduplicated by [Alert.dedupeKey] within [dedupeWindowMs]), and as a
+     * notification when it is MEDIUM or worse. Safe to call from any thread; the
+     * timeline and the notification need [bindTrustStore] to have run in this
+     * process, which the activity and the service both do on create.
+     */
+    fun publishAlert(alert: Alert, dedupeWindowMs: Long = 30 * 60_000L) {
+        _alerts.update { current -> (listOf(alert) + current.filter { it.id != alert.id }).take(ALERT_CAP) }
+        val ctx = appContext ?: return
+        alertScope.launch {
+            val event = TimelineEvent(
+                id = "${alert.dedupeKey ?: alert.kind.name.lowercase()}@${alert.ts}",
+                kind = alert.kind, ts = alert.ts, title = alert.title,
+                detail = alert.detail, severity = alert.severity
+            )
+            val recorded = runCatching {
+                val log = TimelineLog.get(ctx)
+                val ok = log.record(event, alert.dedupeKey, dedupeWindowMs)
+                if (ok) publishTimeline(log.snapshot())
+                ok
+            }.getOrDefault(true)
+            if (recorded && alert.severity.ordinal >= Severity.MEDIUM.ordinal) {
+                runCatching { PlatformAlerts.notify(ctx, alert) }
+            }
+        }
+    }
+
+    /** The most recent biometric enrolment detected, or null when none has been. */
+    private val _biometricTripwire = MutableStateFlow<BiometricTripwireEvent?>(null)
+    val biometricTripwire: StateFlow<BiometricTripwireEvent?> = _biometricTripwire.asStateFlow()
+    fun publishBiometricTripwire(event: BiometricTripwireEvent) { _biometricTripwire.value = event }
+    /** The user has seen the warning; clears the banner. */
+    fun clearBiometricTripwire() { _biometricTripwire.value = null }
+
+    /** Screen captures of Aegis this process has seen, newest first. */
+    private val _screenRecordings = MutableStateFlow<List<ScreenRecordingEvent>>(emptyList())
+    val screenRecordings: StateFlow<List<ScreenRecordingEvent>> = _screenRecordings.asStateFlow()
+    /** True while the platform says Aegis's window is being recorded right now. */
+    private val _screenRecordingActive = MutableStateFlow(false)
+    val screenRecordingActive: StateFlow<Boolean> = _screenRecordingActive.asStateFlow()
+    fun publishScreenRecording(event: ScreenRecordingEvent) {
+        _screenRecordings.update { current -> (listOf(event) + current).take(EVENT_CAP) }
+    }
+    fun setScreenRecordingActive(active: Boolean) { _screenRecordingActive.value = active }
+
+    /** Suspicious audio inputs this process has seen, newest first. */
+    private val _audioRoutes = MutableStateFlow<List<AudioRouteEvent>>(emptyList())
+    val audioRoutes: StateFlow<List<AudioRouteEvent>> = _audioRoutes.asStateFlow()
+    fun publishAudioRoute(event: AudioRouteEvent) {
+        _audioRoutes.update { current -> (listOf(event) + current).take(EVENT_CAP) }
+    }
+
+    /** The most recent unlock-ledger row, mirrored from [com.xat.aegis.security.UnlockLedger.latest]. */
+    private val _lastUnlock = MutableStateFlow<UnlockEvent?>(null)
+    val lastUnlock: StateFlow<UnlockEvent?> = _lastUnlock.asStateFlow()
+    fun publishUnlock(event: UnlockEvent) {
+        // Rows arrive from the admin receiver and from a backfill in either order;
+        // only a newer one moves the pointer.
+        _lastUnlock.update { current -> if (current == null || event.ts >= current.ts) event else current }
+    }
+
     fun reset() {
         _detections.value = emptyList()
         _status.value = ScanStatus()
         _cell.value = CellStatus()
         _map.value = MapData()
         _wifiStatus.value = WifiStatus()
+        _alerts.value = emptyList()
+        _screenRecordings.value = emptyList()
+        _audioRoutes.value = emptyList()
     }
 }

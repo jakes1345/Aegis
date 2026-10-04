@@ -1,5 +1,7 @@
 package com.xat.aegis
 
+import com.xat.aegis.detect.DultResult
+
 enum class Threat { NONE, LOW, MEDIUM, HIGH, CRITICAL }
 
 enum class Severity { LOW, MEDIUM, HIGH, CRITICAL }
@@ -47,9 +49,25 @@ data class Detection(
     /** "Classic", "BLE", "Dual" or "Unknown", from [android.bluetooth.BluetoothDevice.getType]. */
     val radio: String = "BLE",
     /** "public", "random static", "resolvable private (rotates)"… when the stack reports it. */
-    val addressKind: String? = null
+    val addressKind: String? = null,
+    /**
+     * What the tracker said about itself over the DULT non-owner service, when it was
+     * asked. A tracker that answers is by definition away from its owner; one that
+     * refuses the connection ([DultResult.error] set, nothing answered) is probably not.
+     */
+    val dult: DultResult? = null
 ) {
     val identified: Boolean get() = tracker != null
+
+    /** "Apple AirTag · serial 3f9a1c2e…" when the tracker identified itself over DULT. */
+    val dultLabel: String? get() {
+        val d = dult ?: return null
+        if (!d.answered) return null
+        val parts = ArrayList<String>(2)
+        d.label?.let { parts.add(it) }
+        d.serialHash?.let { parts.add("serial ${it.take(8)}…") }
+        return parts.joinToString(" · ").ifEmpty { null }
+    }
 
     /**
      * One-line description for the list row when no tracker signature matched:
@@ -199,8 +217,99 @@ enum class EventKind {
     /** A threat another member of one of the user's organisation groups shared. */
     SHARED_THREAT,
     /** An SOS the user (or a group member) sent to their groups. */
-    PANIC
+    PANIC,
+    /** A fingerprint or face was enrolled on the phone since Aegis last checked. */
+    BIOMETRIC_ENROLLED,
+    /** The screen was being recorded or cast while an Aegis screen was showing. */
+    SCREEN_RECORDING,
+    /** The phone was unlocked inside the owner's sleep window. */
+    UNLOCK_ANOMALY,
+    /** A wireless or USB microphone appeared while nothing was playing or in a call. */
+    AUDIO_ROUTE,
+    /** The phone's clock is off the relay's, or automatic time is switched off. */
+    CLOCK_DRIFT,
+    /** Any other platform-hardening alert. */
+    PLATFORM
 }
+
+// --- Platform hardening alerts ------------------------------------------------
+
+/**
+ * An alert raised by one of the platform monitors (biometric tripwire, screen
+ * recording, unlock ledger, audio route, clock). Published through
+ * [Registry.publishAlert], which also records it on the timeline as a
+ * [TimelineEvent] of [kind] and posts a notification for MEDIUM and above.
+ * [dedupeKey], when given, suppresses a repeat of the same alert within the
+ * timeline's dedupe window so a standing condition is reported once, not every poll.
+ */
+data class Alert(
+    val id: String,
+    val ts: Long,
+    val severity: Severity,
+    val title: String,
+    val detail: String,
+    val kind: EventKind = EventKind.PLATFORM,
+    val dedupeKey: String? = null
+)
+
+/**
+ * The enrolment-bound Keystore key was invalidated: a biometric was added between
+ * [previousCheckTs] (0 when this is the first check since the key was made) and
+ * [timestamp].
+ */
+data class BiometricTripwireEvent(val timestamp: Long, val previousCheckTs: Long)
+
+/**
+ * Aegis's window was captured by a screen recording or cast. Android does not tell
+ * a third-party app who is recording, so [packageName] is null unless the platform
+ * happens to say.
+ */
+data class ScreenRecordingEvent(val timestamp: Long, val packageName: String?)
+
+/** A capture-capable audio input appeared while nothing was playing and no call was up. */
+data class AudioRouteEvent(
+    val ts: Long,
+    /** One of the [android.media.AudioDeviceInfo] TYPE_ constants. */
+    val deviceType: Int,
+    val deviceName: String,
+    val productName: String
+) {
+    val deviceTypeLabel: String get() = when (deviceType) {
+        7 -> "Bluetooth headset (SCO)"
+        22 -> "USB headset"
+        26 -> "LE Audio headset"
+        30 -> "LE Audio broadcast"
+        else -> "Audio input type $deviceType"
+    }
+}
+
+/** What an unlock-ledger row records. Stored by name in the `event` column. */
+enum class UnlockKind {
+    /** The screen lock was passed (device admin callback). */
+    PASSWORD_SUCCEEDED,
+    /** A wrong PIN, pattern, password or biometric (device admin callback). */
+    PASSWORD_FAILED,
+    /** The screen lock credential was changed (device admin callback). */
+    PASSWORD_CHANGED,
+    /** The keyguard went away: the phone was unlocked (UsageStats). */
+    KEYGUARD_HIDDEN,
+    /** The keyguard came up: the phone locked (UsageStats). */
+    KEYGUARD_SHOWN,
+    /** The screen turned on (UsageStats). */
+    SCREEN_INTERACTIVE,
+    /** The screen turned off (UsageStats). */
+    SCREEN_NON_INTERACTIVE,
+    /** Aegis's device admin was enabled. */
+    ADMIN_ENABLED,
+    /** Aegis's device admin was disabled — someone turned the ledger off. */
+    ADMIN_DISABLED;
+
+    /** True for the kinds that mean someone got past the lock screen. */
+    val isUnlock: Boolean get() = this == PASSWORD_SUCCEEDED || this == KEYGUARD_HIDDEN
+}
+
+/** One row of the unlock ledger. */
+data class UnlockEvent(val id: Long, val ts: Long, val kind: UnlockKind, val extra: String?)
 
 data class TimelineEvent(
     val id: String,
@@ -459,7 +568,14 @@ data class HealthFact(
     val label: String,
     val value: String,
     val severity: Severity? = null,
-    val detail: String? = null
+    val detail: String? = null,
+    /**
+     * A Settings intent action that opens the page where this row can be fixed
+     * (for example `Settings.ACTION_BLUETOOTH_SETTINGS`), or null when there is
+     * nothing to tap. The Device tab falls back to the security settings page when
+     * the phone has no activity for the action.
+     */
+    val fixAction: String? = null
 ) {
     val ok: Boolean get() = severity == null
 }

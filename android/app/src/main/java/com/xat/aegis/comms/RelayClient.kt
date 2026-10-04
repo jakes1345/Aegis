@@ -375,6 +375,14 @@ class RelayClient(
     private var clockOffsetMs: Long = 0L
 
     /**
+     * Told (relay time, phone time) for every response that carries a `Date`;
+     * the app points it at the clock-integrity store, which this Android-free
+     * class cannot reach itself. Called on OkHttp's threads.
+     */
+    @Volatile
+    var clockListener: ((serverMs: Long, localMs: Long) -> Unit)? = null
+
+    /**
      * The current time by the relay's clock. Envelope timestamps are the relay's,
      * so anything that measures an envelope's age (a call offer that waited too
      * long to ring) compares against this rather than the phone's own clock,
@@ -389,8 +397,10 @@ class RelayClient(
      */
     fun noteServerTime(response: Response): Boolean {
         val server = response.headers.getDate("Date")?.time ?: return false
+        val local = System.currentTimeMillis()
+        runCatching { clockListener?.invoke(server + 500L, local) }
         // The header has one-second resolution; half a second centres the error.
-        val offset = server + 500L - System.currentTimeMillis()
+        val offset = server + 500L - local
         val previous = clockOffsetMs
         clockOffsetMs = offset
         val moved = kotlin.math.abs(offset - previous) > CLOCK_WARN_MS
