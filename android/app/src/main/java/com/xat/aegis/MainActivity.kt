@@ -102,6 +102,7 @@ import com.google.android.gms.tasks.Tasks
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.osmdroid.config.Configuration as OsmConfig
@@ -1389,15 +1390,24 @@ private fun MainApp(
                 Box(Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 16.dp)) {
                     SosButton(onConfirmed = {
                         scope.launch(Dispatchers.IO) {
-                            val loc = sosLocation(context)
-                            Registry.setPanicActive(true)
-                            withContext(Dispatchers.Main) {
-                                Toast.makeText(
-                                    context,
-                                    if (loc != null) "SOS sent with your location" else "SOS sent — no GPS fix to attach",
-                                    Toast.LENGTH_LONG
-                                ).show()
+                            suspend fun toast(text: String) = withContext(Dispatchers.Main) {
+                                Toast.makeText(context, text, Toast.LENGTH_LONG).show()
                             }
+                            // The alert goes out at once with whatever position is known.
+                            // Waiting for a fix first held it up by several seconds; now a
+                            // fix found afterwards follows as a second alert.
+                            val s = Registry.status.value
+                            val hadFix = s.lat != null && s.lon != null
+                            Registry.setPanicActive(true)
+                            toast(if (hadFix) "SOS sent with your location" else "SOS sent — finding your location…")
+                            if (hadFix) return@launch
+                            val loc = sosLocation(context)
+                            if (loc == null) { toast("No GPS fix to attach to the SOS"); return@launch }
+                            // The first broadcast lowers the flag when it is done; a second
+                            // raise before that would be lost, so wait for it.
+                            Registry.panicActive.first { !it }
+                            Registry.setPanicActive(true)
+                            toast("Your location followed the SOS")
                         }
                     })
                 }
@@ -1456,15 +1466,13 @@ private fun MainApp(
 }
 
 /**
- * The position an SOS carries. The scanner's live fix when it has one; otherwise
- * — scanner off, or the comms-only build, which has no scanner — the platform's
- * last known position, else a fresh fix with a short wait, so the alert is not
- * held up long. Whatever is found is put in the status the panic broadcast
- * reads. Null when location is not granted or nothing could be found in time.
+ * A position for an SOS when the scanner has none (scanner off, or the
+ * comms-only build, which has no scanner): the platform's last known position,
+ * else a fresh fix with a short wait. Whatever is found is put in the status the
+ * panic broadcast reads. Null when location is not granted or nothing could be
+ * found in time.
  */
 private fun sosLocation(context: Context): LatLon? {
-    val s = Registry.status.value
-    if (s.lat != null && s.lon != null) return LatLon(s.lat, s.lon)
     val granted = arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
         .any { ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }
     if (!granted) return null
