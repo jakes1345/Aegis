@@ -28,6 +28,10 @@ EARTH_RADIUS_M = 6371008.8
 # The phone memory-maps the file into a single ByteBuffer, which Java caps at Integer.MAX_VALUE.
 MAX_FILE_BYTES = 0x7FFFFFFF
 CHUNK = 1 << 22  # elements per vectorised batch; bounds temporary arrays on state-sized inputs
+# Strongly connected components at least this big are kept alongside the largest one, so islands
+# and ferry-only towns (Hawaii's islands, Juneau, Vieques) stay routable while parking-lot
+# fragments and one-way dead ends are still dropped.
+MIN_COMPONENT_NODES = 200
 
 FLAG_TOLL = 1
 FLAG_ROUNDABOUT = 2
@@ -285,13 +289,15 @@ def cumulative_length(lat_e7: np.ndarray, lon_e7: np.ndarray) -> np.ndarray:
     return cum
 
 
-def largest_scc(n: int, first: list[int], to: list[int]) -> list[int]:
-    """Iterative Tarjan; returns the node ids of the largest strongly connected component."""
+def kept_components(n: int, first: list[int], to: list[int], min_nodes: int) -> list[int]:
+    """Iterative Tarjan; returns the node ids of every strongly connected component with at least
+    min_nodes nodes, plus the largest component whatever its size."""
     index = [-1] * n
     low = [0] * n
     on_stack = [False] * n
     next_edge = [0] * n
     stack: list[int] = []
+    kept: list[int] = []
     best: list[int] = []
     counter = 0
     for root in range(n):
@@ -339,9 +345,13 @@ def largest_scc(n: int, first: list[int], to: list[int]) -> list[int]:
                     comp.append(w)
                     if w == v:
                         break
+                if len(comp) >= min_nodes:
+                    kept.extend(comp)
                 if len(comp) > len(best):
                     best = comp
-    return best
+    if len(best) < min_nodes:
+        kept.extend(best)
+    return kept
 
 
 def morton_order(lat_e7: np.ndarray, lon_e7: np.ndarray) -> np.ndarray:
@@ -362,7 +372,8 @@ def morton_order(lat_e7: np.ndarray, lon_e7: np.ndarray) -> np.ndarray:
 
 
 
-def build(store: WayStore, region: str, built_at: int, out_path: str) -> dict:
+def build(store: WayStore, region: str, built_at: int, out_path: str,
+          min_component: int = MIN_COMPONENT_NODES) -> dict:
     """Turn the collected ways into an AGR1 file at out_path; returns summary stats."""
     refs = np.frombuffer(store.refs, dtype=np.int64)
     plat = np.frombuffer(store.lat, dtype=np.int32)
@@ -493,7 +504,7 @@ def build(store: WayStore, region: str, built_at: int, out_path: str) -> dict:
     first_list = first_all.tolist()
     to_list = e_to[order].tolist()
     del order, first_all
-    comp = largest_scc(n_all, first_list, to_list)
+    comp = kept_components(n_all, first_list, to_list, min_component)
     del first_list, to_list
     in_comp = np.zeros(n_all, dtype=bool)
     in_comp[np.array(comp, dtype=np.int64)] = True
@@ -637,6 +648,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--region", required=True, help="region slug, e.g. north-america-us-ohio")
     ap.add_argument("--index", default="flex_mem",
                     help="osmium node location index (flex_mem, sparse_file_array,<file>, ...)")
+    ap.add_argument("--min-component", type=int, default=MIN_COMPONENT_NODES,
+                    help="keep every strongly connected component with at least this many nodes "
+                         f"(the largest is always kept; default {MIN_COMPONENT_NODES})")
     args = ap.parse_args(argv)
 
     try:
@@ -645,6 +659,8 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--region must be ASCII")
     if len(args.region) > REGION_BYTES:
         ap.error(f"--region is longer than {REGION_BYTES} characters")
+    if args.min_component < 1:
+        ap.error("--min-component must be at least 1")
 
     t0 = time.time()
     store = read_osm(args.input, args.index)
@@ -653,7 +669,7 @@ def main(argv: list[str] | None = None) -> int:
     built_at = int(os.environ.get("SOURCE_DATE_EPOCH", time.time()))
     tmp = args.output + ".tmp"
     try:
-        stats = build(store, args.region, built_at, tmp)
+        stats = build(store, args.region, built_at, tmp, args.min_component)
     except BaseException:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -661,7 +677,7 @@ def main(argv: list[str] | None = None) -> int:
     os.replace(tmp, args.output)
     print(f"nodes={stats['nodes']} edges={stats['edges']} shape={stats['shape']} "
           f"names={stats['names']} bytes={stats['bytes']} "
-          f"(largest SCC kept {stats['nodes']}/{stats['candidate_nodes']} nodes, "
+          f"(SCCs >= {args.min_component} nodes kept {stats['nodes']}/{stats['candidate_nodes']} nodes, "
           f"{stats['edges']}/{stats['candidate_edges']} edges) in {time.time() - t0:.1f}s")
     return 0
 

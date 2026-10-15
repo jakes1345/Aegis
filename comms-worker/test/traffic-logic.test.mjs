@@ -11,6 +11,7 @@ import {
   liveSegments,
   median,
   parseWzdx,
+  readTextCapped,
   robustBBox,
   weekSlot,
 } from "../src/traffic-logic.ts";
@@ -224,4 +225,52 @@ test("WZDx work zones become closures or hazards", () => {
   assert.equal(b.endsAt, null);
   assert.equal(b.description, null);
   assert.deepEqual(parseWzdx("x", { nope: true }, NOW), []);
+});
+
+function streamOf(chunks, onCancel) {
+  let i = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (i < chunks.length) controller.enqueue(chunks[i++]);
+      else controller.close();
+    },
+    cancel() {
+      onCancel?.();
+    },
+  });
+}
+
+test("readTextCapped stops reading a body that grows past the cap", async () => {
+  let cancelled = false;
+  let pulled = 0;
+  const chunk = new Uint8Array(400).fill(0x61);
+  const body = new ReadableStream({
+    pull(controller) {
+      pulled++;
+      controller.enqueue(chunk);
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  assert.equal(await readTextCapped(body, null, 1000), null);
+  assert.ok(cancelled);
+  assert.ok(pulled <= 4);
+});
+
+test("readTextCapped refuses a declared content-length over the cap without reading", async () => {
+  let cancelled = false;
+  const body = streamOf([new TextEncoder().encode("{}")], () => {
+    cancelled = true;
+  });
+  assert.equal(await readTextCapped(body, "5000", 1000), null);
+  assert.ok(cancelled);
+});
+
+test("readTextCapped returns the text of a body under the cap, across split UTF-8", async () => {
+  const bytes = new TextEncoder().encode('{"name":"Café road"}');
+  const cut = bytes.indexOf(0xc3) + 1; // split inside the two-byte é
+  const body = streamOf([bytes.slice(0, cut), bytes.slice(cut)]);
+  assert.equal(await readTextCapped(body, String(bytes.length), 1000), '{"name":"Café road"}');
+  assert.equal(await readTextCapped(null, null, 1000), "");
 });

@@ -3,7 +3,7 @@ import { HttpError, json, normaliseNumber, randomNumber, requireSecret, timingSa
 import { INVITE_TTL_MS, Mailbox, type CoinTx, type Profile, type SignedKey } from "./mailbox";
 import { invitePage } from "./invite-page";
 import { REGISTRY_NAME, Traffic, type ProbeSample } from "./traffic";
-import { INCIDENT_TYPES, PROBE_MAX_AGE_SEC, REGION_RE, SEGMENT_RE, bboxContains, fnv1a, parseWzdx, type BBox, type IncidentType } from "./traffic-logic";
+import { INCIDENT_TYPES, PROBE_MAX_AGE_SEC, REGION_RE, SEGMENT_RE, bboxContains, fnv1a, parseWzdx, readTextCapped, type BBox, type IncidentType } from "./traffic-logic";
 
 export { Mailbox, Traffic };
 
@@ -422,6 +422,8 @@ function probeSample(raw: unknown): ProbeSample {
 }
 
 const WZDX_FETCH_TIMEOUT_MS = 30_000;
+/** A statewide feed is a few MiB; the cap keeps a misbehaving one from exhausting the isolate's memory. */
+const WZDX_MAX_BYTES = 20 * 1024 * 1024;
 /** Regions are created by any signed-in phone; the cron serves only the most recently active ones. */
 const WZDX_MAX_REGIONS = 200;
 
@@ -466,7 +468,12 @@ async function refreshWzdx(env: Env, now: number): Promise<void> {
         console.error(`wzdx: ${feed} answered ${res.status}`);
         continue;
       }
-      doc = await res.json();
+      const text = await readTextCapped(res.body, res.headers.get("content-length"), WZDX_MAX_BYTES);
+      if (text === null) {
+        console.error(`wzdx: ${feed} is larger than ${WZDX_MAX_BYTES} bytes`);
+        continue;
+      }
+      doc = JSON.parse(text);
     } catch (e) {
       console.error(`wzdx: ${feed} failed`, e);
       continue;

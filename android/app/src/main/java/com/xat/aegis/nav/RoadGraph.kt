@@ -237,7 +237,8 @@ class RoadGraph private constructor(
 
     private fun grid(): Grid = grid ?: synchronized(this) { grid ?: buildGrid().also { grid = it } }
 
-    private fun buildGrid(): Grid {
+    /** The empty grid sized to this graph's bounding box; [buildGrid] fills it. */
+    private fun gridShape(): Grid {
         val midLat = (minLat + maxLat) / 2
         val mPerDegLat = RoadGeo.M_PER_DEG_LAT
         val mPerDegLon = RoadGeo.M_PER_DEG_LAT * max(0.01, cos(midLat * PI / 180))
@@ -245,12 +246,32 @@ class RoadGraph private constructor(
         val spanLonM = max(1.0, (maxLon - minLon) * mPerDegLon)
         var cellM = TARGET_CELL_M
         while ((ceil(spanLatM / cellM) + 1) * (ceil(spanLonM / cellM) + 1) > MAX_CELLS) cellM *= 1.25
-        val cellLat = cellM / mPerDegLat
-        val cellLon = cellM / mPerDegLon
         val rows = (ceil(spanLatM / cellM).toInt() + 1).coerceAtLeast(1)
         val cols = (ceil(spanLonM / cellM).toInt() + 1).coerceAtLeast(1)
+        return Grid(minLat, minLon, cellM / mPerDegLat, cellM / mPerDegLon, rows, cols, IntArray(0), IntArray(0))
+    }
+
+    /**
+     * Peak heap the spatial index takes while [buildGrid] runs: three cell-sized IntArrays (counts,
+     * lastEdge, cursor) plus one Int per (edge, cell) pair. The pair count is only known after a pass
+     * over the geometry; it is estimated as one per polyline segment, which is what short urban
+     * segments produce and what consecutive segments of a long edge share. 0 once the index exists.
+     */
+    fun estimatedIndexBytes(): Long {
+        if (grid != null) return 0L
+        val shape = gridShape()
+        val cells = shape.rows.toLong() * shape.cols
+        val segments = edgeCount.toLong() + shapeTotal
+        return 3 * 4L * (cells + 1) + 4L * segments
+    }
+
+    private fun buildGrid(): Grid {
+        val probe = gridShape()
+        val rows = probe.rows
+        val cols = probe.cols
+        val cellLat = probe.cellLat
+        val cellLon = probe.cellLon
         val cells = rows * cols
-        val probe = Grid(minLat, minLon, cellLat, cellLon, rows, cols, IntArray(0), IntArray(0))
 
         val counts = IntArray(cells + 1)
         val lastEdge = IntArray(cells) { -1 }

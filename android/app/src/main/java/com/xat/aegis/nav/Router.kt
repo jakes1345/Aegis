@@ -16,23 +16,40 @@ class Router(
     private val speeds: SpeedSource,
     private val vehicle: VehicleModel = VehicleModel.DEFAULT,
 ) {
-    private companion object {
-        const val MAX_KPH = 130.0
-        const val MIN_KPH = 2.0
-        const val SIGNAL_SEC = 15.0
-        const val STOP_SEC = 5.0
-        const val LEFT_SEC = 8.0
-        const val RIGHT_SEC = 3.0
-        const val UTURN_SEC = 30.0
-        const val TOLL_FACTOR = 1e3
-        const val HIGHWAY_FACTOR = 5.0
+    companion object {
+        private const val MAX_KPH = 130.0
+        private const val MIN_KPH = 2.0
+        private const val SIGNAL_SEC = 15.0
+        private const val STOP_SEC = 5.0
+        private const val LEFT_SEC = 8.0
+        private const val RIGHT_SEC = 3.0
+        private const val UTURN_SEC = 30.0
+        private const val TOLL_FACTOR = 1e3
+        private const val HIGHWAY_FACTOR = 5.0
         // Share of signalised junctions where the car actually has to stop.
-        const val SIGNAL_STOP_SHARE = 0.5
-        const val SNAP_SLACK_M = 25.0
-        const val MIN_PARTIAL_M = 1.0
-        const val DEDUP_SHARE = 0.8
-        val SNAP_RADII = doubleArrayOf(60.0, 250.0, 1_000.0, 3_000.0)
-        val CLASS_KPH = doubleArrayOf(105.0, 85.0, 65.0, 55.0, 45.0, 40.0, 30.0, 15.0)
+        private const val SIGNAL_STOP_SHARE = 0.5
+        private const val SNAP_SLACK_M = 25.0
+        private const val MIN_PARTIAL_M = 1.0
+        private const val DEDUP_SHARE = 0.8
+        private val SNAP_RADII = doubleArrayOf(60.0, 250.0, 1_000.0, 3_000.0)
+        private val CLASS_KPH = doubleArrayOf(105.0, 85.0, 65.0, 55.0, 45.0, 40.0, 30.0, 15.0)
+
+        /** Bytes per edge [ensureArrays] allocates: g, gTime, pred and speedCache, 4 bytes each. */
+        private const val WORK_BYTES_PER_EDGE = 4L * 4
+        /** [settled] grows up to one bit per edge. */
+        private const val SETTLED_EDGES_PER_BYTE = 8L
+
+        /**
+         * Heap a [Router] over [graph] needs on top of the memory-mapped file: its per-edge work
+         * arrays, the `settled` bitset at full size, and the graph's spatial index if it is not
+         * built yet. The touched lists and the A* heap grow with the search frontier instead of the
+         * graph and are left to the caller's safety margin.
+         */
+        fun estimatedHeapBytes(graph: RoadGraph): Long {
+            val edges = graph.edgeCount.toLong()
+            return edges * WORK_BYTES_PER_EDGE + (edges + SETTLED_EDGES_PER_BYTE - 1) / SETTLED_EDGES_PER_BYTE +
+                graph.estimatedIndexBytes()
+        }
     }
 
     private val edgeCount = graph.edgeCount

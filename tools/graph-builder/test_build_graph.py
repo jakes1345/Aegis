@@ -251,12 +251,43 @@ def test_parse_maxspeed(raw, kph):
     assert build_graph.parse_maxspeed(raw) == kph
 
 
-def test_largest_scc_deep_chain():
+def test_kept_components_deep_chain():
     # A long cycle would blow Python's recursion limit with a recursive Tarjan.
     n = 200_000
     first = list(range(n + 1))
     to = [(i + 1) % n for i in range(n)]
-    assert len(build_graph.largest_scc(n, first, to)) == n
+    assert len(build_graph.kept_components(n, first, to, build_graph.MIN_COMPONENT_NODES)) == n
+
+
+def test_largest_component_kept_even_below_threshold():
+    # Two 2-cycles and a 3-cycle; with a threshold above all of them only the largest survives.
+    first = [0, 1, 2, 3, 4, 5, 6, 7]
+    to = [1, 0, 3, 2, 5, 6, 4]
+    assert sorted(build_graph.kept_components(7, first, to, 10)) == [4, 5, 6]
+    assert sorted(build_graph.kept_components(7, first, to, 2)) == list(range(7))
+
+
+def test_island_above_min_component_is_kept(tmp_path):
+    osm = tmp_path / "islands.osm"
+    out = tmp_path / "islands.agr"
+    write_osm(osm)
+    assert build_graph.main([str(osm), str(out), "--region", "x", "--min-component", "2"]) == 0
+    g = parse_agr(out.read_bytes())
+    by_coord = {(e7(lat), e7(lon)): nid for nid, (lat, lon, _) in NODES.items()}
+    assert sorted(by_coord[n] for n in g["nodes"]) == [1, 3, 5, 6, 8, 20, 21]
+    assert len(g["edges"]) == 11
+    assert sum(1 for e in g["edges"] if e["way"] == 500) == 2
+    assert "Island Road" in g["names"]
+
+
+def test_island_below_min_component_is_dropped(tmp_path):
+    osm = tmp_path / "islands.osm"
+    out = tmp_path / "islands.agr"
+    write_osm(osm)
+    assert build_graph.main([str(osm), str(out), "--region", "x", "--min-component", "3"]) == 0
+    g = parse_agr(out.read_bytes())
+    assert len(g["nodes"]) == 5
+    assert all(e["way"] != 500 for e in g["edges"])
 
 
 def test_graph_too_large_for_the_phone_is_refused(tmp_path, monkeypatch):

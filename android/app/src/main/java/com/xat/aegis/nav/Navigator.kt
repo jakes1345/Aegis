@@ -349,6 +349,7 @@ class Navigator(
             fixes = null
         }
         stopUpdates()
+        NavigationService.stop(appContext)
         traffic.stopLive()
         probe.stop()
         matcher.reset()
@@ -377,6 +378,9 @@ class Navigator(
             .build()
         try {
             fused.requestLocationUpdates(request, callback, Looper.getMainLooper())
+            // Without a foreground service, Android throttles fused location to a few fixes an
+            // hour once Aegis leaves the screen (Drive Mode's own service may not be running).
+            NavigationService.start(appContext)
         } catch (e: SecurityException) {
             synchronized(sessionLock) { updatesOn = false }
             endSession(null, "Location permission is needed to navigate")

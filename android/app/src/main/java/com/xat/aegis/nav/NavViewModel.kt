@@ -95,6 +95,8 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
         const val LOCATION_INTERVAL_MS = 2_000L
         const val FIRST_FIX_WAIT_MS = 20_000L
         const val LIVE_TRAFFIC_WAIT_MS = 4_000L
+        /** Share of the free heap a region's routing arrays and spatial index may take. */
+        const val HEAP_BUDGET_SHARE = 0.6
         const val REPORT_SNAP_M = 35.0
         const val REPORT_HEADING_TOLERANCE_DEG = 60.0
         /** Destinations this far outside the map's box cannot be snapped to any road in it. */
@@ -184,6 +186,7 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
 
     private var loadJob: Job? = null
     private var downloadJob: Job? = null
+    private var pendingLoadJob: Job? = null
     private var searchJob: Job? = null
     private var routeJob: Job? = null
     private var reverseJob: Job? = null
@@ -229,6 +232,8 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Switches navigation to an installed region. */
     fun selectRegion(slug: String) {
+        // An explicit choice overrides a map that was waiting for the drive to end.
+        pendingLoadJob?.cancel()
         if ((session.value?.slug == slug) && _graph.value is GraphState.Ready) return
         load(slug)
     }
@@ -243,6 +248,12 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val s = withContext(Dispatchers.IO) {
                     val graph = store.open(slug)
+                    val rt = Runtime.getRuntime()
+                    val headroom = rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())
+                    // The rest of the app and each search's frontier need the remaining 40%.
+                    if (Router.estimatedHeapBytes(graph) > headroom * HEAP_BUDGET_SHARE) {
+                        throw IllegalStateException("This map is too large for this phone's memory")
+                    }
                     // Builds the spatial index now rather than on the first tap or route request.
                     graph.nearestEdges((graph.minLat + graph.maxLat) / 2, (graph.minLon + graph.maxLon) / 2, 50.0, 1)
                     val traffic = TrafficClient(ctx, slug)
@@ -282,7 +293,18 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
         downloadJob = viewModelScope.launch {
             store.download(region).onSuccess {
                 refreshInstalled()
-                load(region.slug)
+                // A drive may have started while the file was downloading; swapping graphs would end it.
+                val driving = session.value?.navigator?.state?.value.let { it != null && it !is NavState.Idle }
+                if (driving) {
+                    messageChannel.trySend("${region.name} map downloaded; it will be used after this drive")
+                    pendingLoadJob?.cancel()
+                    pendingLoadJob = viewModelScope.launch {
+                        navState.first { it is NavState.Idle }
+                        load(region.slug)
+                    }
+                } else {
+                    load(region.slug)
+                }
             }.onFailure { e ->
                 messageChannel.trySend("${region.name}: ${e.message ?: "download failed"}")
             }
@@ -467,7 +489,8 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
             // Offline routing must not wait on a stalled connection; stale traffic is better than none.
-            withTimeoutOrNull(LIVE_TRAFFIC_WAIT_MS) { s.traffic.refreshLive() }
+            val liveRefresh = launch { s.traffic.refreshLive() }
+            withTimeoutOrNull(LIVE_TRAFFIC_WAIT_MS) { liveRefresh.join() }
             val now = System.currentTimeMillis() / 1000
             var routes = withContext(Dispatchers.Default) { s.router.alternatives(from.first, from.second, dest.lat, dest.lon, now) }
             if (routes.isEmpty()) {

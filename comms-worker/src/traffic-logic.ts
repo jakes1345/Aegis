@@ -370,3 +370,38 @@ function wzdxDescription(core: Record<string, unknown>): string | null {
 export function round1(x: number): number {
   return Math.round(x * 10) / 10;
 }
+
+/**
+ * Reads a response body as UTF-8 text, giving up (null) as soon as it is known to exceed maxBytes:
+ * up front from a declared content-length, otherwise while streaming, so an oversized or endless
+ * body is never buffered whole.
+ */
+export async function readTextCapped(
+  body: ReadableStream<Uint8Array> | null,
+  contentLength: string | null,
+  maxBytes: number,
+): Promise<string | null> {
+  const declared = contentLength === null ? NaN : Number(contentLength);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    if (body) await body.cancel().catch(() => {});
+    return null;
+  }
+  if (!body) return "";
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const decoder = new TextDecoder();
+  let text = "";
+  for (const c of chunks) text += decoder.decode(c, { stream: true });
+  return text + decoder.decode();
+}
