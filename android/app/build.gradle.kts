@@ -110,8 +110,8 @@ android {
         applicationId = "com.xat.aegis"
         minSdk = 31
         targetSdk = 35
-        versionCode = 19
-        versionName = "2.6.0"
+        versionCode = 20
+        versionName = "2.7.0"
     }
 
     // Two APKs from one codebase, for handing to two circles of people:
