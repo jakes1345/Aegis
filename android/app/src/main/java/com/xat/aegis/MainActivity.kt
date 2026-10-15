@@ -191,12 +191,14 @@ private const val TAB_NFC = 4
 private const val TAB_WIFI = 5
 private const val TAB_DEVICE = 6
 private const val TAB_COMMS = CommsNotifications.COMMS_TAB_INDEX
+private const val TAB_DRIVE = TAB_COMMS + 1
 
 private class TabSpec(val id: Int, val label: String)
 
 private val FULL_TABS = listOf(
     TabSpec(TAB_SCAN, "SCAN"), TabSpec(TAB_MAP, "MAP"), TabSpec(TAB_LOG, "LOG"), TabSpec(TAB_CELL, "CELL"),
-    TabSpec(TAB_NFC, "NFC"), TabSpec(TAB_WIFI, "WIFI"), TabSpec(TAB_DEVICE, "DEVICE"), TabSpec(TAB_COMMS, "COMMS")
+    TabSpec(TAB_NFC, "NFC"), TabSpec(TAB_WIFI, "WIFI"), TabSpec(TAB_DEVICE, "DEVICE"), TabSpec(TAB_COMMS, "COMMS"),
+    TabSpec(TAB_DRIVE, "DRIVE")
 )
 private val COMMS_TABS = listOf(TabSpec(TAB_COMMS, "COMMS"))
 
@@ -1381,6 +1383,7 @@ private fun MainApp(
                     onGroupConsumed = { Registry.takeGroupRequest() },
                     onAppSettings = { showSettings = true }
                 )
+                TAB_DRIVE -> DriveScreen()
             }
 
             // SOS panic button, floating over the active tab. Hidden while settings or
@@ -1589,7 +1592,15 @@ private fun TabIcon(index: Int, selected: Boolean) {
                     drawCircle(color, radius = 1.6f, center = Offset(left + w * (0.3f + i * 0.2f), top + h / 2f))
                 }
             }
-            else -> { // DEVICE — shield
+            TAB_DRIVE -> { // DRIVE — steering wheel
+                val r = size.minDimension * 0.44f
+                drawCircle(color, radius = r, center = center, style = Stroke(2f))
+                drawCircle(color, radius = r * 0.28f, center = center)
+                // Three spokes: left, right and down from the hub to the rim.
+                drawLine(color, Offset(cx - r, cy), Offset(cx + r, cy), strokeWidth = 1.8f)
+                drawLine(color, center, Offset(cx, cy + r), strokeWidth = 1.8f)
+            }
+            TAB_DEVICE -> { // DEVICE — shield
                 val sw = size.width * 0.76f
                 val sh = size.height * 0.88f
                 val ox = cx - sw / 2f
@@ -1609,6 +1620,7 @@ private fun TabIcon(index: Int, selected: Boolean) {
                 drawLine(color, Offset(cx - sw * 0.22f, cy + sh * 0.05f), Offset(cx - sw * 0.05f, cy + sh * 0.22f), strokeWidth = 1.8f)
                 drawLine(color, Offset(cx - sw * 0.05f, cy + sh * 0.22f), Offset(cx + sw * 0.25f, cy - sh * 0.1f), strokeWidth = 1.8f)
             }
+            else -> Unit
         }
     }
 }
