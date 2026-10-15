@@ -2,8 +2,10 @@ import { parseSigned, verifyEd25519 } from "./auth";
 import { HttpError, json, normaliseNumber, randomNumber, requireSecret, timingSafeEqual, type Env } from "./env";
 import { INVITE_TTL_MS, Mailbox, type CoinTx, type Profile, type SignedKey } from "./mailbox";
 import { invitePage } from "./invite-page";
+import { REGISTRY_NAME, Traffic, type ProbeSample } from "./traffic";
+import { INCIDENT_TYPES, PROBE_MAX_AGE_SEC, REGION_RE, SEGMENT_RE, bboxContains, fnv1a, parseWzdx, type BBox, type IncidentType } from "./traffic-logic";
 
-export { Mailbox };
+export { Mailbox, Traffic };
 
 /**
  * Aegis comms relay: store-and-forward for end-to-end encrypted envelopes
@@ -37,6 +39,13 @@ export { Mailbox };
  *   POST   /v1/coin/pay        {to, amount, note?}         → {txid, balance, ok}: moves coins to a contact
  *   GET    /v1/coin/history                                → {txs: [...]}, newest first
  *   POST   /v1/admin/coin/mint {to, amount}                → {ok, balance}; X-Admin-Secret must match ADMIN_SECRET
+ * Traffic (one Durable Object per map region; senders are kept only as salted hashes):
+ *   POST   /v1/traffic/probe   {region, samples:[{seg, kph, t, lat?, lon?}]} → {ok, accepted}
+ *   GET    /v1/traffic/live?region=                        → {now, segments: {seg: {kph, n, t}}, incidents}
+ *   GET    /v1/traffic/typical?region=&segs=a,b            → {segments: {seg: {h: [168]}}}
+ *   POST   /v1/traffic/report  {region, type, lat, lon, seg|null} → {incident}
+ *   POST   /v1/traffic/report/vote {region, id, still}     → {incident|null}
+ * Cron (every 10 minutes): WZDx work zones from WZDX_FEEDS into every known region.
  */
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -59,6 +68,10 @@ export default {
       console.error(e);
       return json({ error: "Internal error" }, 500);
     }
+  },
+
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(refreshWzdx(env, Math.floor(controller.scheduledTime / 1000)));
   },
 } satisfies ExportedHandler<Env>;
 
@@ -227,6 +240,11 @@ async function route(request: Request, env: Env): Promise<Response> {
     return json({ iceServers: servers, turn: servers.some((s) => s.urls.some((u) => u.startsWith("turn"))) });
   }
 
+  // ── Traffic ───────────────────────────────────────────────────────────
+  if (path.startsWith("/v1/traffic/")) {
+    return trafficRoute(env, request, url, path, bodyText, me, profile.number);
+  }
+
   // ── AegisCoin ─────────────────────────────────────────────────────────
   if (path === "/v1/coin/balance" && request.method === "GET") {
     return json({ balance: await me.getBalance(), symbol: COIN_SYMBOL });
@@ -284,6 +302,176 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
 
   throw new HttpError(404, "Not found");
+}
+
+/** Per-sender limits for traffic calls, kept in the sender's own mailbox so the Traffic objects never see the number at rest. */
+const TRAFFIC_LIMITS = {
+  probe: { perMinute: 12, burst: 30 },
+  read: { perMinute: 30, burst: 30 },
+  report: { perMinute: 6, burst: 10 },
+  vote: { perMinute: 30, burst: 30 },
+} as const;
+const MAX_PROBE_SAMPLES = 60;
+const MAX_TYPICAL_SEGS = 500;
+/** Phone clocks drift; a sample stamped slightly in the future is still a fresh one. */
+const PROBE_CLOCK_SKEW_SEC = 60;
+const INCIDENT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+type MailboxStub = DurableObjectStub<Mailbox>;
+
+async function trafficRoute(env: Env, request: Request, url: URL, path: string, bodyText: string, me: MailboxStub, number: string): Promise<Response> {
+  const now = Math.floor(Date.now() / 1000);
+  const limit = async (action: keyof typeof TRAFFIC_LIMITS) => {
+    const { perMinute, burst } = TRAFFIC_LIMITS[action];
+    const allowed = await me.rateOk(`traffic-${action}`, perMinute, burst);
+    if (!allowed.ok) throw new HttpError(429, "Too many traffic requests; try again shortly", allowed.retryAfter);
+  };
+  const regionStub = (region: string) => env.TRAFFIC.get(env.TRAFFIC.idFromName(`traffic:${region}`));
+
+  if (path === "/v1/traffic/probe" && request.method === "POST") {
+    await limit("probe");
+    const body = parseJson<{ region?: unknown; samples?: unknown }>(bodyText);
+    const region = trafficRegion(body.region);
+    if (!Array.isArray(body.samples)) throw new HttpError(400, "samples must be an array");
+    if (body.samples.length > MAX_PROBE_SAMPLES) throw new HttpError(400, `at most ${MAX_PROBE_SAMPLES} samples per request`);
+    const samples: ProbeSample[] = [];
+    for (const raw of body.samples) {
+      const s = probeSample(raw);
+      // Stale samples are normal after a phone was offline; they are dropped, not an error.
+      if (s.t < now - PROBE_MAX_AGE_SEC || s.t > now + PROBE_CLOCK_SKEW_SEC) continue;
+      samples.push(s);
+    }
+    const accepted = samples.length === 0 ? 0 : await regionStub(region).ingestProbes(region, number, samples, now);
+    return json({ ok: true, accepted });
+  }
+
+  if (path === "/v1/traffic/live" && request.method === "GET") {
+    await limit("read");
+    const region = trafficRegion(url.searchParams.get("region"));
+    return json(await regionStub(region).live(now));
+  }
+
+  if (path === "/v1/traffic/typical" && request.method === "GET") {
+    await limit("read");
+    const region = trafficRegion(url.searchParams.get("region"));
+    const segs = (url.searchParams.get("segs") ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+    if (segs.length > MAX_TYPICAL_SEGS) throw new HttpError(400, `at most ${MAX_TYPICAL_SEGS} segments per request`);
+    for (const seg of segs) if (!SEGMENT_RE.test(seg)) throw new HttpError(400, `bad segment ${seg.slice(0, 40)}`);
+    if (segs.length === 0) return json({ segments: {} });
+    return json(await regionStub(region).typical(segs));
+  }
+
+  if (path === "/v1/traffic/report" && request.method === "POST") {
+    await limit("report");
+    const body = parseJson<{ region?: unknown; type?: unknown; lat?: unknown; lon?: unknown; seg?: unknown }>(bodyText);
+    const region = trafficRegion(body.region);
+    if (typeof body.type !== "string" || !(INCIDENT_TYPES as readonly string[]).includes(body.type)) {
+      throw new HttpError(400, `type must be one of ${INCIDENT_TYPES.join(", ")}`);
+    }
+    const { lat, lon } = latLon(body.lat, body.lon);
+    let seg: string | null = null;
+    if (body.seg !== undefined && body.seg !== null) {
+      if (typeof body.seg !== "string" || !SEGMENT_RE.test(body.seg)) throw new HttpError(400, "seg must be \"<wayId>:<0|1>\" or null");
+      seg = body.seg;
+    }
+    const incident = await regionStub(region).report(region, number, body.type as IncidentType, lat, lon, seg, now);
+    return json({ incident });
+  }
+
+  if (path === "/v1/traffic/report/vote" && request.method === "POST") {
+    await limit("vote");
+    const body = parseJson<{ region?: unknown; id?: unknown; still?: unknown }>(bodyText);
+    const region = trafficRegion(body.region);
+    if (typeof body.id !== "string" || !INCIDENT_ID_RE.test(body.id)) throw new HttpError(400, "id must be an incident id");
+    if (typeof body.still !== "boolean") throw new HttpError(400, "still must be a boolean");
+    const incident = await regionStub(region).vote(region, number, body.id, body.still, now);
+    return json({ incident });
+  }
+
+  throw new HttpError(404, "Not found");
+}
+
+function trafficRegion(raw: unknown): string {
+  if (typeof raw !== "string" || !REGION_RE.test(raw)) throw new HttpError(400, "region must be a map region slug, e.g. north-america-us-ohio");
+  return raw;
+}
+
+function latLon(rawLat: unknown, rawLon: unknown): { lat: number; lon: number } {
+  if (typeof rawLat !== "number" || !Number.isFinite(rawLat) || rawLat < -90 || rawLat > 90) throw new HttpError(400, "lat must be a latitude");
+  if (typeof rawLon !== "number" || !Number.isFinite(rawLon) || rawLon < -180 || rawLon > 180) throw new HttpError(400, "lon must be a longitude");
+  return { lat: rawLat, lon: rawLon };
+}
+
+function probeSample(raw: unknown): ProbeSample {
+  if (!raw || typeof raw !== "object") throw new HttpError(400, "each sample must be an object");
+  const s = raw as { seg?: unknown; kph?: unknown; t?: unknown; lat?: unknown; lon?: unknown };
+  if (typeof s.seg !== "string" || !SEGMENT_RE.test(s.seg)) throw new HttpError(400, "sample seg must be \"<wayId>:<0|1>\"");
+  if (typeof s.kph !== "number" || !Number.isFinite(s.kph) || s.kph < 0 || s.kph > 250) throw new HttpError(400, "sample kph must be from 0 to 250");
+  if (typeof s.t !== "number" || !Number.isFinite(s.t)) throw new HttpError(400, "sample t must be epoch seconds");
+  const sample: ProbeSample = { seg: s.seg, kph: s.kph, t: Math.floor(s.t) };
+  if (s.lat !== undefined || s.lon !== undefined) {
+    const { lat, lon } = latLon(s.lat, s.lon);
+    sample.lat = lat;
+    sample.lon = lon;
+  }
+  return sample;
+}
+
+const WZDX_FETCH_TIMEOUT_MS = 30_000;
+
+/**
+ * Pulls every WZDx feed once and hands each known region the work zones
+ * inside its bounding box. A feed that fails to load is skipped, so its
+ * existing work zones stay until their own end time rather than vanishing.
+ */
+async function refreshWzdx(env: Env, now: number): Promise<void> {
+  const feeds = (env.WZDX_FEEDS ?? "")
+    .split(",")
+    .map((u) => u.trim())
+    .filter((u) => /^https?:\/\/\S+$/.test(u));
+  if (feeds.length === 0) return;
+  const registry = env.TRAFFIC.get(env.TRAFFIC.idFromName(REGISTRY_NAME));
+  const regions = await registry.listRegions(now);
+  if (regions.length === 0) return;
+  const targets = [];
+  for (const region of regions) {
+    const stub = env.TRAFFIC.get(env.TRAFFIC.idFromName(`traffic:${region}`));
+    const bbox = await stub.regionBBox(now);
+    // RPC hands the tuple back as a plain array.
+    if (bbox) targets.push({ region, stub, bbox: Array.from(bbox) as BBox });
+  }
+  if (targets.length === 0) return;
+
+  for (const feed of feeds) {
+    let doc: unknown;
+    try {
+      const res = await fetch(feed, {
+        headers: { accept: "application/geo+json, application/json" },
+        signal: AbortSignal.timeout(WZDX_FETCH_TIMEOUT_MS),
+      });
+      if (!res.ok) {
+        console.error(`wzdx: ${feed} answered ${res.status}`);
+        continue;
+      }
+      doc = await res.json();
+    } catch (e) {
+      console.error(`wzdx: ${feed} failed`, e);
+      continue;
+    }
+    const events = parseWzdx(feed, doc, now);
+    const feedKey = fnv1a(feed);
+    for (const t of targets) {
+      const inside = events.filter((e) => bboxContains(t.bbox, e.lat, e.lon));
+      try {
+        const result = await t.stub.ingestWzdx(feedKey, inside, now);
+        if (result.upserted > 0 || result.removed > 0) {
+          console.log(`wzdx: ${t.region} from ${feed}: ${result.upserted} current, ${result.removed} ended`);
+        }
+      } catch (e) {
+        console.error(`wzdx: delivering ${feed} to ${t.region} failed`, e);
+      }
+    }
+  }
 }
 
 const COIN_SYMBOL = "AC";

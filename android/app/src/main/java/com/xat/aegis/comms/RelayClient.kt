@@ -279,6 +279,43 @@ class RelayClient(
         }
     }
 
+    // ── Traffic ───────────────────────────────────────────────────────────
+    //
+    // The relay keeps one traffic store per map region (comms-worker Traffic
+    // object). Probes carry segment speeds only: no position and, on the relay,
+    // no sender number beyond rate limiting.
+
+    /** Posts up to 60 per-segment speed samples ({"seg","kph","t"}); returns the relay's reply ({"ok","accepted"}). */
+    fun trafficProbe(region: String, samples: JSONArray): JSONObject =
+        signed("POST", "/v1/traffic/probe", JSONObject().put("region", region).put("samples", samples))
+
+    /** Live segment speeds and current incidents for [region]: {"now","segments","incidents"}. */
+    fun trafficLive(region: String): JSONObject =
+        signed("GET", "/v1/traffic/live?region=${query(region)}")
+
+    /** Hour-of-week speed profiles for at most 500 segments: {"segments":{seg:{"h":[168]}}}. */
+    fun trafficTypical(region: String, segs: List<String>): JSONObject {
+        require(segs.size <= TRAFFIC_TYPICAL_MAX) { "At most $TRAFFIC_TYPICAL_MAX segments per request" }
+        return signed("GET", "/v1/traffic/typical?region=${query(region)}&segs=${query(segs.joinToString(","))}")
+    }
+
+    /** Reports an incident ("police", "crash", "hazard", "closure" or "jam"); returns {"incident"}. */
+    fun trafficReport(region: String, type: String, lat: Double, lon: Double, seg: String?): JSONObject {
+        val body = JSONObject()
+            .put("region", region)
+            .put("type", type)
+            .put("lat", lat)
+            .put("lon", lon)
+            .put("seg", seg ?: JSONObject.NULL)
+        return signed("POST", "/v1/traffic/report", body)
+    }
+
+    /** Confirms ([still] = true) or clears an incident; returns {"incident"}, null once it is removed. */
+    fun trafficVote(region: String, id: String, still: Boolean): JSONObject =
+        signed("POST", "/v1/traffic/report/vote", JSONObject().put("region", region).put("id", id).put("still", still))
+
+    private fun query(value: String): String = java.net.URLEncoder.encode(value, "UTF-8")
+
     /** Opens the live-delivery socket. The caller owns the returned socket. */
     fun openSocket(listener: WebSocketListener): WebSocket {
         // OkHttp runs no network interceptors for a WebSocket upgrade, so it is
@@ -420,6 +457,8 @@ class RelayClient(
         const val MALFORMED = -1
         /** Envelopes the relay returns per inbox fetch (Mailbox.inbox's limit). */
         const val INBOX_PAGE = 200
+        /** Segments per /v1/traffic/typical request (the relay's limit). */
+        const val TRAFFIC_TYPICAL_MAX = 500
         private const val CLOCK_WARN_MS = 30_000L
         /** The relay mints TURN credentials for 24 h and hands them out for at most 6 h. */
         private const val ICE_CACHE_MS = 5 * 60 * 60_000L

@@ -9,6 +9,10 @@
 #
 # Plain variables (may go in [vars] below):
 #   COIN_INITIAL_BALANCE AegisCoin every new registration starts with, e.g. "100"; unset: none
+#   WZDX_FEEDS           Optional, for navigation: comma-separated URLs of WZDx v4 GeoJSON
+#                        feeds (state DOT work-zone feeds). The cron below fetches them every
+#                        10 minutes and adds work zones as traffic incidents to every region
+#                        whose area (learned from positioned reports) contains them.
 
 name = "aegis-comms"
 main = "src/index.ts"
@@ -22,6 +26,17 @@ enabled = true
 name = "MAILBOX"
 class_name = "Mailbox"
 
+[[durable_objects.bindings]]
+name = "TRAFFIC"
+class_name = "Traffic"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Mailbox"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Traffic"]
+
+[triggers]
+crons = ["*/10 * * * *"]
