@@ -101,6 +101,10 @@ class Navigator(
         /** A fix this imprecise says nothing about whether the car left the route. */
         const val MAX_ACCURACY_FOR_OFF_ROUTE_M = 40f
         const val REROUTE_COOLDOWN_MS = 5_000L
+        /** Reroutes that do not get the car back on a route back off up to this long (parking lots, unmapped roads). */
+        const val REROUTE_MAX_COOLDOWN_MS = 60_000L
+        /** Probes stop this far from the destination, so the relay never sees where a trip ends. */
+        const val PROBE_END_ZONE_M = 500.0
         const val FASTER_CHECK_MS = 120_000L
         const val FASTER_SAVING_SEC = 180.0
         const val ARRIVED_M = 30.0
@@ -199,6 +203,8 @@ class Navigator(
     private var progressSeg = 0
     private var offCount = 0
     private var lastRerouteMs = 0L
+    /** Reroutes since the car was last on its route; each one doubles the cooldown before the next. */
+    private var reroutesOffRoute = 0
     /** Held while any route search for this session (reroute or faster-route check) runs. */
     private val searching = AtomicBoolean(false)
     /** True only while recovering from leaving the route, for display. */
@@ -415,7 +421,17 @@ class Navigator(
         val bearing = if (loc.hasBearing()) loc.bearing else null
         val hit = matcher.match(loc.latitude, loc.longitude, bearing, speed, loc.time)
         if (hit != null) {
-            probe.onMatched(graph.segmentKey(hit.edge), hit.fraction * graph.edgeLengthM(hit.edge), speed, loc.time)
+            // The segment's midpoint from the map, never the fix itself.
+            val a = graph.edgeFrom(hit.edge)
+            val b = graph.edgeTo(hit.edge)
+            probe.onMatched(
+                graph.segmentKey(hit.edge),
+                hit.fraction * graph.edgeLengthM(hit.edge),
+                speed,
+                loc.time,
+                (graph.nodeLat(a) + graph.nodeLat(b)) / 2,
+                (graph.nodeLon(a) + graph.nodeLon(b)) / 2,
+            )
         } else {
             probe.onMatched(null, 0.0, speed, loc.time)
         }
@@ -431,13 +447,16 @@ class Navigator(
                 if (!loc.hasAccuracy() || loc.accuracy <= MAX_ACCURACY_FOR_OFF_ROUTE_M) offCount++
             } else {
                 offCount = 0
+                reroutesOffRoute = 0
                 progressM = p.alongM
                 progressSeg = p.segment
             }
             val now = System.currentTimeMillis()
-            if (offCount >= OFF_ROUTE_FIXES && !rerouting && now - lastRerouteMs > REROUTE_COOLDOWN_MS) {
+            val cooldown = minOf(REROUTE_MAX_COOLDOWN_MS, REROUTE_COOLDOWN_MS shl minOf(reroutesOffRoute, 4))
+            if (offCount >= OFF_ROUTE_FIXES && !rerouting && now - lastRerouteMs > cooldown) {
                 reroute = true
             }
+            probe.nearDestination(t.total - progressM <= PROBE_END_ZONE_M)
             if (!off && t.total - progressM <= ARRIVED_M) {
                 arrived = true
                 return@withLock
@@ -672,6 +691,7 @@ class Navigator(
             try {
                 val (lat, lon, prof) = routeLock.withLock {
                     lastRerouteMs = System.currentTimeMillis()
+                    reroutesOffRoute++
                     Triple(destLat, destLon, profile)
                 }
                 val route = router.route(from.latitude, from.longitude, lat, lon, prof, nowSec())

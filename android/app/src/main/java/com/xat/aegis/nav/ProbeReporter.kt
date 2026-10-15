@@ -18,9 +18,12 @@ import java.io.IOException
 /**
  * Turns map-matched positions into anonymous per-segment speed samples for the relay.
  *
- * Only a segment key, a median speed and a time leave the phone, one sample per segment
- * traversed; positions never do. Nothing is collected or sent unless Drive navigation is
- * active, and stopping navigation discards whatever had not been sent.
+ * Only a segment key, the segment's own map position, a median speed and a time leave the
+ * phone, one sample per segment traversed (or per minute spent on one); GPS positions never do.
+ * Nothing is collected or sent unless Drive navigation is active, and stopping navigation
+ * discards whatever had not been sent. The first [PRIVACY_ZONE_M] driven and the last stretch
+ * before the destination (see [nearDestination]) are never reported, so the relay cannot learn
+ * where trips begin or end.
  */
 class ProbeReporter(context: Context, val region: String) {
 
@@ -35,12 +38,25 @@ class ProbeReporter(context: Context, val region: String) {
         const val MAX_KPH = 250.0
         /** A gap this long between fixes means the traversal was not observed continuously. */
         const val MAX_GAP_MS = 15_000L
+        /**
+         * A long stay on one segment is reported a minute at a time; otherwise a car stopped in
+         * a jam or behind a crash would say nothing until it moved on, too late for detection.
+         */
+        const val SLICE_MS = 60_000L
+        const val PRIVACY_ZONE_M = 500.0
     }
 
-    private class Sample(val seg: String, val kph: Double, val timeMs: Long)
+    private class Sample(val seg: String, val kph: Double, val timeMs: Long, val lat: Double, val lon: Double)
 
     /** The segment currently being driven and what was observed on it so far. */
-    private class Traversal(val seg: String, firstAlongM: Double, var lastTimeMs: Long) {
+    private class Traversal(
+        val seg: String,
+        firstAlongM: Double,
+        val startTimeMs: Long,
+        var lastTimeMs: Long,
+        val segLat: Double,
+        val segLon: Double,
+    ) {
         val speeds = ArrayList<Double>()
         var minAlongM = firstAlongM
         var maxAlongM = firstAlongM
@@ -55,6 +71,20 @@ class ProbeReporter(context: Context, val region: String) {
     @Volatile private var active = false
     private var flushJob: Job? = null
     private var scope: CoroutineScope? = null
+    /** Distance observed since [start]; nothing is reported until it passes [PRIVACY_ZONE_M]. */
+    private var drivenM = 0.0
+    @Volatile private var suppressed = false
+
+    /**
+     * Set by navigation once the destination is near: from then on nothing more is reported, and
+     * the segment being driven is dropped rather than finished.
+     */
+    fun nearDestination(near: Boolean) {
+        synchronized(lock) {
+            if (near && !suppressed) current = null
+            suppressed = near
+        }
+    }
 
     /** Begins collecting; samples are posted every minute, or sooner once 60 are waiting. */
     fun start(scope: CoroutineScope) {
@@ -64,6 +94,8 @@ class ProbeReporter(context: Context, val region: String) {
             this.scope = scope
             current = null
             pending.clear()
+            drivenM = 0.0
+            suppressed = false
             flushJob = scope.launch(Dispatchers.IO) {
                 while (isActive) {
                     delay(FLUSH_INTERVAL_MS)
@@ -89,18 +121,20 @@ class ProbeReporter(context: Context, val region: String) {
      * One matched fix. [segmentKey] is null when the fix matched no road, which ends the current
      * traversal. [alongM] is the distance from the start of the matched edge, used to tell how
      * much of the segment was actually observed. [speedMps] null means the GPS gave no speed.
+     * [segLat]/[segLon] locate the segment on the map (not the car), so the relay can place
+     * incidents it detects there.
      */
-    fun onMatched(segmentKey: String?, alongM: Double, speedMps: Float?, timeMs: Long) {
+    fun onMatched(segmentKey: String?, alongM: Double, speedMps: Float?, timeMs: Long, segLat: Double = Double.NaN, segLon: Double = Double.NaN) {
         var batchFull = false
         synchronized(lock) {
-            if (!active) return
+            if (!active || suppressed) return
             val cur = current
-            if (cur != null && (cur.seg != segmentKey || timeMs - cur.lastTimeMs > MAX_GAP_MS)) {
+            if (cur != null && (cur.seg != segmentKey || timeMs - cur.lastTimeMs > MAX_GAP_MS || timeMs - cur.startTimeMs >= SLICE_MS)) {
                 finish(cur)
                 current = null
             }
             if (segmentKey == null) return
-            val t = current ?: Traversal(segmentKey, alongM, timeMs).also { current = it }
+            val t = current ?: Traversal(segmentKey, alongM, timeMs, timeMs, segLat, segLon).also { current = it }
             t.lastTimeMs = timeMs
             t.minAlongM = minOf(t.minAlongM, alongM)
             t.maxAlongM = maxOf(t.maxAlongM, alongM)
@@ -112,13 +146,16 @@ class ProbeReporter(context: Context, val region: String) {
     }
 
     private fun finish(t: Traversal) {
+        val coveredM = t.maxAlongM - t.minAlongM
+        drivenM += coveredM
+        if (drivenM < PRIVACY_ZONE_M) return
         // A segment where the GPS lost its speed even once is not reported: its median would
         // describe only part of the drive.
         if (t.speedUnknown || t.speeds.isEmpty()) return
-        if (t.speeds.size < MIN_FIXES && t.maxAlongM - t.minAlongM < MIN_COVERED_M) return
+        if (t.speeds.size < MIN_FIXES && coveredM < MIN_COVERED_M) return
         val kph = median(t.speeds)
         if (kph < 0 || kph > MAX_KPH) return
-        pending.add(Sample(t.seg, kph, t.lastTimeMs))
+        pending.add(Sample(t.seg, kph, t.lastTimeMs, t.segLat, t.segLon))
     }
 
     private fun median(values: List<Double>): Double {
@@ -147,13 +184,15 @@ class ProbeReporter(context: Context, val region: String) {
                 val clockOffsetMs = relay.relayNow() - System.currentTimeMillis()
                 val arr = JSONArray()
                 for (s in batch) {
-                    arr.put(
-                        JSONObject()
-                            .put("seg", s.seg)
-                            .put("kph", Math.round(s.kph * 10) / 10.0)
-                            // The relay checks freshness against its own clock, not this phone's.
-                            .put("t", (s.timeMs + clockOffsetMs) / 1000)
-                    )
+                    val o = JSONObject()
+                        .put("seg", s.seg)
+                        .put("kph", Math.round(s.kph * 10) / 10.0)
+                        // The relay checks freshness against its own clock, not this phone's.
+                        .put("t", (s.timeMs + clockOffsetMs) / 1000)
+                    if (!s.lat.isNaN() && !s.lon.isNaN()) {
+                        o.put("lat", Math.round(s.lat * 1e5) / 1e5).put("lon", Math.round(s.lon * 1e5) / 1e5)
+                    }
+                    arr.put(o)
                 }
                 try {
                     relay.trafficProbe(region, arr)

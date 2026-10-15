@@ -18,6 +18,7 @@ import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
@@ -54,8 +55,13 @@ class GraphStore(context: Context) {
 
     companion object {
         private const val RELEASE_BASE = "https://github.com/jakes1345/Aegis/releases/download"
-        private const val HEADER_BYTES = 64
+        private const val HEADER_BYTES = 128
+        private const val GRAPH_VERSION = 2
+        private val SHA256_RE = Regex("^[0-9a-fA-F]{64}$")
         private const val PROGRESS_STEP_BYTES = 256 * 1024L
+        /** RoadGraph maps the whole file into one buffer, so nothing larger can ever open. */
+        private const val MAX_GRAPH_BYTES = Int.MAX_VALUE.toLong()
+        private val SLUG_RE = Regex("^[a-z0-9][a-z0-9-]{0,63}$")
 
         fun slugOf(path: String): String = path.trim('/').replace('/', '-')
 
@@ -93,14 +99,18 @@ class GraphStore(context: Context) {
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true) // release assets redirect to GitHub's object storage
+        .followSslRedirects(false) // never follow an https -> http downgrade
         .build()
 
     private val _progress = MutableStateFlow<GraphDownload>(GraphDownload.Idle)
     val progress: StateFlow<GraphDownload> = _progress.asStateFlow()
 
-    fun fileFor(slug: String): File = File(dir, "$slug.agr")
+    fun fileFor(slug: String): File {
+        require(SLUG_RE.matches(slug)) { "Not a map region: $slug" }
+        return File(dir, "$slug.agr")
+    }
 
-    fun isInstalled(slug: String): Boolean = fileFor(slug).isFile
+    fun isInstalled(slug: String): Boolean = SLUG_RE.matches(slug) && fileFor(slug).isFile
 
     /** Opens an installed region's graph. */
     fun open(slug: String): RoadGraph = RoadGraph.open(fileFor(slug))
@@ -120,6 +130,8 @@ class GraphStore(context: Context) {
             val h = ByteArray(HEADER_BYTES)
             raf.readFully(h)
             if (h[0] != 'A'.code.toByte() || h[1] != 'G'.code.toByte() || h[2] != 'R'.code.toByte() || h[3] != '1'.code.toByte()) return null
+            // A graph in an older format would fail to open, so it does not count as installed.
+            if ((h[4].toInt() and 0xFF) != GRAPH_VERSION || h[5].toInt() != 0 || h[6].toInt() != 0 || h[7].toInt() != 0) return null
             var v = 0L
             for (i in 7 downTo 0) v = (v shl 8) or (h[40 + i].toLong() and 0xFF)
             v
@@ -130,6 +142,7 @@ class GraphStore(context: Context) {
 
     /** Removes a region's graph and anything left over from an unfinished download of it. */
     fun delete(slug: String): Boolean {
+        if (!SLUG_RE.matches(slug)) return false
         File(dir, "$slug.agr.gz.part").delete()
         File(dir, "$slug.agr.tmp").delete()
         val f = fileFor(slug)
@@ -143,13 +156,16 @@ class GraphStore(context: Context) {
     suspend fun download(region: MapRegion): Result<File> = download(region.slug)
 
     suspend fun download(slug: String): Result<File> = withContext(Dispatchers.IO) {
+        if (!SLUG_RE.matches(slug)) return@withContext Result.failure(IllegalArgumentException("Not a map region: $slug"))
         dir.mkdirs()
         val part = File(dir, "$slug.agr.gz.part")
         val tmp = File(dir, "$slug.agr.tmp")
         val target = fileFor(slug)
         try {
             _progress.value = GraphDownload.Downloading(slug, 0, null)
-            fetch(downloadUrl(slug), part, slug)
+            val expected = fetchChecksum(downloadUrl(slug) + ".sha256")
+            val actual = fetch(downloadUrl(slug), part, slug)
+            if (!actual.equals(expected, ignoreCase = true)) throw IOException("The map download failed its checksum")
             currentCoroutineContext().ensureActive()
             _progress.value = GraphDownload.Installing(slug)
             gunzip(part, tmp)
@@ -159,7 +175,7 @@ class GraphStore(context: Context) {
             } catch (e: Exception) {
                 throw IOException("The downloaded map is not a valid road graph: ${e.message}")
             }
-            if (graph.region.isEmpty() || !slug.startsWith(graph.region)) {
+            if (graph.region != slug) {
                 throw IOException("The downloaded map is for ${graph.region}, not $slug")
             }
             Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
@@ -176,20 +192,41 @@ class GraphStore(context: Context) {
         }
     }
 
-    private suspend fun fetch(url: String, out: File, slug: String) {
+    private suspend fun execute(url: String): Response {
         val call = http.newCall(Request.Builder().url(url).header("Accept", "application/octet-stream").build())
-        val response = suspendCancellableCoroutine<Response> { cont ->
+        return suspendCancellableCoroutine { cont ->
             cont.invokeOnCancellation { call.cancel() }
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) { cont.resumeWithException(e) }
-                override fun onResponse(call: Call, response: Response) { cont.resume(response) }
+                // A response that arrives after cancellation must still be closed, or its connection leaks.
+                override fun onResponse(call: Call, response: Response) { cont.resume(response) { response.close() } }
             })
         }
-        response.use { res ->
+    }
+
+    private suspend fun fetchChecksum(url: String): String {
+        execute(url).use { res ->
+            if (res.code == 404) throw IOException("No map has been published for this region yet")
+            if (!res.isSuccessful) throw IOException("Map checksum download failed: HTTP ${res.code}")
+            val body = res.body ?: throw IOException("Map checksum download returned no data")
+            val source = body.source()
+            source.request(256)
+            val text = source.buffer.readUtf8(minOf(256L, source.buffer.size))
+            val hex = text.trim().substringBefore(' ')
+            if (!SHA256_RE.matches(hex)) throw IOException("The published map checksum is malformed")
+            return hex
+        }
+    }
+
+    /** Streams [url] into [out] and returns the SHA-256 of the bytes written, in hex. */
+    private suspend fun fetch(url: String, out: File, slug: String): String {
+        val sha = MessageDigest.getInstance("SHA-256")
+        execute(url).use { res ->
             if (res.code == 404) throw IOException("No map has been published for $slug yet")
             if (!res.isSuccessful) throw IOException("Map download failed: HTTP ${res.code}")
             val body = res.body ?: throw IOException("Map download returned no data")
             val total = body.contentLength().takeIf { it > 0 }
+            if (total != null && total > MAX_GRAPH_BYTES) throw IOException("The map download is too large")
             val ctx = currentCoroutineContext()
             body.byteStream().use { input ->
                 out.outputStream().buffered().use { output ->
@@ -201,7 +238,9 @@ class GraphStore(context: Context) {
                         val n = input.read(buf)
                         if (n < 0) break
                         output.write(buf, 0, n)
+                        sha.update(buf, 0, n)
                         done += n
+                        if (done > MAX_GRAPH_BYTES) throw IOException("The map download is too large")
                         if (done - reported >= PROGRESS_STEP_BYTES) {
                             reported = done
                             _progress.value = GraphDownload.Downloading(slug, done, total)
@@ -212,6 +251,7 @@ class GraphStore(context: Context) {
                 }
             }
         }
+        return sha.digest().joinToString("") { "%02x".format(it) }
     }
 
     private suspend fun gunzip(src: File, dst: File) {
@@ -219,10 +259,14 @@ class GraphStore(context: Context) {
         GZIPInputStream(src.inputStream().buffered(), 64 * 1024).use { input ->
             dst.outputStream().buffered().use { output ->
                 val buf = ByteArray(64 * 1024)
+                var done = 0L
                 while (true) {
                     ctx.ensureActive()
                     val n = input.read(buf)
                     if (n < 0) break
+                    done += n
+                    // Bounds what a corrupt or hostile archive can write to disk.
+                    if (done > MAX_GRAPH_BYTES) throw IOException("The downloaded map is too large to open")
                     output.write(buf, 0, n)
                 }
             }

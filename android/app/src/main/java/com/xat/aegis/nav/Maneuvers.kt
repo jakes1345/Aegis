@@ -44,9 +44,15 @@ object Maneuvers {
             val dist = cum[idx]
 
             val others = ArrayList<Double>()
+            // A rival carriageway (not a ramp) splitting off close to straight ahead: a real fork.
+            var highwayFork = false
             for (o in graph.firstEdge(node) until graph.lastEdgeExclusive(node)) {
                 if (o == cur || graph.isReverseOf(prev, prevFrom, o)) continue
-                others.add(RoadGeo.deltaDeg(inB, graph.startBearing(o, node)))
+                val d = RoadGeo.deltaDeg(inB, graph.startBearing(o, node))
+                others.add(d)
+                if (graph.edgeRoadClass(o) <= 1 && graph.edgeFlags(o) and EdgeFlags.LINK == 0 && abs(d) <= SLIGHT_DEG) {
+                    highwayFork = true
+                }
             }
 
             if (curFlags and EdgeFlags.ROUNDABOUT != 0 && prevFlags and EdgeFlags.ROUNDABOUT == 0) {
@@ -102,8 +108,10 @@ object Maneuvers {
                 }
                 prevLink && !curLink && curHighway ->
                     Maneuver(ManeuverType.MERGE, idx, dist, curName, null, if (curName != null) "Merge onto $curName" else "Merge")
-                others.isNotEmpty() && ((prevLink && curLink) || (prevHighway && curHighway && !prevLink && !curLink &&
-                    others.any { abs(it) < TURN_DEG })) -> {
+                // Driving past an exit ramp or a side road is not a fork; only a split into two
+                // carriageways is, or else every interchange would say "Keep left".
+                others.isNotEmpty() && ((prevLink && curLink) ||
+                    (prevHighway && curHighway && !prevLink && !curLink && highwayFork)) -> {
                     val type = if (sideRight) ManeuverType.KEEP_RIGHT else ManeuverType.KEEP_LEFT
                     if (curLink) {
                         val toward = towardName(graph, edges, i)
@@ -127,8 +135,13 @@ object Maneuvers {
         graph: RoadGraph, prev: Int, prevFrom: Int, cur: Int, delta: Double, others: List<Double>,
         prevName: String?, curName: String?, idx: Int, dist: Double,
     ): Maneuver? {
-        val uturn = graph.isReverseOf(prev, prevFrom, cur) || abs(delta) > UTURN_DEG
-        val type = if (uturn) ManeuverType.UTURN else classify(delta)
+        // A hairpin with no other way on is a bend in the road, not a U-turn the driver chooses.
+        val uturn = graph.isReverseOf(prev, prevFrom, cur) || (abs(delta) > UTURN_DEG && others.isNotEmpty())
+        val type = when {
+            uturn -> ManeuverType.UTURN
+            abs(delta) > UTURN_DEG -> if (delta > 0) ManeuverType.SHARP_RIGHT else ManeuverType.SHARP_LEFT
+            else -> classify(delta)
+        }
         val renamed = curName != null && curName != prevName
         if (type == ManeuverType.STRAIGHT) {
             return if (renamed) Maneuver(type, idx, dist, curName, null, "Continue onto $curName") else null

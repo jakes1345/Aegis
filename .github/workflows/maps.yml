@@ -26,7 +26,8 @@ jobs:
         env:
           REGION: ${{ github.event.inputs.region }}
         run: |
-          if ! printf '%s' "$REGION" | grep -Eq '^[a-z0-9-]+(/[a-z0-9-]+)*$'; then
+          # Matched in bash, not grep: grep tests each line, so a value with a newline would pass.
+          if [[ ! "$REGION" =~ ^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*$ ]]; then
             echo "::error::region must look like north-america/us/ohio (got '$REGION')"
             exit 1
           fi
@@ -77,6 +78,7 @@ jobs:
           read -r version nodes edges shape <<< "$(od -An -tu4 -j4 -N16 "$agr")"
           raw=$(stat -c %s "$agr")
           gzip -9 -f "$agr"
+          (cd dist && sha256sum "graph-$SLUG.agr.gz" > "graph-$SLUG.agr.gz.sha256")
           size=$(stat -c %s "$file")
           echo "AGR version $version: $nodes nodes, $edges edges, $shape shape points"
           echo "uncompressed $raw bytes, compressed $size bytes"
@@ -100,6 +102,8 @@ jobs:
           body: |
             AGR1 road graph for `${{ steps.region.outputs.region }}`, built from the Geofabrik extract
             by run ${{ github.run_id }} of ${{ github.sha }}. Map data (c) OpenStreetMap contributors, ODbL.
-          files: dist/graph-${{ steps.region.outputs.slug }}.agr.gz
+          files: |
+            dist/graph-${{ steps.region.outputs.slug }}.agr.gz
+            dist/graph-${{ steps.region.outputs.slug }}.agr.gz.sha256
           overwrite_files: true
           make_latest: false

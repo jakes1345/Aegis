@@ -133,6 +133,22 @@ test("no detection with one sender, slow roads, or old samples", () => {
   assert.equal(detectStoppage("7:1", late, 100, NOW), "jam");
 });
 
+test("senders that drove off again do not count as stopped", () => {
+  // Two cars wait at a red light, then one of them pulls away onto the next segment.
+  const light = [
+    { seg: "7:1", sender: "a", kph: 70, t: NOW - 100 },
+    { seg: "7:1", sender: "b", kph: 70, t: NOW - 100 },
+    { seg: "7:1", sender: "a", kph: 2, t: NOW - 60 },
+    { seg: "7:1", sender: "b", kph: 2, t: NOW - 60 },
+    { seg: "8:1", sender: "a", kph: 45, t: NOW - 10 },
+  ];
+  assert.equal(detectStoppage("7:1", light, 100, NOW), null);
+  light.push({ seg: "8:1", sender: "b", kph: 1, t: NOW - 5 });
+  assert.equal(detectStoppage("7:1", light, 100, NOW), null, "b is still slow but a has gone");
+  light.push({ seg: "7:1", sender: "c", kph: 0, t: NOW - 5 });
+  assert.equal(detectStoppage("7:1", light, 100, NOW), "jam");
+});
+
 test("line midpoint is halfway along the length", () => {
   const mid = lineMidpoint([
     [-83, 40],

@@ -71,7 +71,11 @@ export default {
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(refreshWzdx(env, Math.floor(controller.scheduledTime / 1000)));
+    ctx.waitUntil(
+      refreshWzdx(env, Math.floor(controller.scheduledTime / 1000)).catch((e) => {
+        console.error("wzdx: refresh failed", e);
+      }),
+    );
   },
 } satisfies ExportedHandler<Env>;
 
@@ -418,6 +422,8 @@ function probeSample(raw: unknown): ProbeSample {
 }
 
 const WZDX_FETCH_TIMEOUT_MS = 30_000;
+/** Regions are created by any signed-in phone; the cron serves only the most recently active ones. */
+const WZDX_MAX_REGIONS = 200;
 
 /**
  * Pulls every WZDx feed once and hands each known region the work zones
@@ -431,14 +437,21 @@ async function refreshWzdx(env: Env, now: number): Promise<void> {
     .filter((u) => /^https?:\/\/\S+$/.test(u));
   if (feeds.length === 0) return;
   const registry = env.TRAFFIC.get(env.TRAFFIC.idFromName(REGISTRY_NAME));
-  const regions = await registry.listRegions(now);
+  const regions = await registry.listRegions(now, WZDX_MAX_REGIONS);
   if (regions.length === 0) return;
   const targets = [];
   for (const region of regions) {
+    // The registry only ever holds names that passed REGION_RE, but it is re-checked before naming an object.
+    if (!REGION_RE.test(region)) continue;
     const stub = env.TRAFFIC.get(env.TRAFFIC.idFromName(`traffic:${region}`));
-    const bbox = await stub.regionBBox(now);
-    // RPC hands the tuple back as a plain array.
-    if (bbox) targets.push({ region, stub, bbox: Array.from(bbox) as BBox });
+    try {
+      const bbox = await stub.regionBBox(now);
+      // RPC hands the tuple back as a plain array.
+      if (bbox) targets.push({ region, stub, bbox: Array.from(bbox) as BBox });
+    } catch (e) {
+      // One unreachable region must not cost every other region its work zones.
+      console.error(`wzdx: area of ${region} unavailable`, e);
+    }
   }
   if (targets.length === 0) return;
 
@@ -458,7 +471,13 @@ async function refreshWzdx(env: Env, now: number): Promise<void> {
       console.error(`wzdx: ${feed} failed`, e);
       continue;
     }
-    const events = parseWzdx(feed, doc, now);
+    let events;
+    try {
+      events = parseWzdx(feed, doc, now);
+    } catch (e) {
+      console.error(`wzdx: ${feed} unparseable`, e);
+      continue;
+    }
     const feedKey = fnv1a(feed);
     for (const t of targets) {
       const inside = events.filter((e) => bboxContains(t.bbox, e.lat, e.lon));

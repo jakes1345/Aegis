@@ -18,12 +18,15 @@ import numpy as np
 import osmium
 
 MAGIC = b"AGR1"
-VERSION = 1
-HEADER_SIZE = 64
+VERSION = 2
+HEADER_SIZE = 128
+REGION_BYTES = 64
 UNNAMED = 0xFFFFFFFF
 MAX_SHAPE = 0xFFFF
 UNDEFINED_COORD = 2147483647  # libosmium's Location::undefined_coordinate
 EARTH_RADIUS_M = 6371008.8
+# The phone memory-maps the file into a single ByteBuffer, which Java caps at Integer.MAX_VALUE.
+MAX_FILE_BYTES = 0x7FFFFFFF
 CHUNK = 1 << 22  # elements per vectorised batch; bounds temporary arrays on state-sized inputs
 
 FLAG_TOLL = 1
@@ -597,8 +600,8 @@ def build(store: WayStore, region: str, built_at: int, out_path: str) -> dict:
             fh.write(struct.pack("<H", len(raw)))
             fh.write(raw)
 
-        slug = region.encode("ascii")[:16].ljust(16, b"\0")
-        header = struct.pack("<4sIIIII iiii Q 16s", MAGIC, VERSION, node_count, edge_count,
+        slug = region.encode("ascii").ljust(REGION_BYTES, b"\0")
+        header = struct.pack("<4sIIIII iiii Q 64s 16x", MAGIC, VERSION, node_count, edge_count,
                              shape_total, len(names), lat_min, lon_min, lat_max, lon_max,
                              built_at, slug)
         assert len(header) == HEADER_SIZE
@@ -606,6 +609,8 @@ def build(store: WayStore, region: str, built_at: int, out_path: str) -> dict:
         fh.write(header)
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
+    if size > MAX_FILE_BYTES:
+        raise SystemExit(f"graph is {size} bytes; the phone cannot map more than {MAX_FILE_BYTES}")
 
     return {
         "nodes": node_count,
@@ -638,9 +643,8 @@ def main(argv: list[str] | None = None) -> int:
         args.region.encode("ascii")
     except UnicodeEncodeError:
         ap.error("--region must be ASCII")
-    if len(args.region) > 16:
-        print(f"note: region slug '{args.region}' is stored truncated to 16 bytes in the header",
-              file=sys.stderr)
+    if len(args.region) > REGION_BYTES:
+        ap.error(f"--region is longer than {REGION_BYTES} characters")
 
     t0 = time.time()
     store = read_osm(args.input, args.index)

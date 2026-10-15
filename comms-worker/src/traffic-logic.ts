@@ -138,9 +138,12 @@ export function bucketMedians(rows: readonly ProbeRow[]): Array<{ bucket: number
 /**
  * Stoppage on `seg`: at least two distinct senders under STOP_KPH there in the
  * last five minutes, on a road that normally flows at DETECT_MIN_REF_KPH or
- * more. It is a crash rather than a jam when at least two of them were doing
- * more than SUDDEN_FROM_KPH (on any segment) in the two minutes before they
- * stopped. `history` must hold those senders' recent samples on every segment.
+ * more. A sender whose latest sample (on any segment) is no longer slow has
+ * moved on, so it does not count: two cars that waited at a red light and then
+ * drove off are not a jam. It is a crash rather than a jam when at least two of
+ * the stopped senders were doing more than SUDDEN_FROM_KPH (on any segment) in
+ * the two minutes before they stopped. `history` must hold those senders'
+ * recent samples on every segment.
  */
 export function detectStoppage(seg: string, history: readonly ProbeRow[], typicalKph: number | null, now: number): "crash" | "jam" | null {
   const ref = typicalKph ?? DEFAULT_REF_KPH;
@@ -151,6 +154,14 @@ export function detectStoppage(seg: string, history: readonly ProbeRow[], typica
     const prev = firstSlow.get(r.sender);
     if (prev === undefined || r.t < prev) firstSlow.set(r.sender, r.t);
   }
+  if (firstSlow.size < DETECT_MIN_SENDERS) return null;
+  const latest = new Map<string, ProbeRow>();
+  for (const r of history) {
+    if (!firstSlow.has(r.sender) || r.t > now + 60) continue;
+    const prev = latest.get(r.sender);
+    if (!prev || r.t > prev.t || (r.t === prev.t && r.kph > prev.kph)) latest.set(r.sender, r);
+  }
+  for (const [sender, r] of latest) if (r.kph >= STOP_KPH) firstSlow.delete(sender);
   if (firstSlow.size < DETECT_MIN_SENDERS) return null;
   let sudden = 0;
   for (const [sender, slowT] of firstSlow) {

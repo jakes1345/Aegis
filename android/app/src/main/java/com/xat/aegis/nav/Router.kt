@@ -118,8 +118,9 @@ class Router(
 
     private fun lookupKph(e: Int, elapsedSec: Double): Double {
         val key = graph.segmentKey(e)
-        val kph = speeds.liveKph(key)
-            ?: speeds.typicalKph(key, departEpochSec + elapsedSec.toLong())
+        // A NaN would survive coerceIn and poison every cost compared against it.
+        val kph = speeds.liveKph(key)?.takeUnless { it.isNaN() }
+            ?: speeds.typicalKph(key, departEpochSec + elapsedSec.toLong())?.takeUnless { it.isNaN() }
             ?: freeFlowKph(e)
         // Capped at the heuristic's speed so the A* bound stays admissible.
         return kph.coerceIn(MIN_KPH, MAX_KPH)
@@ -168,13 +169,14 @@ class Router(
     private fun turnSeconds(eIn: Int, inFrom: Int, eOut: Int): Double {
         val node = graph.edgeTo(eIn)
         if (graph.isReverseOf(eIn, inFrom, eOut)) return UTURN_SEC
-        val delta = RoadGeo.deltaDeg(graph.endBearing(eIn, inFrom), graph.startBearing(eOut, node))
-        if (abs(delta) > 170) return UTURN_SEC
         var options = 0
         for (o in graph.firstEdge(node) until graph.lastEdgeExclusive(node)) {
             if (!graph.isReverseOf(eIn, inFrom, o)) options++
         }
+        // Checked before the angle: a hairpin where one way hands over to the next is still a bend.
         if (options <= 1) return 0.0
+        val delta = RoadGeo.deltaDeg(graph.endBearing(eIn, inFrom), graph.startBearing(eOut, node))
+        if (abs(delta) > 170) return UTURN_SEC
         return when {
             delta < -30 -> LEFT_SEC
             delta > 30 -> RIGHT_SEC

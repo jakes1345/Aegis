@@ -60,8 +60,8 @@ def parse_agr(data: bytes) -> dict:
     magic, version, nn, ne, ns, nnames = struct.unpack_from("<4sIIIII", data, 0)
     bbox = struct.unpack_from("<iiii", data, 24)
     built_at, = struct.unpack_from("<Q", data, 40)
-    region = data[48:64].rstrip(b"\0").decode("ascii")
-    off = 64
+    region = data[48:112].rstrip(b"\0").decode("ascii")
+    off = 128
     nodes = [struct.unpack_from("<ii", data, off + 8 * i) for i in range(nn)]
     off += 8 * nn
     first = list(struct.unpack_from(f"<{nn + 1}I", data, off))
@@ -129,7 +129,7 @@ def shape_osm_ids(g, e):
 
 def test_header(graph):
     assert graph["magic"] == b"AGR1"
-    assert graph["version"] == 1
+    assert graph["version"] == 2
     assert graph["region"] == "test-region"
     assert graph["built_at"] == 1760000000
     assert graph["bbox"] == (e7(39.998), e7(-83.000), e7(40.001), e7(-82.997))
@@ -257,3 +257,38 @@ def test_largest_scc_deep_chain():
     first = list(range(n + 1))
     to = [(i + 1) % n for i in range(n)]
     assert len(build_graph.largest_scc(n, first, to)) == n
+
+
+def test_graph_too_large_for_the_phone_is_refused(tmp_path, monkeypatch):
+    # The phone maps the whole file into one ByteBuffer (max 2^31-1 bytes); a bigger graph must
+    # fail at build time instead of being published and then rejected on every phone.
+    osm = tmp_path / "big.osm"
+    out = tmp_path / "big.agr"
+    write_osm(osm)
+    monkeypatch.setattr(build_graph, "MAX_FILE_BYTES", 100)
+    with pytest.raises(SystemExit):
+        build_graph.main([str(osm), str(out), "--region", "x"])
+    assert not out.exists()
+    assert not (tmp_path / "big.agr.tmp").exists()
+
+
+def test_full_region_name_is_stored(tmp_path):
+    osm = tmp_path / "r.osm"
+    out = tmp_path / "r.agr"
+    osm.write_text(
+        '<?xml version="1.0"?><osm version="0.6">'
+        '<node id="1" lat="40.0" lon="-83.0"/><node id="2" lat="40.0" lon="-83.001"/>'
+        '<way id="9"><nd ref="1"/><nd ref="2"/><tag k="highway" v="residential"/></way>'
+        '</osm>', encoding="utf-8")
+    slug = "north-america-us-north-carolina"
+    assert build_graph.main([str(osm), str(out), "--region", slug]) == 0
+    data = out.read_bytes()
+    assert struct.unpack_from("<I", data, 4)[0] == 2
+    assert parse_agr(data)["region"] == slug
+
+
+def test_region_longer_than_header_is_refused(tmp_path):
+    osm = tmp_path / "r.osm"
+    osm.write_text('<?xml version="1.0"?><osm version="0.6"></osm>', encoding="utf-8")
+    with pytest.raises(SystemExit):
+        build_graph.main([str(osm), str(tmp_path / "r.agr"), "--region", "a" * 65])

@@ -80,16 +80,16 @@ object TestCity {
         }
         val all = nodes + shapePoints
         val nameBytes = names.map { it.toByteArray(Charsets.UTF_8) }
-        val size = 64 + nodes.size * 8 + (nodes.size + 1) * 4 + edges.size * 32 + shapePoints.size * 8 +
+        val size = 128 + nodes.size * 8 + (nodes.size + 1) * 4 + edges.size * 32 + shapePoints.size * 8 +
             nameBytes.sumOf { 2 + it.size }
         val b = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
         b.put("AGR1".toByteArray(Charsets.US_ASCII))
-        b.putInt(1); b.putInt(nodes.size); b.putInt(edges.size); b.putInt(shapePoints.size); b.putInt(names.size)
+        b.putInt(2); b.putInt(nodes.size); b.putInt(edges.size); b.putInt(shapePoints.size); b.putInt(names.size)
         b.putInt(e7(all.minOf { it.lat })); b.putInt(e7(all.minOf { it.lon }))
         b.putInt(e7(all.maxOf { it.lat })); b.putInt(e7(all.maxOf { it.lon }))
         b.putLong(1_760_000_000L)
         val slug = "test-city".toByteArray(Charsets.US_ASCII)
-        b.put(slug); repeat(16 - slug.size) { b.put(0) }
+        b.put(slug); repeat(80 - slug.size) { b.put(0) }
         for (n in nodes) { b.putInt(e7(n.lat)); b.putInt(e7(n.lon)) }
         var offset = 0
         for (n in nodes.indices) {

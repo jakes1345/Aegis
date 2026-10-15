@@ -147,7 +147,8 @@ class Geocoder(context: Context) {
             cont.invokeOnCancellation { call.cancel() }
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) { cont.resumeWithException(e) }
-                override fun onResponse(call: Call, response: Response) { cont.resume(response) }
+                // A response that arrives after cancellation must still be closed, or its connection leaks.
+                override fun onResponse(call: Call, response: Response) { cont.resume(response) { response.close() } }
             })
         }
         return response.use { res ->

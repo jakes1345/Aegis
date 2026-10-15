@@ -42,7 +42,7 @@ class RoadGraph private constructor(
     private val shapeOff = edgesOff + edgeCount * EDGE_BYTES
 
     companion object {
-        private const val HEADER_BYTES = 64
+        private const val HEADER_BYTES = 128
         private const val EDGE_BYTES = 32
         private const val NO_NAME = -1 // 0xFFFFFFFF read as a signed Int
         private const val TARGET_CELL_M = 250.0
@@ -59,7 +59,7 @@ class RoadGraph private constructor(
             val magic = ByteArray(4).also { for (i in 0 until 4) it[i] = buf.get(i) }
             if (String(magic, Charsets.US_ASCII) != "AGR1") throw IOException("${file.name} is not an AGR1 road graph")
             val version = buf.getInt(4)
-            if (version != 1) throw IOException("Unsupported road graph version $version")
+            if (version != 2) throw IOException("Unsupported road graph version $version")
             val nodeCount = buf.getInt(8)
             val edgeCount = buf.getInt(12)
             val shapeCount = buf.getInt(16)
@@ -81,8 +81,8 @@ class RoadGraph private constructor(
                 if (p > size) throw IOException("Road graph name table is truncated")
             }
 
-            val regionBytes = ByteArray(16).also { for (i in 0 until 16) it[i] = buf.get(48 + i) }
-            val regionLen = regionBytes.indexOfFirst { it.toInt() == 0 }.let { if (it < 0) 16 else it }
+            val regionBytes = ByteArray(64).also { for (i in 0 until 64) it[i] = buf.get(48 + i) }
+            val regionLen = regionBytes.indexOfFirst { it.toInt() == 0 }.let { if (it < 0) 64 else it }
             val g = RoadGraph(
                 buf = buf,
                 region = String(regionBytes, 0, regionLen, Charsets.US_ASCII),
@@ -214,8 +214,14 @@ class RoadGraph private constructor(
         return RoadGeo.bearingDeg(pLat, pLon, nodeLat(to), nodeLon(to))
     }
 
-    /** True when [b] runs back along [a]: the U-turn twin on a two-way way. */
-    internal fun isReverseOf(a: Int, aFrom: Int, b: Int): Boolean = edgeTo(b) == aFrom && edgeWayId(b) == edgeWayId(a)
+    /**
+     * True when [b] runs back along [a]: the U-turn twin on a two-way way. The twin always has the
+     * opposite direction bit; without that check, carrying on around a closed way that has only two
+     * graph nodes (a small roundabout, a loop at the end of a cul-de-sac) looks like a U-turn.
+     */
+    internal fun isReverseOf(a: Int, aFrom: Int, b: Int): Boolean =
+        edgeTo(b) == aFrom && edgeWayId(b) == edgeWayId(a) &&
+            (edgeFlags(a) xor edgeFlags(b)) and EdgeFlags.FORWARD != 0
 
     // ── Spatial index ────────────────────────────────────────────────────────
 

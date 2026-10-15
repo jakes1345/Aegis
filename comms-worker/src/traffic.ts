@@ -350,9 +350,13 @@ export class Traffic extends DurableObject<Env> {
     );
   }
 
-  listRegions(now: number): string[] {
+  /** The most recently active regions, at most `limit` of them (any signed-in phone can name a new region). */
+  listRegions(now: number, limit: number): string[] {
     this.sql.exec("DELETE FROM regions WHERE last_seen < ?", now - REGION_FORGET_SEC);
-    return this.sql.exec<{ name: string }>("SELECT name FROM regions ORDER BY name").toArray().map((r) => r.name);
+    return this.sql
+      .exec<{ name: string }>("SELECT name FROM regions ORDER BY last_seen DESC, name LIMIT ?", Math.max(0, Math.floor(limit)))
+      .toArray()
+      .map((r) => r.name);
   }
 
   // ── Internals ─────────────────────────────────────────────────────────
@@ -507,13 +511,19 @@ export class Traffic extends DurableObject<Env> {
     );
   }
 
+  /**
+   * Remembers only the centre of the 0.1° cell, never the reported point: the
+   * first report in a quiet cell could otherwise pin someone's driveway forever.
+   * The bbox pad (0.05°) is half a cell, so the cell is still fully covered.
+   */
   private noteArea(lat: number, lon: number, now: number): void {
-    const cell = `${Math.floor(lat / AREA_CELL_DEG)}:${Math.floor(lon / AREA_CELL_DEG)}`;
+    const cy = Math.floor(lat / AREA_CELL_DEG);
+    const cx = Math.floor(lon / AREA_CELL_DEG);
     this.sql.exec(
       "INSERT INTO area (cell, lat, lon, updated) VALUES (?, ?, ?, ?) ON CONFLICT (cell) DO UPDATE SET updated = excluded.updated",
-      cell,
-      lat,
-      lon,
+      `${cy}:${cx}`,
+      round6((cy + 0.5) * AREA_CELL_DEG),
+      round6((cx + 0.5) * AREA_CELL_DEG),
       now,
     );
   }
@@ -536,6 +546,10 @@ export class Traffic extends DurableObject<Env> {
   private setMeta(k: string, v: string): void {
     this.sql.exec("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", k, v);
   }
+}
+
+function round6(x: number): number {
+  return Math.round(x * 1e6) / 1e6;
 }
 
 function toIncident(r: IncidentRow): Incident {

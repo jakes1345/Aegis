@@ -94,6 +94,7 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
         const val IDLE_TRAFFIC_INTERVAL_MS = 60_000L
         const val LOCATION_INTERVAL_MS = 2_000L
         const val FIRST_FIX_WAIT_MS = 20_000L
+        const val LIVE_TRAFFIC_WAIT_MS = 4_000L
         const val REPORT_SNAP_M = 35.0
         const val REPORT_HEADING_TOLERANCE_DEG = 60.0
         /** Destinations this far outside the map's box cannot be snapped to any road in it. */
@@ -188,10 +189,13 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
     private var reverseJob: Job? = null
 
     init {
-        refreshInstalled()
-        val saved = prefs.getString(KEY_REGION, null)
-        val pick = _installed.value.firstOrNull { it.slug == saved } ?: _installed.value.firstOrNull()
-        if (pick != null) load(pick.slug)
+        viewModelScope.launch {
+            refreshInstalled()
+            val saved = prefs.getString(KEY_REGION, null)
+            val pick = _installed.value.firstOrNull { it.slug == saved } ?: _installed.value.firstOrNull()
+            // A region chosen or downloaded meanwhile wins over the remembered one.
+            if (pick != null && _graph.value == GraphState.None) load(pick.slug)
+        }
         // While not navigating, keep incidents on the map current; the navigator refreshes them itself while driving.
         viewModelScope.launch {
             while (isActive) {
@@ -216,8 +220,9 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
 
     // ── Regions ─────────────────────────────────────────────────────────
 
-    private fun refreshInstalled() {
-        _installed.value = store.installed()
+    /** Lists the graphs on disk (reads each file's header) off the main thread. */
+    private suspend fun refreshInstalled() {
+        _installed.value = withContext(Dispatchers.IO) { store.installed() }
     }
 
     private fun regionName(slug: String): String = regions.firstOrNull { it.slug == slug }?.name ?: slug
@@ -269,6 +274,11 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
 
     fun downloadRegion(region: MapRegion) {
         if (downloadJob?.isActive == true) return
+        val active = session.value
+        if (active?.slug == region.slug && active.navigator.state.value !is NavState.Idle) {
+            messageChannel.trySend("End the drive before updating the ${region.name} map")
+            return
+        }
         downloadJob = viewModelScope.launch {
             store.download(region).onSuccess {
                 refreshInstalled()
@@ -285,7 +295,12 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun deleteRegion(slug: String) {
-        if (session.value?.slug == slug) {
+        val active = session.value
+        if (active?.slug == slug && active.navigator.state.value !is NavState.Idle) {
+            messageChannel.trySend("End the drive before deleting the ${regionName(slug)} map")
+            return
+        }
+        if (active?.slug == slug) {
             loadJob?.cancel()
             closeSession()
         }
@@ -451,7 +466,8 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 return@launch
             }
-            s.traffic.refreshLive()
+            // Offline routing must not wait on a stalled connection; stale traffic is better than none.
+            withTimeoutOrNull(LIVE_TRAFFIC_WAIT_MS) { s.traffic.refreshLive() }
             val now = System.currentTimeMillis() / 1000
             var routes = withContext(Dispatchers.Default) { s.router.alternatives(from.first, from.second, dest.lat, dest.lon, now) }
             if (routes.isEmpty()) {
