@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -57,22 +58,29 @@ class ObdBluetoothManager(private val context: Context) {
     @Volatile private var input: InputStream? = null
     @Volatile private var output: OutputStream? = null
     @Volatile private var isCan: Boolean? = null
+    /** Bumped by connect() and disconnect(); a link set up under an older value is dropped. */
+    @Volatile private var generation = 0
 
     private class Reply(val text: String, val prompted: Boolean)
 
-    private class Frame(val header: String, val bytes: List<Int>)
 
     suspend fun connect(): Boolean = connectMutex.withLock {
+        val gen = ++generation
         if (!scope.isActive) scope = newScope()
-        pollJob?.cancel()
+        val old = pollJob
         pollJob = null
+        old?.cancel()
         closeLink()
-        val ok = establish()
-        if (ok) startPolling()
+        // A reconnect attempt of the old poll loop may still be inside establish(); it sees the
+        // new generation and gives up, but wait so it cannot close the link set up below.
+        old?.join()
+        val ok = establish(gen)
+        if (ok && gen == generation) startPolling(gen)
         ok
     }
 
     fun disconnect() {
+        generation++
         pollJob?.cancel()
         pollJob = null
         scope.cancel()
@@ -84,7 +92,7 @@ class ObdBluetoothManager(private val context: Context) {
 
     private fun newScope() = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private fun startPolling() {
+    private fun startPolling(gen: Int) {
         pollJob = scope.launch {
             while (isActive) {
                 try {
@@ -103,7 +111,7 @@ class ObdBluetoothManager(private val context: Context) {
                 while (isActive && attempts < MAX_RECONNECT_ATTEMPTS) {
                     attempts++
                     delay(RECONNECT_DELAY_MS)
-                    if (establish()) {
+                    if (establish(gen)) {
                         recovered = true
                         break
                     }
@@ -138,39 +146,43 @@ class ObdBluetoothManager(private val context: Context) {
         }
     }
 
-    private suspend fun establish(): Boolean = withContext(Dispatchers.IO) {
+    /**
+     * Opens and initialises the link. The blocking RFCOMM connect is not interrupted by
+     * coroutine cancellation, so after each blocking step it re-checks that this attempt is
+     * still wanted (same [gen], coroutine active); if not, it closes what it opened and
+     * publishes nothing.
+     */
+    private suspend fun establish(gen: Int): Boolean = withContext(Dispatchers.IO) {
+        fun stale() = gen != generation || !isActive
         if (!hasConnectPermission()) return@withContext false
         val adapter = bluetoothAdapter() ?: return@withContext false
+        var opened: BluetoothSocket? = null
+        fun abandon(): Boolean {
+            if (socket === opened) closeLink() else runCatching { opened?.close() }
+            return false
+        }
         try {
             if (!adapter.isEnabled) return@withContext false
             val device = findElmDevice(adapter) ?: return@withContext false
-            val opened = openSocket(adapter, device) ?: return@withContext false
+            opened = openSocket(adapter, device, ::stale) ?: return@withContext false
+            if (stale()) return@withContext abandon()
             socket = opened
             input = opened.inputStream
             output = opened.outputStream
             val name = runCatching { device.name }.getOrNull()
-            val initialized = try {
-                initialize()
-            } catch (_: IOException) {
-                false
-            }
-            if (!initialized) {
-                closeLink()
-                return@withContext false
-            }
-            _data.value = ObdData(connected = true, deviceName = name)
-            val dtcs = try {
-                readDtcs()
-            } catch (_: IOException) {
-                closeLink()
-                _data.value = ObdData()
-                return@withContext false
-            }
-            _data.update { it.copy(dtcs = dtcs) }
+            val initialized = initialize()
+            if (!initialized || stale()) return@withContext abandon()
+            val dtcs = readDtcs()
+            if (stale()) return@withContext abandon()
+            _data.value = ObdData(connected = true, deviceName = name, dtcs = dtcs)
             true
+        } catch (e: CancellationException) {
+            abandon()
+            throw e
+        } catch (_: IOException) {
+            abandon()
         } catch (_: SecurityException) {
-            closeLink()
-            false
+            abandon()
         }
     }
 
@@ -189,7 +201,7 @@ class ObdBluetoothManager(private val context: Context) {
         }
     }
 
-    private fun openSocket(adapter: BluetoothAdapter, device: BluetoothDevice): BluetoothSocket? {
+    private fun openSocket(adapter: BluetoothAdapter, device: BluetoothDevice, stale: () -> Boolean): BluetoothSocket? {
         // Discovery saturates the radio and makes RFCOMM connects time out on most chipsets.
         try {
             adapter.cancelDiscovery()
@@ -209,6 +221,11 @@ class ObdBluetoothManager(private val context: Context) {
             } catch (_: IOException) {
                 runCatching { primary.close() }
             }
+        }
+        // A disconnect() during the first connect closes it; do not then dial channel 1.
+        if (stale()) {
+            pendingSocket = null
+            return null
         }
         // Many cheap ELM327 clones advertise a broken SDP record; channel 1 is where they actually listen.
         val fallback = try {
@@ -256,130 +273,11 @@ class ObdBluetoothManager(private val context: Context) {
         return code in 6..12
     }
 
-    private suspend fun queryPid(cmd: String, pid: Int): List<Int>? {
-        val lines = cleanLines(exchange(cmd, COMMAND_TIMEOUT_MS).text, cmd) ?: return null
-        return payloads(lines)
-            .firstOrNull { it.size >= 3 && it[0] == 0x41 && it[1] == pid }
-            ?.drop(2)
-    }
+    private suspend fun queryPid(cmd: String, pid: Int): List<Int>? =
+        ObdParser.pidData(exchange(cmd, COMMAND_TIMEOUT_MS).text, cmd, pid, isCan)
 
-    private suspend fun readDtcs(): List<String> {
-        val lines = cleanLines(exchange("03", DTC_TIMEOUT_MS).text, "03") ?: return emptyList()
-        val can = isCan == true
-        val codes = mutableListOf<String>()
-        for (payload in payloads(lines)) {
-            if (payload.isEmpty() || payload[0] != 0x43) continue
-            val pairs = if (can) {
-                val count = payload.getOrNull(1) ?: continue
-                payload.drop(2).take(count * 2)
-            } else {
-                payload.drop(1)
-            }
-            var i = 0
-            while (i + 1 < pairs.size) {
-                val a = pairs[i]
-                val b = pairs[i + 1]
-                if (a != 0 || b != 0) codes += decodeDtc(a, b)
-                i += 2
-            }
-        }
-        return codes.distinct()
-    }
-
-    private fun decodeDtc(a: Int, b: Int): String {
-        val system = DTC_SYSTEMS[(a shr 6) and 0x03]
-        val second = (a shr 4) and 0x03
-        val third = a and 0x0F
-        return String.format(Locale.US, "%c%d%X%02X", system, second, third, b)
-    }
-
-    private fun cleanLines(raw: String, cmd: String): List<String>? {
-        val lines = raw.split('\r', '\n')
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .filterNot { it.equals(cmd, ignoreCase = true) }
-            .filterNot { it.uppercase(Locale.US).startsWith("SEARCHING") }
-            .filterNot { it.uppercase(Locale.US).startsWith("BUS INIT") }
-        if (lines.isEmpty()) return null
-        for (line in lines) {
-            val upper = line.uppercase(Locale.US)
-            if (ERROR_MARKERS.any { upper.contains(it) } || upper == "?") return null
-        }
-        return lines
-    }
-
-    private fun tokenize(line: String): List<String>? {
-        val upper = line.uppercase(Locale.US)
-        val tokens = if (upper.contains(' ')) {
-            upper.split(Regex("\\s+")).filter { it.isNotEmpty() }
-        } else {
-            val prefix = if (isCan == true && upper.length % 2 == 1) 3 else 0
-            buildList {
-                if (prefix > 0) add(upper.substring(0, prefix))
-                var i = prefix
-                while (i + 2 <= upper.length) {
-                    add(upper.substring(i, i + 2))
-                    i += 2
-                }
-            }
-        }
-        if (tokens.isEmpty() || tokens.any { t -> t.any { it !in HEX_CHARS } }) return null
-        return tokens
-    }
-
-    private fun parseFrame(line: String): Frame? {
-        val tokens = tokenize(line) ?: return null
-        val headerLen = when {
-            tokens[0].length == 3 -> 1
-            isCan == true -> 4
-            else -> 3
-        }
-        if (tokens.size <= headerLen) return null
-        val header = tokens.take(headerLen).joinToString(" ")
-        var body = tokens.drop(headerLen).map { it.toInt(16) }
-        // Legacy (J1850/ISO 9141/KWP) frames end with a checksum byte that is not part of the payload.
-        if (isCan != true && headerLen == 3 && body.size > 1) body = body.dropLast(1)
-        return Frame(header, body)
-    }
-
-    private fun payloads(lines: List<String>): List<List<Int>> {
-        val frames = lines.mapNotNull { parseFrame(it) }
-        val isoTp = isCan == true || frames.any { it.header.length == 3 }
-        val grouped = frames.groupBy { it.header }.toSortedMap()
-        val out = mutableListOf<List<Int>>()
-        for ((_, ecuFrames) in grouped) {
-            if (!isoTp) {
-                ecuFrames.forEach { out += it.bytes }
-                continue
-            }
-            var buffer = mutableListOf<Int>()
-            var expected = 0
-            for (frame in ecuFrames) {
-                val bytes = frame.bytes
-                if (bytes.isEmpty()) continue
-                val pci = bytes[0]
-                when (pci shr 4) {
-                    0 -> out += bytes.drop(1).take(pci and 0x0F)
-                    1 -> {
-                        if (bytes.size < 2) continue
-                        expected = ((pci and 0x0F) shl 8) or bytes[1]
-                        buffer = bytes.drop(2).toMutableList()
-                    }
-                    2 -> {
-                        if (expected == 0) continue
-                        buffer.addAll(bytes.drop(1))
-                    }
-                }
-                if (expected > 0 && buffer.size >= expected) {
-                    out += buffer.take(expected)
-                    buffer = mutableListOf()
-                    expected = 0
-                }
-            }
-            if (expected > 0 && buffer.isNotEmpty()) out += buffer.toList()
-        }
-        return out
-    }
+    private suspend fun readDtcs(): List<String> =
+        ObdParser.dtcs(exchange("03", DTC_TIMEOUT_MS).text, isCan)
 
     private suspend fun exchange(cmd: String, timeoutMs: Long): Reply = ioMutex.withLock {
         withContext(Dispatchers.IO) {
@@ -429,9 +327,6 @@ class ObdBluetoothManager(private val context: Context) {
     private companion object {
         val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
         val DEVICE_KEYWORDS = listOf("OBD", "ELM", "V-LINK", "OBDII")
-        val ERROR_MARKERS = listOf("NO DATA", "UNABLE TO CONNECT", "ERROR", "STOPPED")
-        val DTC_SYSTEMS = charArrayOf('P', 'C', 'B', 'U')
-        const val HEX_CHARS = "0123456789ABCDEF"
         const val COMMAND_TIMEOUT_MS = 1_000L
         const val RESET_TIMEOUT_MS = 2_000L
         const val RESET_SETTLE_MS = 500L

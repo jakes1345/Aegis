@@ -1592,7 +1592,15 @@ private fun TabIcon(index: Int, selected: Boolean) {
                     drawCircle(color, radius = 1.6f, center = Offset(left + w * (0.3f + i * 0.2f), top + h / 2f))
                 }
             }
-            else -> { // DEVICE — shield
+            TAB_DRIVE -> { // DRIVE — steering wheel
+                val r = size.minDimension * 0.44f
+                drawCircle(color, radius = r, center = center, style = Stroke(2f))
+                drawCircle(color, radius = r * 0.28f, center = center)
+                // Three spokes: left, right and down from the hub to the rim.
+                drawLine(color, Offset(cx - r, cy), Offset(cx + r, cy), strokeWidth = 1.8f)
+                drawLine(color, center, Offset(cx, cy + r), strokeWidth = 1.8f)
+            }
+            TAB_DEVICE -> { // DEVICE — shield
                 val sw = size.width * 0.76f
                 val sh = size.height * 0.88f
                 val ox = cx - sw / 2f
@@ -1612,6 +1620,7 @@ private fun TabIcon(index: Int, selected: Boolean) {
                 drawLine(color, Offset(cx - sw * 0.22f, cy + sh * 0.05f), Offset(cx - sw * 0.05f, cy + sh * 0.22f), strokeWidth = 1.8f)
                 drawLine(color, Offset(cx - sw * 0.05f, cy + sh * 0.22f), Offset(cx + sw * 0.25f, cy - sh * 0.1f), strokeWidth = 1.8f)
             }
+            else -> Unit
         }
     }
 }
