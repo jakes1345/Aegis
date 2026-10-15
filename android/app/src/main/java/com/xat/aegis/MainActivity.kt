@@ -191,12 +191,14 @@ private const val TAB_NFC = 4
 private const val TAB_WIFI = 5
 private const val TAB_DEVICE = 6
 private const val TAB_COMMS = CommsNotifications.COMMS_TAB_INDEX
+private const val TAB_DRIVE = TAB_COMMS + 1
 
 private class TabSpec(val id: Int, val label: String)
 
 private val FULL_TABS = listOf(
     TabSpec(TAB_SCAN, "SCAN"), TabSpec(TAB_MAP, "MAP"), TabSpec(TAB_LOG, "LOG"), TabSpec(TAB_CELL, "CELL"),
-    TabSpec(TAB_NFC, "NFC"), TabSpec(TAB_WIFI, "WIFI"), TabSpec(TAB_DEVICE, "DEVICE"), TabSpec(TAB_COMMS, "COMMS")
+    TabSpec(TAB_NFC, "NFC"), TabSpec(TAB_WIFI, "WIFI"), TabSpec(TAB_DEVICE, "DEVICE"), TabSpec(TAB_COMMS, "COMMS"),
+    TabSpec(TAB_DRIVE, "DRIVE")
 )
 private val COMMS_TABS = listOf(TabSpec(TAB_COMMS, "COMMS"))
 
@@ -1381,6 +1383,7 @@ private fun MainApp(
                     onGroupConsumed = { Registry.takeGroupRequest() },
                     onAppSettings = { showSettings = true }
                 )
+                TAB_DRIVE -> DriveScreen()
             }
 
             // SOS panic button, floating over the active tab. Hidden while settings or
