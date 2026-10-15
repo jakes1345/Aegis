@@ -96,6 +96,7 @@ class ScannerMonitor(private val context: Context, private val driver: SdrUsbDri
     }
 
     fun addChannel(name: String, freqHz: Long) {
+        if (!SdrUsbDriver.isTunable(freqHz)) return
         val next = _channels.value.filterNot { it.freqHz == freqHz } + ScannerChannel(name, freqHz)
         _channels.value = next
         persistChannels(context)
@@ -111,9 +112,9 @@ class ScannerMonitor(private val context: Context, private val driver: SdrUsbDri
         persistChannels(context)
     }
 
+    /** [level] 0..1, higher = tighter (needs a cleaner carrier to open). */
     fun setSquelch(level: Float) {
-        val t = level.coerceIn(0f, 1f)
-        demodulator.squelchThreshold = 0.005f + (0.1f - 0.005f) * t
+        demodulator.squelchThreshold = FmDemodulator.noiseThresholdFor(level)
     }
 
     private fun buildTrack(): AudioTrack {
@@ -142,7 +143,7 @@ class ScannerMonitor(private val context: Context, private val driver: SdrUsbDri
     private suspend fun scanLoop() {
         var index = 0
         while (currentCoroutineIsActive()) {
-            val list = _channels.value.filter { it.active }
+            val list = _channels.value.filter { it.active && SdrUsbDriver.isTunable(it.freqHz) }
             if (list.isEmpty()) {
                 _activeChannel.value = null
                 delay(DWELL_MS)
@@ -150,8 +151,14 @@ class ScannerMonitor(private val context: Context, private val driver: SdrUsbDri
             }
             index %= list.size
             val ch = list[index]
+            if (!driver.setFrequency(ch.freqHz)) {
+                // PLL did not lock (or the dongle went away): move on instead of listening
+                // to the previous channel under this one's name.
+                index++
+                delay(SQUELCH_POLL_MS)
+                continue
+            }
             _activeChannel.value = ch
-            driver.setFrequency(ch.freqHz)
             delay(DWELL_MS)
             while (currentCoroutineIsActive() && demodulator.squelchOpen.value) {
                 delay(SQUELCH_POLL_MS)

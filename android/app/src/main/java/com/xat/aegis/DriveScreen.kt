@@ -62,6 +62,7 @@ fun DriveScreen(viewModel: DriveViewModel = viewModel()) {
     val lastRecordingPath by viewModel.lastRecordingPath.collectAsStateWithLifecycle()
     val aircraft by viewModel.aircraft.collectAsStateWithLifecycle()
     val driveModeActive by viewModel.driveModeActive.collectAsStateWithLifecycle()
+    val squelchLevel by viewModel.squelchLevel.collectAsStateWithLifecycle()
 
     DriveContent(
         obd = obd,
@@ -73,6 +74,7 @@ fun DriveScreen(viewModel: DriveViewModel = viewModel()) {
         lastRecordingPath = lastRecordingPath,
         aircraft = aircraft,
         driveModeActive = driveModeActive,
+        squelchLevel = squelchLevel,
         onSetSquelch = viewModel::setSquelch,
         onAddChannel = viewModel::addChannel,
         onRemoveChannel = viewModel::removeChannel,
@@ -98,6 +100,7 @@ private fun DriveContent(
     lastRecordingPath: String?,
     aircraft: Map<String, Aircraft>,
     driveModeActive: Boolean,
+    squelchLevel: Float,
     onSetSquelch: (Float) -> Unit,
     onAddChannel: (String, Long) -> Unit,
     onRemoveChannel: (Long) -> Unit,
@@ -110,7 +113,6 @@ private fun DriveContent(
     var scannerExpanded by remember { mutableStateOf(true) }
     var adsbExpanded by remember { mutableStateOf(true) }
     var obdExpanded by remember { mutableStateOf(true) }
-    var squelchLevel by remember { mutableStateOf(0.3f) }
     var showAddDialog by remember { mutableStateOf(false) }
 
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -135,10 +137,7 @@ private fun DriveContent(
                     isRecording = isRecording,
                     squelchLevel = squelchLevel,
                     lastRecordingPath = lastRecordingPath,
-                    onSquelchChange = {
-                        squelchLevel = it
-                        onSetSquelch(it)
-                    },
+                    onSquelchChange = onSetSquelch,
                     onAddClick = { showAddDialog = true },
                     onRemoveChannel = onRemoveChannel,
                     onSetChannelActive = onSetChannelActive,
@@ -900,7 +899,9 @@ private fun AddChannelDialog(
     var name by remember { mutableStateOf("") }
     var freq by remember { mutableStateOf("") }
     val freqMhz = freq.toDoubleOrNull()
-    val valid = name.isNotEmpty() && freq.isNotEmpty() && freqMhz != null && freqMhz > 0.0
+    val minMhz = SdrUsbDriver.MIN_FREQ_HZ / 1_000_000.0
+    val maxMhz = SdrUsbDriver.MAX_FREQ_HZ / 1_000_000.0
+    val valid = name.isNotBlank() && freqMhz != null && freqMhz in minMhz..maxMhz
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -916,7 +917,8 @@ private fun AddChannelDialog(
                 OutlinedTextField(
                     value = freq,
                     onValueChange = { freq = it },
-                    label = { Text("Frequency (MHz)") },
+                    label = { Text("Frequency (MHz, %.0f–%.0f)".format(Locale.US, minMhz, maxMhz)) },
+                    isError = freq.isNotEmpty() && (freqMhz == null || freqMhz !in minMhz..maxMhz),
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
                 )
@@ -955,6 +957,7 @@ fun DriveScreenPreview() {
             lastRecordingPath = null,
             aircraft = emptyMap(),
             driveModeActive = false,
+            squelchLevel = 0.3f,
             onSetSquelch = {},
             onAddChannel = { _, _ -> },
             onRemoveChannel = {},

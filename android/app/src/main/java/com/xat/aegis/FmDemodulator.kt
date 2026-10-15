@@ -43,9 +43,23 @@ class FmDemodulator {
         private const val TAPS = 31
         private const val DEEMPHASIS_TAU = 300e-6
         private const val DC_OFFSET = 127.5f
+        /** The squelch closes again only once the noise rises this far above the open level. */
+        const val SQUELCH_HYSTERESIS = 1.2f
+
+        /**
+         * Noise-squelch open threshold for a slider position 0..1 (1 = tightest). The noise
+         * measure is the RMS of the discriminator's second difference: about 0.78 on an empty
+         * channel, 0.01..0.3 with a carrier present, depending on its strength.
+         */
+        fun noiseThresholdFor(level: Float): Float = 0.6f - 0.55f * level.coerceIn(0f, 1f)
     }
 
-    var squelchThreshold: Float = 0.02f
+    /**
+     * Noise squelch: the channel opens while the high-frequency noise of the discriminator
+     * output is BELOW this level. Without a carrier FM demodulates to loud wideband static;
+     * a carrier quiets it, so an audio-level squelch would open on static and close on voice.
+     */
+    @Volatile var squelchThreshold: Float = noiseThresholdFor(0.3f)
 
     private val _squelchOpen = MutableStateFlow(false)
     val squelchOpen: StateFlow<Boolean> = _squelchOpen.asStateFlow()
@@ -85,6 +99,9 @@ class FmDemodulator {
         val stage1 = ComplexDecimator(stage1Taps, STAGE1_DECIM)
         val stage2 = ComplexDecimator(stage2Taps, STAGE2_DECIM)
         var phasePrev = 0f
+        var x1 = 0f
+        var x2 = 0f
+        var open = false
         var deemphY = 0f
         val deemphAlpha = (1.0 - exp(-1.0 / (OUTPUT_RATE * DEEMPHASIS_TAU))).toFloat()
         val rmsRing = FloatArray(RMS_WINDOW)
@@ -148,14 +165,21 @@ class FmDemodulator {
                 state.phasePrev = phase
                 if (delta > pi) delta -= twoPi else if (delta < -pi) delta += twoPi
                 val x = delta / pi
+                // Second difference: ~0 for voice-band audio, large for discriminator noise.
+                state.pushRms(x - 2f * state.x1 + state.x2)
+                state.x2 = state.x1
+                state.x1 = x
                 state.deemphY = state.deemphAlpha * x + (1f - state.deemphAlpha) * state.deemphY
                 val y = state.deemphY
-                state.pushRms(y)
                 val clamped = if (y > 1f) 1f else if (y < -1f) -1f else y
                 state.chunk[state.chunkFill++] = (clamped * 32767f).toInt().toShort()
                 if (state.chunkFill == CHUNK_SAMPLES) {
-                    _squelchOpen.value = state.rms() > squelchThreshold
-                    emit(state.chunk.copyOf())
+                    val noise = state.rms()
+                    val threshold = squelchThreshold
+                    state.open = if (state.open) noise < threshold * SQUELCH_HYSTERESIS else noise < threshold
+                    _squelchOpen.value = state.open
+                    // Closed squelch is silence, not static.
+                    emit(if (state.open) state.chunk.copyOf() else ShortArray(CHUNK_SAMPLES))
                     state.chunkFill = 0
                 }
             }

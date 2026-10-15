@@ -43,6 +43,9 @@ class DriveViewModel(app: Application) : AndroidViewModel(app) {
     val isRecording: StateFlow<Boolean> = scanner.isRecording
     val lastRecordingPath: StateFlow<String?> = scanner.lastRecordingPath
 
+    private val _squelchLevel = MutableStateFlow(DEFAULT_SQUELCH)
+    val squelchLevel: StateFlow<Float> = _squelchLevel.asStateFlow()
+
     private val _driveModeActive = MutableStateFlow(false)
     val driveModeActive: StateFlow<Boolean> = _driveModeActive.asStateFlow()
 
@@ -62,7 +65,7 @@ class DriveViewModel(app: Application) : AndroidViewModel(app) {
         obdJob = viewModelScope.launch { obd.connect() }
         sdrJob = viewModelScope.launch {
             scanner.channels
-                .map { list -> list.any { it.active } }
+                .map { list -> list.any { it.active && SdrUsbDriver.isTunable(it.freqHz) } }
                 .distinctUntilChanged()
                 .collectLatest { scanMode -> runSdr(scanMode) }
         }
@@ -88,7 +91,11 @@ class DriveViewModel(app: Application) : AndroidViewModel(app) {
         if (_driveModeActive.value) deactivateDriveMode() else activateDriveMode()
     }
 
-    fun setSquelch(level: Float) = scanner.setSquelch(level)
+    fun setSquelch(level: Float) {
+        val l = level.coerceIn(0f, 1f)
+        _squelchLevel.value = l
+        scanner.setSquelch(l)
+    }
 
     fun addChannel(name: String, freqHz: Long) = scanner.addChannel(name, freqHz)
 
@@ -158,7 +165,8 @@ class DriveViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun runSdr(scanMode: Boolean) {
         try {
             if (scanMode) {
-                val first = scanner.channels.value.firstOrNull { it.active } ?: return
+                val first = scanner.channels.value
+                    .firstOrNull { it.active && SdrUsbDriver.isTunable(it.freqHz) } ?: return
                 if (!sdr.open(first.freqHz, FmDemodulator.INPUT_RATE)) return
                 scanner.start()
                 awaitCancellation()

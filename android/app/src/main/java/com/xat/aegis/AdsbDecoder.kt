@@ -163,7 +163,25 @@ class AdsbDecoder {
                 msg[bit shr 3] = msg[bit shr 3] or (0x80 ushr (bit and 7))
             }
         }
+        return if (handleMessage(df, len, now)) PREAMBLE_SAMPLES + bits * 2 else 0
+    }
 
+    /** Decodes one already-sliced frame (hex, 14 or 28 digits). Used by the JVM tests. */
+    internal fun decodeHex(hex: String, now: Long): Boolean {
+        val len = hex.length / 2
+        msg.fill(0)
+        for (i in 0 until len) msg[i] = hex.substring(2 * i, 2 * i + 2).toInt(16)
+        val df = msg[0] ushr 3
+        if (df !in SUPPORTED_DF || len != (if (df >= 16) LONG_BYTES else LONG_BYTES / 2)) return false
+        return handleMessage(df, len, now)
+    }
+
+    internal fun snapshot(now: Long): Map<String, Aircraft> {
+        publish(now)
+        return _aircraft.value
+    }
+
+    private fun handleMessage(df: Int, len: Int, now: Long): Boolean {
         val parity = (msg[len - 3] shl 16) or (msg[len - 2] shl 8) or msg[len - 1]
         val residual = crc24(msg, len - 3) xor parity
 
@@ -177,7 +195,13 @@ class AdsbDecoder {
                     handleExtendedSquitter(icaoFromAa(), now)
                     true
                 } else false
-                11 -> if ((residual and 0xFFFF80) == 0) {
+                // DF11 parity is overlaid with the interrogator code, so a non-zero residual
+                // only proves anything for an aircraft already heard; new tracks need IID 0,
+                // or noise that passes the 17-bit check would create ghost aircraft.
+                11 -> if (residual == 0) {
+                    touch(icaoFromAa(), now)
+                    true
+                } else if ((residual and 0xFFFF80) == 0 && tracks.containsKey(icaoFromAa())) {
                     touch(icaoFromAa(), now)
                     true
                 } else false
@@ -202,7 +226,7 @@ class AdsbDecoder {
                 else -> false
             }
         }
-        return if (accepted) PREAMBLE_SAMPLES + bits * 2 else 0
+        return accepted
     }
 
     private fun icaoFromAa(): String = hex((msg[1] shl 16) or (msg[2] shl 8) or msg[3])
@@ -286,121 +310,8 @@ class AdsbDecoder {
         if (vr != 0) ac.verticalRateFpm = (vr - 1) * 64 * (if (getBits(68, 1) == 1) -1 else 1)
     }
 
-    private fun globalPosition(t: Track, newestOdd: Boolean): Pair<Double, Double>? {
-        val lat0 = t.evenLat.toDouble()
-        val lat1 = t.oddLat.toDouble()
-        val lon0 = t.evenLon.toDouble()
-        val lon1 = t.oddLon.toDouble()
-
-        val j = floor((59 * lat0 - 60 * lat1) / CPR_SCALE + 0.5)
-        var rlat0 = AIR_DLAT0 * (cprMod(j, 60) + lat0 / CPR_SCALE)
-        var rlat1 = AIR_DLAT1 * (cprMod(j, 59) + lat1 / CPR_SCALE)
-        if (rlat0 >= 270.0) rlat0 -= 360.0
-        if (rlat1 >= 270.0) rlat1 -= 360.0
-        if (rlat0 < -90.0 || rlat0 > 90.0 || rlat1 < -90.0 || rlat1 > 90.0) return null
-
-        val nl0 = cprNl(rlat0)
-        val nl1 = cprNl(rlat1)
-        if (nl0 != nl1) return null
-
-        val lat: Double
-        var lon: Double
-        if (newestOdd) {
-            val ni = maxOf(nl1 - 1, 1)
-            val m = floor((lon0 * (nl1 - 1) - lon1 * nl1) / CPR_SCALE + 0.5)
-            lon = (360.0 / ni) * (cprMod(m, ni) + lon1 / CPR_SCALE)
-            lat = rlat1
-        } else {
-            val ni = maxOf(nl0, 1)
-            val m = floor((lon0 * (nl0 - 1) - lon1 * nl0) / CPR_SCALE + 0.5)
-            lon = (360.0 / ni) * (cprMod(m, ni) + lon0 / CPR_SCALE)
-            lat = rlat0
-        }
-        lon -= floor((lon + 180.0) / 360.0) * 360.0
-        return lat to lon
-    }
-
-    private fun cprMod(a: Double, b: Int): Double {
-        val r = a % b
-        return if (r < 0) r + b else r
-    }
-
-    private fun cprNl(lat: Double): Int {
-        val a = abs(lat)
-        if (a == 0.0) return 59
-        if (a == 87.0) return 2
-        if (a > 87.0) return 1
-        val c = cos(PI / 180.0 * a)
-        val x = 1.0 - (1.0 - cos(PI / (2.0 * CPR_NZ))) / (c * c)
-        return floor(2.0 * PI / acos(x)).toInt()
-    }
-
-    private fun decodeAlt12(a: Int): Int? {
-        if (a == 0) return null
-        if ((a and 0x10) != 0) {
-            val n = ((a and 0xFE0) shr 1) or (a and 0x0F)
-            return n * 25 - 1000
-        }
-        val ac13 = ((a and 0xFC0) shl 1) or (a and 0x3F)
-        val hundreds = modeAToModeC(decodeId13(ac13))
-        return if (hundreds < -12) null else hundreds * 100
-    }
-
-    private fun decodeAc13(a: Int): Int? {
-        if (a == 0) return null
-        if ((a and 0x40) != 0) {
-            val n = ((a and 0x1F80) shr 2) or (a and 0x3F)
-            return (n * 25 * 3.28084).roundToInt()
-        }
-        if ((a and 0x10) != 0) {
-            val n = ((a and 0x1F80) shr 2) or ((a and 0x20) shr 1) or (a and 0x0F)
-            return n * 25 - 1000
-        }
-        val hundreds = modeAToModeC(decodeId13(a))
-        return if (hundreds < -12) null else hundreds * 100
-    }
-
-    private fun decodeId13(f: Int): Int {
-        var g = 0
-        if ((f and 0x1000) != 0) g = g or 0x0010
-        if ((f and 0x0800) != 0) g = g or 0x1000
-        if ((f and 0x0400) != 0) g = g or 0x0020
-        if ((f and 0x0200) != 0) g = g or 0x2000
-        if ((f and 0x0100) != 0) g = g or 0x0040
-        if ((f and 0x0080) != 0) g = g or 0x4000
-        if ((f and 0x0020) != 0) g = g or 0x0100
-        if ((f and 0x0010) != 0) g = g or 0x0001
-        if ((f and 0x0008) != 0) g = g or 0x0200
-        if ((f and 0x0004) != 0) g = g or 0x0002
-        if ((f and 0x0002) != 0) g = g or 0x0400
-        if ((f and 0x0001) != 0) g = g or 0x0004
-        return g
-    }
-
-    private fun squawkString(gillham: Int): String = "%04x".format(gillham and 0xFFFF)
-
-    private fun modeAToModeC(modeA: Int): Int {
-        if ((modeA and 0xFFFF8889.toInt()) != 0 || (modeA and 0xF0) == 0) return INVALID_ALT
-        var oneHundreds = 0
-        var fiveHundreds = 0
-        if ((modeA and 0x0010) != 0) oneHundreds = oneHundreds xor 0x007
-        if ((modeA and 0x0020) != 0) oneHundreds = oneHundreds xor 0x003
-        if ((modeA and 0x0040) != 0) oneHundreds = oneHundreds xor 0x001
-        if ((oneHundreds and 5) == 5) oneHundreds = oneHundreds xor 2
-        if (oneHundreds > 5) return INVALID_ALT
-
-        if ((modeA and 0x0002) != 0) fiveHundreds = fiveHundreds xor 0x0FF
-        if ((modeA and 0x0004) != 0) fiveHundreds = fiveHundreds xor 0x07F
-        if ((modeA and 0x1000) != 0) fiveHundreds = fiveHundreds xor 0x03F
-        if ((modeA and 0x2000) != 0) fiveHundreds = fiveHundreds xor 0x01F
-        if ((modeA and 0x4000) != 0) fiveHundreds = fiveHundreds xor 0x00F
-        if ((modeA and 0x0100) != 0) fiveHundreds = fiveHundreds xor 0x007
-        if ((modeA and 0x0200) != 0) fiveHundreds = fiveHundreds xor 0x003
-        if ((modeA and 0x0400) != 0) fiveHundreds = fiveHundreds xor 0x001
-
-        if ((fiveHundreds and 1) != 0) oneHundreds = 6 - oneHundreds
-        return fiveHundreds * 5 + oneHundreds - 13
-    }
+    private fun globalPosition(t: Track, newestOdd: Boolean): Pair<Double, Double>? =
+        cprGlobal(t.evenLat, t.evenLon, t.oddLat, t.oddLon, newestOdd)
 
     private fun getBits(start: Int, count: Int): Int {
         var v = 0
@@ -409,14 +320,6 @@ class AdsbDecoder {
             v = (v shl 1) or bit
         }
         return v
-    }
-
-    private fun crc24(data: IntArray, len: Int): Int {
-        var crc = 0
-        for (i in 0 until len) {
-            crc = ((crc shl 8) xor CRC_TABLE[((crc ushr 16) xor data[i]) and 0xFF]) and 0xFFFFFF
-        }
-        return crc
     }
 
     private fun evictStale(now: Long) {
@@ -436,38 +339,162 @@ class AdsbDecoder {
         _aircraft.value = snapshot
     }
 
-    private companion object {
-        const val PREAMBLE_SAMPLES = 16
-        const val LONG_BITS = 112
-        const val SHORT_BITS = 56
-        const val LONG_BYTES = LONG_BITS / 8
-        const val FRAME_SAMPLES = PREAMBLE_SAMPLES + LONG_BITS * 2
-        const val PREAMBLE_THRESHOLD = 0.6f
+    internal companion object {
+        fun crc24(data: IntArray, len: Int): Int {
+            var crc = 0
+            for (i in 0 until len) {
+                crc = ((crc shl 8) xor CRC_TABLE[((crc ushr 16) xor data[i]) and 0xFF]) and 0xFFFFFF
+            }
+            return crc
+        }
 
-        const val HOUSEKEEPING_MS = 10_000L
-        const val STALE_MS = 60_000L
-        const val PUBLISH_INTERVAL_MS = 250L
-        const val CPR_PAIR_WINDOW_MS = 10_000L
+        /** Airborne CPR global decode of an even/odd pair; null if the pair straddles an NL zone. */
+        fun cprGlobal(evenLat: Int, evenLon: Int, oddLat: Int, oddLon: Int, newestOdd: Boolean): Pair<Double, Double>? {
+            val lat0 = evenLat.toDouble()
+            val lat1 = oddLat.toDouble()
+            val lon0 = evenLon.toDouble()
+            val lon1 = oddLon.toDouble()
 
-        const val CPR_SCALE = 131072.0
-        const val CPR_NZ = 15.0
-        const val AIR_DLAT0 = 360.0 / 60.0
-        const val AIR_DLAT1 = 360.0 / 59.0
-        const val INVALID_ALT = -9999
+            val j = floor((59 * lat0 - 60 * lat1) / CPR_SCALE + 0.5)
+            var rlat0 = AIR_DLAT0 * (cprMod(j, 60) + lat0 / CPR_SCALE)
+            var rlat1 = AIR_DLAT1 * (cprMod(j, 59) + lat1 / CPR_SCALE)
+            if (rlat0 >= 270.0) rlat0 -= 360.0
+            if (rlat1 >= 270.0) rlat1 -= 360.0
+            if (rlat0 < -90.0 || rlat0 > 90.0 || rlat1 < -90.0 || rlat1 > 90.0) return null
 
-        const val CALLSIGN_CHARSET =
+            val nl0 = cprNl(rlat0)
+            val nl1 = cprNl(rlat1)
+            if (nl0 != nl1) return null
+
+            val lat: Double
+            var lon: Double
+            if (newestOdd) {
+                val ni = maxOf(nl1 - 1, 1)
+                val m = floor((lon0 * (nl1 - 1) - lon1 * nl1) / CPR_SCALE + 0.5)
+                lon = (360.0 / ni) * (cprMod(m, ni) + lon1 / CPR_SCALE)
+                lat = rlat1
+            } else {
+                val ni = maxOf(nl0, 1)
+                val m = floor((lon0 * (nl0 - 1) - lon1 * nl0) / CPR_SCALE + 0.5)
+                lon = (360.0 / ni) * (cprMod(m, ni) + lon0 / CPR_SCALE)
+                lat = rlat0
+            }
+            lon -= floor((lon + 180.0) / 360.0) * 360.0
+            return lat to lon
+        }
+
+        fun cprMod(a: Double, b: Int): Double {
+            val r = a % b
+            return if (r < 0) r + b else r
+        }
+
+        fun cprNl(lat: Double): Int {
+            val a = abs(lat)
+            if (a == 0.0) return 59
+            if (a == 87.0) return 2
+            if (a > 87.0) return 1
+            val c = cos(PI / 180.0 * a)
+            val x = 1.0 - (1.0 - cos(PI / (2.0 * CPR_NZ))) / (c * c)
+            return floor(2.0 * PI / acos(x)).toInt()
+        }
+
+        fun decodeAlt12(a: Int): Int? {
+            if (a == 0) return null
+            if ((a and 0x10) != 0) {
+                val n = ((a and 0xFE0) shr 1) or (a and 0x0F)
+                return n * 25 - 1000
+            }
+            val ac13 = ((a and 0xFC0) shl 1) or (a and 0x3F)
+            val hundreds = modeAToModeC(decodeId13(ac13))
+            return if (hundreds < -12) null else hundreds * 100
+        }
+
+        fun decodeAc13(a: Int): Int? {
+            if (a == 0) return null
+            // M bit: metric altitude. Its encoding is not pinned down here (the old code also
+            // dropped two bits instead of one), so report nothing rather than a wrong number.
+            if ((a and 0x40) != 0) return null
+            if ((a and 0x10) != 0) {
+                val n = ((a and 0x1F80) shr 2) or ((a and 0x20) shr 1) or (a and 0x0F)
+                return n * 25 - 1000
+            }
+            val hundreds = modeAToModeC(decodeId13(a))
+            return if (hundreds < -12) null else hundreds * 100
+        }
+
+        fun decodeId13(f: Int): Int {
+            var g = 0
+            if ((f and 0x1000) != 0) g = g or 0x0010
+            if ((f and 0x0800) != 0) g = g or 0x1000
+            if ((f and 0x0400) != 0) g = g or 0x0020
+            if ((f and 0x0200) != 0) g = g or 0x2000
+            if ((f and 0x0100) != 0) g = g or 0x0040
+            if ((f and 0x0080) != 0) g = g or 0x4000
+            if ((f and 0x0020) != 0) g = g or 0x0100
+            if ((f and 0x0010) != 0) g = g or 0x0001
+            if ((f and 0x0008) != 0) g = g or 0x0200
+            if ((f and 0x0004) != 0) g = g or 0x0002
+            if ((f and 0x0002) != 0) g = g or 0x0400
+            if ((f and 0x0001) != 0) g = g or 0x0004
+            return g
+        }
+
+        fun squawkString(gillham: Int): String = "%04x".format(gillham and 0xFFFF)
+
+        fun modeAToModeC(modeA: Int): Int {
+            if ((modeA and 0xFFFF8889.toInt()) != 0 || (modeA and 0xF0) == 0) return INVALID_ALT
+            var oneHundreds = 0
+            var fiveHundreds = 0
+            if ((modeA and 0x0010) != 0) oneHundreds = oneHundreds xor 0x007
+            if ((modeA and 0x0020) != 0) oneHundreds = oneHundreds xor 0x003
+            if ((modeA and 0x0040) != 0) oneHundreds = oneHundreds xor 0x001
+            if ((oneHundreds and 5) == 5) oneHundreds = oneHundreds xor 2
+            if (oneHundreds > 5) return INVALID_ALT
+
+            if ((modeA and 0x0002) != 0) fiveHundreds = fiveHundreds xor 0x0FF
+            if ((modeA and 0x0004) != 0) fiveHundreds = fiveHundreds xor 0x07F
+            if ((modeA and 0x1000) != 0) fiveHundreds = fiveHundreds xor 0x03F
+            if ((modeA and 0x2000) != 0) fiveHundreds = fiveHundreds xor 0x01F
+            if ((modeA and 0x4000) != 0) fiveHundreds = fiveHundreds xor 0x00F
+            if ((modeA and 0x0100) != 0) fiveHundreds = fiveHundreds xor 0x007
+            if ((modeA and 0x0200) != 0) fiveHundreds = fiveHundreds xor 0x003
+            if ((modeA and 0x0400) != 0) fiveHundreds = fiveHundreds xor 0x001
+
+            if ((fiveHundreds and 1) != 0) oneHundreds = 6 - oneHundreds
+            return fiveHundreds * 5 + oneHundreds - 13
+        }
+
+        private const val PREAMBLE_SAMPLES = 16
+        private const val LONG_BITS = 112
+        private const val SHORT_BITS = 56
+        private const val LONG_BYTES = LONG_BITS / 8
+        private const val FRAME_SAMPLES = PREAMBLE_SAMPLES + LONG_BITS * 2
+        private const val PREAMBLE_THRESHOLD = 0.6f
+
+        private const val HOUSEKEEPING_MS = 10_000L
+        private const val STALE_MS = 60_000L
+        private const val PUBLISH_INTERVAL_MS = 250L
+        private const val CPR_PAIR_WINDOW_MS = 10_000L
+
+        private const val CPR_SCALE = 131072.0
+        private const val CPR_NZ = 15.0
+        private const val AIR_DLAT0 = 360.0 / 60.0
+        private const val AIR_DLAT1 = 360.0 / 59.0
+        private const val INVALID_ALT = -9999
+
+        private const val CALLSIGN_CHARSET =
             "?ABCDEFGHIJKLMNOPQRSTUVWXYZ????? ???????????????0123456789??????"
 
-        val SUPPORTED_DF = setOf(0, 4, 5, 11, 16, 17, 18, 20, 21)
-        val EMERGENCY_SQUAWKS = setOf("7500", "7600", "7700")
+        private val SUPPORTED_DF = setOf(0, 4, 5, 11, 16, 17, 18, 20, 21)
+        private val EMERGENCY_SQUAWKS = setOf("7500", "7600", "7700")
 
-        val MAG_LUT = FloatArray(65536) { idx ->
+        private val MAG_LUT = FloatArray(65536) { idx ->
             val i = (idx ushr 8) - 127
             val q = (idx and 0xFF) - 127
             sqrt((i * i + q * q).toFloat())
         }
 
-        val CRC_TABLE = IntArray(256) { b ->
+        private val CRC_TABLE = IntArray(256) { b ->
             var crc = b shl 16
             repeat(8) {
                 crc = crc shl 1

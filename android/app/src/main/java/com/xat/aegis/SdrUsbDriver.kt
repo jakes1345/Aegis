@@ -50,7 +50,6 @@ class SdrUsbDriver(private val context: Context) {
     private var claimedInterface: UsbInterface? = null
 
     private val tunerShadow = IntArray(TUNER_REG_COUNT)
-    private var tunerInput = 0
     private var filterCalCode = 0
     private var pllLocked = false
 
@@ -62,7 +61,7 @@ class SdrUsbDriver(private val context: Context) {
             _state.value = SdrState.Error("Unsupported sample rate $sampleRateHz Hz")
             return false
         }
-        if (freqHz !in MIN_FREQ_HZ..MAX_FREQ_HZ) {
+        if (!isTunable(freqHz)) {
             _state.value = SdrState.Error("Frequency $freqHz Hz outside R820T range")
             return false
         }
@@ -115,18 +114,25 @@ class SdrUsbDriver(private val context: Context) {
         _state.value = SdrState.Closed
     }
 
-    suspend fun setFrequency(hz: Long) {
-        val ready = _state.value as? SdrState.Ready ?: return
-        if (hz !in MIN_FREQ_HZ..MAX_FREQ_HZ) {
-            _state.value = SdrState.Error("Frequency $hz Hz outside R820T range")
-            return
-        }
-        withContext(Dispatchers.IO) {
-            try {
-                synchronized(ioLock) { tune(hz) }
-                _state.value = SdrState.Ready(hz, ready.sampleRateHz)
-            } catch (e: IOException) {
-                _state.value = SdrState.Error(e.message ?: "Tuning failed")
+    /**
+     * Retunes an open dongle. Returns false when [hz] is out of range or the PLL did not
+     * lock there; the device stays Ready (on its previous frequency) either way, so one bad
+     * channel does not stop a scanner from moving on to the next.
+     */
+    suspend fun setFrequency(hz: Long): Boolean {
+        if (_state.value !is SdrState.Ready || !isTunable(hz)) return false
+        return withContext(Dispatchers.IO) {
+            synchronized(ioLock) {
+                val conn = connection ?: return@synchronized false
+                val ready = _state.value as? SdrState.Ready ?: return@synchronized false
+                try {
+                    tune(hz)
+                    // Only report the new frequency if nobody closed or reopened the dongle meanwhile.
+                    if (connection === conn) _state.value = SdrState.Ready(hz, ready.sampleRateHz)
+                    true
+                } catch (e: IOException) {
+                    false
+                }
             }
         }
     }
@@ -324,11 +330,8 @@ class SdrUsbDriver(private val context: Context) {
             r82xxSetMux(lo)
             r82xxSetPll(lo)
             if (!pllLocked) throw IOException("R820T PLL failed to lock at $freqHz Hz")
-            val input = if (freqHz > 345_000_000L) 0x00 else 0x60
-            if (input != tunerInput) {
-                tunerInput = input
-                tunerWriteMask(0x05, input, 0x60)
-            }
+            // librtlsdr switches reg 0x05 between Air-In and Cable1 at 345 MHz only on the
+            // R828D. R820T/R820T2 sticks wire the antenna to Air-In, so the input stays put.
         } finally {
             setI2cRepeater(false)
         }
@@ -367,6 +370,7 @@ class SdrUsbDriver(private val context: Context) {
             r82xxSetPll(filtCalLoHz)
             if (!pllLocked) throw IOException("R820T calibration PLL failed to lock")
             tunerWriteMask(0x0B, 0x10, 0x10)
+            Thread.sleep(1) // librtlsdr: usleep_range(1000, 2000) between start and stop trigger
             tunerWriteMask(0x0B, 0x00, 0x10)
             tunerWriteMask(0x0F, 0x00, 0x04)
             val data = tunerRead(5)
@@ -403,7 +407,6 @@ class SdrUsbDriver(private val context: Context) {
         tunerWriteReg(0x0D, lnaVthL)
         tunerWriteReg(0x0E, mixerVthL)
 
-        tunerInput = airCable1In
         tunerWriteMask(0x05, airCable1In, 0x60)
         tunerWriteMask(0x06, cable2In, 0x08)
         tunerWriteMask(0x11, cpCur, 0x38)
@@ -502,7 +505,7 @@ class SdrUsbDriver(private val context: Context) {
 
         var locked = false
         for (i in 0 until 2) {
-            Thread.sleep(1)
+            Thread.sleep(PLL_LOCK_WAIT_MS) // librtlsdr r82xx_set_pll: sleep_time = 10000 us
             val data = tunerRead(3)
             if ((data[2] and 0x40) != 0) {
                 locked = true
@@ -606,50 +609,72 @@ class SdrUsbDriver(private val context: Context) {
     private fun isValidSampleRate(rate: Int): Boolean =
         rate in 225_001..300_000 || rate in 900_001..3_200_000
 
-    private companion object {
-        const val ACTION_USB_PERMISSION = "com.xat.aegis.SDR_USB_PERMISSION"
-
-        const val CTRL_OUT = 0x40
-        const val CTRL_IN = 0xC0
-        const val CTRL_TIMEOUT_MS = 300
-
-        const val BULK_IN_ADDRESS = 0x81
-        const val BULK_BUFFER_BYTES = 131072
-        const val BULK_TIMEOUT_MS = 1000
-        const val MAX_BULK_FAILURES = 10
-        const val SAMPLE_QUEUE_DEPTH = 16
-
-        const val BLOCK_USB = 1
-        const val BLOCK_SYS = 2
-        const val BLOCK_IIC = 6
-
-        const val USB_SYSCTL = 0x2000
-        const val USB_EPA_CTL = 0x2148
-        const val USB_EPA_MAXPKT = 0x2158
-        const val SYS_DEMOD_CTL = 0x3000
-        const val SYS_DEMOD_CTL_1 = 0x300B
-
-        const val RTL_XTAL_HZ = 28_800_000L
-        const val R82XX_XTAL_HZ = 28_800_000L
-        const val R82XX_IF_HZ = 3_570_000L
-        const val R820T_I2C_ADDR = 0x34
-        const val R82XX_CHECK_ADDR = 0x00
-        const val R82XX_CHECK_VAL = 0x69
-        const val R82XX_VER_NUM = 49
-        const val R82XX_SHADOW_START = 0x05
-        const val TUNER_REG_COUNT = 0x20
-        const val VCO_POWER_REF = 2
-        const val I2C_MAX_PAYLOAD = 7
-
+    companion object {
+        /** R820T tuning range used by this driver (librtlsdr reports 24..1766 MHz). */
         const val MIN_FREQ_HZ = 24_000_000L
         const val MAX_FREQ_HZ = 1_766_000_000L
 
-        val FIR_DEFAULT = intArrayOf(
+        fun isTunable(hz: Long): Boolean = hz in MIN_FREQ_HZ..MAX_FREQ_HZ
+
+        /** USB vendor/product pairs this driver opens; res/xml/usb_device_filter.xml must match. */
+        val KNOWN_DONGLES = listOf(
+            0x0BDA to 0x2832, 0x0BDA to 0x2838,
+            0x0413 to 0x6680, 0x0413 to 0x6F0F,
+            0x0458 to 0x707F,
+            0x0CCD to 0x00A9, 0x0CCD to 0x00B3, 0x0CCD to 0x00B4, 0x0CCD to 0x00B5,
+            0x0CCD to 0x00B7, 0x0CCD to 0x00B8, 0x0CCD to 0x00B9, 0x0CCD to 0x00C0,
+            0x0CCD to 0x00C6, 0x0CCD to 0x00D3, 0x0CCD to 0x00D7, 0x0CCD to 0x00E0,
+            0x1554 to 0x5020,
+            0x15F4 to 0x0131, 0x15F4 to 0x0133,
+            0x185B to 0x0620, 0x185B to 0x0650, 0x185B to 0x0680,
+            0x1B80 to 0xD393, 0x1B80 to 0xD394, 0x1B80 to 0xD395, 0x1B80 to 0xD397,
+            0x1B80 to 0xD398, 0x1B80 to 0xD39D, 0x1B80 to 0xD3A4, 0x1B80 to 0xD3A8,
+            0x1B80 to 0xD3AF, 0x1B80 to 0xD3B0,
+            0x1D19 to 0x1101, 0x1D19 to 0x1102, 0x1D19 to 0x1103, 0x1D19 to 0x1104,
+            0x1F4D to 0xA803, 0x1F4D to 0xB803, 0x1F4D to 0xC803, 0x1F4D to 0xD286, 0x1F4D to 0xD803
+        )
+
+        private const val PLL_LOCK_WAIT_MS = 10L
+        private const val ACTION_USB_PERMISSION = "com.xat.aegis.SDR_USB_PERMISSION"
+
+        private const val CTRL_OUT = 0x40
+        private const val CTRL_IN = 0xC0
+        private const val CTRL_TIMEOUT_MS = 300
+
+        private const val BULK_IN_ADDRESS = 0x81
+        private const val BULK_BUFFER_BYTES = 131072
+        private const val BULK_TIMEOUT_MS = 1000
+        private const val MAX_BULK_FAILURES = 10
+        private const val SAMPLE_QUEUE_DEPTH = 16
+
+        private const val BLOCK_USB = 1
+        private const val BLOCK_SYS = 2
+        private const val BLOCK_IIC = 6
+
+        private const val USB_SYSCTL = 0x2000
+        private const val USB_EPA_CTL = 0x2148
+        private const val USB_EPA_MAXPKT = 0x2158
+        private const val SYS_DEMOD_CTL = 0x3000
+        private const val SYS_DEMOD_CTL_1 = 0x300B
+
+        private const val RTL_XTAL_HZ = 28_800_000L
+        private const val R82XX_XTAL_HZ = 28_800_000L
+        private const val R82XX_IF_HZ = 3_570_000L
+        private const val R820T_I2C_ADDR = 0x34
+        private const val R82XX_CHECK_ADDR = 0x00
+        private const val R82XX_CHECK_VAL = 0x69
+        private const val R82XX_VER_NUM = 49
+        private const val R82XX_SHADOW_START = 0x05
+        private const val TUNER_REG_COUNT = 0x20
+        private const val VCO_POWER_REF = 2
+        private const val I2C_MAX_PAYLOAD = 7
+
+        private val FIR_DEFAULT = intArrayOf(
             -54, -36, -41, -40, -32, -14, 14, 53,
             101, 156, 215, 273, 327, 372, 404, 421
         )
 
-        val R82XX_INIT = intArrayOf(
+        private val R82XX_INIT = intArrayOf(
             0x83, 0x32, 0x75,
             0xC0, 0x40, 0xD6, 0x6C,
             0xF5, 0x63, 0x75, 0x68,
@@ -659,7 +684,7 @@ class SdrUsbDriver(private val context: Context) {
             0x54, 0xAE, 0x4A, 0xC0
         )
 
-        val FREQ_RANGES = arrayOf(
+        private val FREQ_RANGES = arrayOf(
             intArrayOf(0, 0x08, 0x02, 0xDF, 0x02, 0x01, 0x00),
             intArrayOf(50, 0x08, 0x02, 0xBE, 0x02, 0x01, 0x00),
             intArrayOf(55, 0x08, 0x02, 0x8B, 0x02, 0x01, 0x00),
@@ -681,23 +706,6 @@ class SdrUsbDriver(private val context: Context) {
             intArrayOf(450, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00),
             intArrayOf(588, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00),
             intArrayOf(650, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00)
-        )
-
-        val KNOWN_DONGLES = listOf(
-            0x0BDA to 0x2832, 0x0BDA to 0x2838,
-            0x0413 to 0x6680, 0x0413 to 0x6F0F,
-            0x0458 to 0x707F,
-            0x0CCD to 0x00A9, 0x0CCD to 0x00B3, 0x0CCD to 0x00B4, 0x0CCD to 0x00B5,
-            0x0CCD to 0x00B7, 0x0CCD to 0x00B8, 0x0CCD to 0x00B9, 0x0CCD to 0x00C0,
-            0x0CCD to 0x00C6, 0x0CCD to 0x00D3, 0x0CCD to 0x00D7, 0x0CCD to 0x00E0,
-            0x1554 to 0x5020,
-            0x15F4 to 0x0131, 0x15F4 to 0x0133,
-            0x185B to 0x0620, 0x185B to 0x0650, 0x185B to 0x0680,
-            0x1B80 to 0xD393, 0x1B80 to 0xD394, 0x1B80 to 0xD395, 0x1B80 to 0xD397,
-            0x1B80 to 0xD398, 0x1B80 to 0xD39D, 0x1B80 to 0xD3A4, 0x1B80 to 0xD3A8,
-            0x1B80 to 0xD3AF, 0x1B80 to 0xD3B0,
-            0x1D19 to 0x1101, 0x1D19 to 0x1102, 0x1D19 to 0x1103, 0x1D19 to 0x1104,
-            0x1F4D to 0xA803, 0x1F4D to 0xB803, 0x1F4D to 0xC803, 0x1F4D to 0xD286, 0x1F4D to 0xD803
         )
     }
 }
