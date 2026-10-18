@@ -19,6 +19,9 @@
 #   HERE_DAILY_CAP       Upstream HERE incident calls allowed per UTC day, default "1000"
 #   TOMTOM_DAILY_CAP     Upstream TomTom incident calls allowed per UTC day, default "2300"
 #                        (at the cap the provider reports "quota" until UTC midnight)
+#   INCIDENTS_PER_CALLER_DAILY_SHARE
+#                        Share of each daily cap one phone may use, default "0.25"; past 80% of a
+#                        cap only tiles with nothing cached are fetched
 
 name = "aegis-comms"
 main = "src/index.ts"

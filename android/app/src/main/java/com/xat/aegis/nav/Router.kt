@@ -80,7 +80,8 @@ class Router(
         fromLat: Double, fromLon: Double, toLat: Double, toLon: Double,
         profile: RouteProfile, departEpochSec: Long,
     ): Route? {
-        val origins = snap(fromLat, fromLon)?.let(::preferOpen) ?: return null
+        // Origins are not filtered by preferOpen: see its doc.
+        val origins = snap(fromLat, fromLon) ?: return null
         val dests = snap(toLat, toLon)?.let(::preferOpen) ?: return null
         return search(origins, dests, toLat, toLon, profile, departEpochSec)
             ?: search(origins, dests, toLat, toLon, profile, departEpochSec, throughClosures = true)
@@ -88,7 +89,7 @@ class Router(
 
     @Synchronized
     fun alternatives(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double, departEpochSec: Long): List<Route> {
-        val origins = snap(fromLat, fromLon)?.let(::preferOpen) ?: return emptyList()
+        val origins = snap(fromLat, fromLon) ?: return emptyList()
         val dests = snap(toLat, toLon)?.let(::preferOpen) ?: return emptyList()
         val order = listOf(
             RouteProfile.FASTEST, RouteProfile.ECO, RouteProfile.NO_TOLLS,
@@ -119,8 +120,12 @@ class Router(
     }
 
     /**
-     * Drops closed edges from a snap when an open one is there too (the open direction of a road
-     * closed one way). A car already on a closed road, or a destination on one, still routes.
+     * Drops closed edges from a destination snap when an open one is there too (the open direction
+     * of a road closed one way); a destination only on closed edges still routes.
+     *
+     * Not applied to origins: a car on a road closed in its own direction is already on that edge,
+     * and dropping it would leave only the opposite direction, i.e. a forced U-turn. The search
+     * seeds origin edges without a closure check and only checks the edges it turns onto.
      */
     private fun preferOpen(hits: List<EdgeHit>): List<EdgeHit> {
         val open = hits.filter { !restrictions.isClosed(it.edge) }

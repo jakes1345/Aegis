@@ -223,6 +223,26 @@ class RoadClosuresTest {
     }
 
     @Test
+    fun aCarOnARoadClosedInItsDirectionCarriesOnInsteadOfTurningBack() {
+        // The car is 40 m along 1st Street eastbound, which is closed eastbound only (westbound open),
+        // heading for a point further east on 1st Street.
+        val east = edge(graph, node(0, 0), node(0, 1))
+        val west = edge(graph, node(0, 1), node(0, 0))
+        val closed = EdgeRestrictionSet.Builder().apply { close(east) }.build()
+        val router = Router(graph, SpeedSource.NONE, restrictions = closed)
+        val target = TestCity.eastOf(0, 2, 100.0)
+
+        val routes = listOf(router.route(start.lat, start.lon, target.lat, target.lon, RouteProfile.FASTEST, now)!!) +
+            router.alternatives(start.lat, start.lon, target.lat, target.lon, now)
+        for (r in routes) {
+            assertEquals("starts on the edge the car is on", east, r.edges[0])
+            assertFalse("no U-turn onto the open opposite direction", r.edges.contains(west))
+            assertEquals("leaves at the next junction", node(0, 1), graph.edgeFrom(r.edges[1]))
+            assertTrue(r.edges.drop(1).none { closed.isClosed(it) })
+        }
+    }
+
+    @Test
     fun aDetourGeometryClosesNothing() {
         val set = closures.update(listOf(zone("oh:7", WorkZone.DETOUR, WorkZone.IMPACT_UNKNOWN, firstStreetGeom())), emptyList(), now)
         assertEquals(0, set.size)

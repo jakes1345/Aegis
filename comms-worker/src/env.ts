@@ -27,6 +27,8 @@ export interface Env {
   HERE_DAILY_CAP?: string;
   /** Optional: upstream TomTom calls allowed per UTC day (default 2300). */
   TOMTOM_DAILY_CAP?: string;
+  /** Optional: share of each provider's daily cap one caller may use, from 0 to 1 (default 0.25). */
+  INCIDENTS_PER_CALLER_DAILY_SHARE?: string;
 }
 
 /** A JSON response with the headers every API reply carries. */

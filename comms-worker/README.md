@@ -162,7 +162,12 @@ upstream failure is not retried for a minute, and meanwhile a tile's last good
 result (up to 30 minutes old) is still served. Daily caps protect the free
 tiers: `HERE_DAILY_CAP` (default 1000) and `TOMTOM_DAILY_CAP` (default 2300)
 upstream calls per UTC day; at the cap the provider reports `"quota"` until
-UTC midnight. A failing provider reports `"error"`; the request itself still
+UTC midnight. So that one phone cannot spend a cap for everyone, each phone
+(counted under a salted hash of its number) may make at most
+`INCIDENTS_PER_CALLER_DAILY_SHARE` (default 0.25) of a provider's daily calls,
+and once a provider has used 80% of its cap only tiles with nothing cached are
+fetched. A tile held back by either keeps serving its last result; the
+provider then reports `"ok"` if anything was served, else `"quota"`. A failing provider reports `"error"`; the request itself still
 succeeds with whatever the other provider returned.
 
 ```json

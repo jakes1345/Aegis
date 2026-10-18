@@ -3,11 +3,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_DAILY_CAP,
+  HIGH_WATER_SHARE,
   MAX_GEOM_POINTS,
+  PER_CALLER_DAILY_SHARE,
   MAX_UPSTREAM_TILES_PER_REQUEST,
   TILE_ERROR_BACKOFF_SEC,
   TILE_FRESH_SEC,
   TILE_STALE_MAX_SEC,
+  callerAllowance,
   combineStatus,
   decideTile,
   hereUrl,
@@ -18,13 +21,17 @@ import {
   normalizeTomTom,
   parseBBoxParam,
   parseCap,
+  parseShare,
   pickTilesToFetch,
+  planUpstream,
+  providerStatus,
   quotaTake,
   serializeTile,
   staleUsable,
   tileFromKey,
   tilesForBBox,
   tomtomUrl,
+  upstreamGate,
   utcDay,
 } from "../src/incidents-logic.ts";
 
@@ -362,6 +369,84 @@ test("one request fetches a bounded number of tiles, empty ones first", () => {
   assert.equal(picked[1], stale, "then the oldest result");
   assert.ok(!pickTilesToFetch(tiles, r2, box, NOW, 25).includes(fresh));
   assert.deepEqual(pickTilesToFetch(tiles, r2, box, NOW, 0), []);
+});
+
+test("per-caller allowance defaults to a quarter of the cap and is env-overridable", () => {
+  assert.equal(PER_CALLER_DAILY_SHARE, 0.25);
+  assert.equal(callerAllowance(DEFAULT_DAILY_CAP.here, PER_CALLER_DAILY_SHARE), 250);
+  assert.equal(callerAllowance(3, 0.25), 1, "a small cap still lets each caller make a call");
+  assert.equal(callerAllowance(0, 0.25), 0);
+  assert.equal(parseShare(undefined, 0.25), 0.25);
+  assert.equal(parseShare("0.5", 0.25), 0.5);
+  assert.equal(parseShare("1", 0.25), 1);
+  for (const bad of ["0", "-0.1", "1.5", "half", " "]) assert.equal(parseShare(bad, 0.25), 0.25, bad);
+});
+
+test("upstream gate: cap, then high-water mark for tiles with a result, then the caller's allowance", () => {
+  const u = (globalCount, callerCount) => ({ globalCount, cap: 100, callerCount, callerAllowance: 25 });
+  assert.equal(upstreamGate(u(10, 0), true), "fetch");
+  assert.equal(upstreamGate(u(10, 25), false), "limited", "allowance exhausted");
+  assert.equal(upstreamGate(u(100 * HIGH_WATER_SHARE, 0), true), "limited", "high-water mark holds back a tile with a result");
+  assert.equal(upstreamGate(u(100 * HIGH_WATER_SHARE - 1, 0), true), "fetch");
+  assert.equal(upstreamGate(u(99, 0), false), "fetch", "a tile with nothing cached is still fetched below the cap");
+  assert.equal(upstreamGate(u(100, 0), false), "cap");
+});
+
+test("planning upstream calls under the caller's allowance and the high-water mark", () => {
+  const box = [40.1, -83.1, 40.4, -82.9];
+  const tiles = tilesForBBox(box);
+  assert.ok(tiles.length >= 4);
+  const [freshT, staleT, emptyT, oldT] = tiles;
+  const rows = new Map(tiles.map((t) => [t.key, { goodAt: NOW - TILE_FRESH_SEC - 60, errorAt: null }]));
+  rows.set(freshT.key, { goodAt: NOW - 10, errorAt: null });
+  rows.set(emptyT.key, null);
+  // Cached, but too old to serve: counts as having nothing to show.
+  rows.set(oldT.key, { goodAt: NOW - TILE_STALE_MAX_SEC - 60, errorAt: null });
+  const usage = (globalCount, callerCount) => ({ globalCount, cap: 100, callerCount, callerAllowance: 25 });
+
+  // Plenty left: the budget goes to tiles with nothing to show first; fresh tiles are not touched.
+  const open = planUpstream(tiles, rows, box, NOW, usage(0, 0));
+  assert.equal(open.has(freshT.key), false);
+  assert.equal(open.get(emptyT.key), "fetch");
+  assert.equal(open.get(oldT.key), "fetch");
+  assert.equal([...open.values()].filter((p) => p === "fetch").length, Math.min(MAX_UPSTREAM_TILES_PER_REQUEST, open.size));
+
+  // Allowance exhausted: nothing is fetched, everything that needed a refresh is limited.
+  const spent = planUpstream(tiles, rows, box, NOW, usage(10, 25));
+  assert.ok([...spent.values()].every((p) => p === "limited"));
+  assert.equal(spent.get(staleT.key), "limited");
+  assert.equal(spent.get(emptyT.key), "limited");
+
+  // One call left in the allowance: it goes to a tile with nothing to show; the rest are limited.
+  const one = planUpstream(tiles, rows, box, NOW, usage(10, 24));
+  assert.equal([...one.values()].filter((p) => p === "fetch").length, 1);
+  assert.ok(one.get(emptyT.key) === "fetch" || one.get(oldT.key) === "fetch");
+  assert.equal(one.get(staleT.key), "limited");
+
+  // High-water mark: tiles with a usable result keep it; uncached ones are still fetched below the cap.
+  const hw = planUpstream(tiles, rows, box, NOW, usage(80, 0));
+  assert.equal(hw.get(staleT.key), "limited");
+  assert.equal(hw.get(emptyT.key), "fetch");
+  assert.equal(hw.get(oldT.key), "fetch");
+  for (const t of tiles.slice(4)) assert.equal(hw.get(t.key), "limited");
+
+  // At the cap: quota, as before.
+  const capped = planUpstream(tiles, rows, box, NOW, usage(100, 0));
+  assert.ok([...capped.values()].every((p) => p === "quota"));
+
+  // Only the per-request budget binds: the leftovers are deferred to later polls.
+  const many = new Map(tiles.map((t) => [t.key, null]));
+  const deferred = planUpstream(tiles, many, box, NOW, usage(0, 0));
+  assert.equal([...deferred.values()].filter((p) => p === "defer").length, tiles.length - MAX_UPSTREAM_TILES_PER_REQUEST);
+});
+
+test("held-back tiles report ok when anything was served, else quota", () => {
+  assert.equal(providerStatus([{ status: "limited", served: true }, { status: "limited", served: false }]), "ok");
+  assert.equal(providerStatus([{ status: "ok", served: true }, { status: "limited", served: false }]), "ok");
+  assert.equal(providerStatus([{ status: "limited", served: false }, { status: "limited", served: false }]), "quota");
+  assert.equal(providerStatus([{ status: "error", served: false }, { status: "limited", served: true }]), "error");
+  assert.equal(providerStatus([{ status: "quota", served: true }, { status: "ok", served: true }]), "quota");
+  assert.equal(providerStatus([{ status: "ok", served: true }]), "ok");
 });
 
 test("tile bodies stay under the storage limit", () => {

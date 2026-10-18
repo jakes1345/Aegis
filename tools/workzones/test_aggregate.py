@@ -331,7 +331,8 @@ def test_run_end_to_end(tmp_path):
 
     files = sorted(os.listdir(out))
     assert "workzones-index.json" in files
-    assert len([f for f in files if f.endswith(".json.gz")]) == 52
+    assert len([f for f in files if f.startswith("workzones-north-america-")]) == 52
+    assert "workzones-feeds.json.gz" in files
     index = json.loads((out / "workzones-index.json").read_text())
     assert index["generated"] == NOW
     feeds = {f["name"]: f for f in index["feeds"]}
@@ -366,7 +367,7 @@ def test_main_fails_when_no_feed_works(tmp_path, monkeypatch):
                                 "url": {"url": (tmp_path / "nope.json").as_uri()}}]))
     monkeypatch.delenv("WZDX_KEYS", raising=False)
     monkeypatch.setattr(agg, "RETRIES", 0)
-    rc = agg.main(["--registry", str(reg), "--out", str(tmp_path / "dist")])
+    rc = agg.main(["--registry", str(reg), "--out", str(tmp_path / "dist"), "--previous", ""])
     assert rc == 1
 
 
@@ -381,3 +382,123 @@ def test_douglas_peucker_handles_long_lines_without_recursion():
     pts = [(40.0 + 0.001 * math.sin(i / 10.0), -90.0 + i * 0.0001) for i in range(20000)]
     out = agg.simplify(pts)
     assert len(out) <= 200
+
+
+# --- key redaction -----------------------------------------------------------------------------
+
+
+def test_feed_errors_never_contain_the_api_key(monkeypatch):
+    key = "s3cr/et key"
+    fetch, _ = agg.plan_feeds([{"feedname": "k", "state": "ohio", "active": True, "needapikey": True,
+                                "url": {"url": "ex.org/feed?api_key="}}], {"k": key})
+    assert fetch[0]["key"] == key
+    monkeypatch.setattr(agg, "RETRIES", 0)
+    # A registry URL without a scheme makes urllib quote the whole URL, key included, in its
+    # ValueError ("unknown url type: 'ex.org/feed?api_key=s3cr%2Fet%20key'").
+    status, items = agg.process_feed(fetch[0], NOW)
+    assert not status["ok"] and items == []
+    assert "unknown url type" in status["error"]
+    enc = "s3cr%2Fet%20key"
+    assert key not in status["error"] and enc not in status["error"]
+    assert "<redacted>" in status["error"]
+
+    # Raw form too, and a key straddling the truncation point is never partly left behind.
+    msg = agg.describe_error(ValueError("x" * 183 + key), key)  # key starts 5 chars before the cut
+    assert len(msg) == 200 and "s3cr" not in msg and msg.endswith("<reda")
+    assert agg.describe_error(ValueError(f"bad {enc} and {key}"), key) == \
+        "ValueError: bad <redacted> and <redacted>"
+
+
+# --- carry-forward -----------------------------------------------------------------------------
+
+
+def _carry_registry(tmp_path):
+    registry = [
+        {"feedname": "sc", "state": "minnesota", "issuingorganization": "Sample City DOT",
+         "active": True, "needapikey": False, "url": {"url": (FIX / "wzdx_v3_1.geojson").as_uri()}},
+        {"feedname": "down", "state": "north carolina", "issuingorganization": "Down DOT",
+         "active": True, "needapikey": False, "url": {"url": (tmp_path / "missing.json").as_uri()}},
+    ]
+    reg = tmp_path / "registry.json"
+    reg.write_text(json.dumps(registry))
+    return reg
+
+
+def _prev_item(ident, end):
+    return {"id": f"down:{ident}", "type": "closure", "impact": "all_closed", "speed_kph": None,
+            "road": "I-40", "direction": None, "description": None, "start": None, "end": end,
+            "geom": [[35.8, -78.6], [35.81, -78.6]], "source": "Down DOT"}
+
+
+def _write_prev(path, generated):
+    agg.write_gz_json(str(path), {"version": 1, "generated": generated, "feeds": {
+        "down": {"generated": generated, "items": [
+            _prev_item("live", NOW + 3600), _prev_item("open-ended", None), _prev_item("expired", NOW - 1)]},
+    }})
+
+
+def _state(out, slug):
+    with gzip.open(out / f"workzones-{slug}.json.gz", "rt", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_failed_feed_carries_recent_previous_items(tmp_path, monkeypatch):
+    monkeypatch.setattr(agg, "RETRIES", 0)
+    prev = tmp_path / "prev.json.gz"
+    generated = NOW - 5 * 3600
+    _write_prev(prev, generated)
+    out = tmp_path / "dist"
+    agg.run(str(_carry_registry(tmp_path)), str(out), str(REGIONS), str(BBOXES), {}, now=NOW,
+            previous_src=str(prev))
+
+    nc = _state(out, "north-america-us-north-carolina")
+    assert sorted(i["id"] for i in nc["items"]) == ["down:live", "down:open-ended"]
+    feeds = {f["name"]: f for f in json.loads((out / "workzones-index.json").read_text())["feeds"]}
+    assert feeds["down"]["ok"] is False and feeds["down"]["error"]
+    assert feeds["down"]["carried_from"] == generated and feeds["down"]["items"] == 2
+    assert "carried_from" not in feeds["sc"]
+
+    # The new feeds file keeps the carried feed's original fetch time, so the 6 h limit holds
+    # across consecutive failures; fresh feeds are stamped with this run.
+    with gzip.open(out / "workzones-feeds.json.gz", "rt", encoding="utf-8") as f:
+        written = json.load(f)
+    assert written["version"] == 1 and written["generated"] == NOW
+    assert written["feeds"]["down"]["generated"] == generated
+    assert len(written["feeds"]["down"]["items"]) == 2
+    assert written["feeds"]["sc"]["generated"] == NOW and len(written["feeds"]["sc"]["items"]) == 2
+
+
+def test_stale_previous_items_are_not_carried(tmp_path, monkeypatch):
+    monkeypatch.setattr(agg, "RETRIES", 0)
+    prev = tmp_path / "prev.json.gz"
+    _write_prev(prev, NOW - 6 * 3600 - 1)
+    out = tmp_path / "dist"
+    agg.run(str(_carry_registry(tmp_path)), str(out), str(REGIONS), str(BBOXES), {}, now=NOW,
+            previous_src=str(prev))
+    assert _state(out, "north-america-us-north-carolina")["items"] == []
+    feeds = {f["name"]: f for f in json.loads((out / "workzones-index.json").read_text())["feeds"]}
+    assert "carried_from" not in feeds["down"] and feeds["down"]["items"] == 0
+    with gzip.open(out / "workzones-feeds.json.gz", "rt", encoding="utf-8") as f:
+        assert set(json.load(f)["feeds"]) == {"sc"}
+
+
+@pytest.mark.parametrize("prev_content", [None, b"not gzip or json", b"\x1f\x8bcorrupt"])
+def test_previous_feeds_unavailable_does_not_fail_the_run(tmp_path, monkeypatch, prev_content):
+    monkeypatch.setattr(agg, "RETRIES", 0)
+    monkeypatch.delenv("WZDX_KEYS", raising=False)
+    prev = tmp_path / "prev.json.gz"
+    if prev_content is not None:
+        prev.write_bytes(prev_content)
+    out = tmp_path / "dist"
+    rc = agg.main(["--registry", str(_carry_registry(tmp_path)), "--out", str(out),
+                   "--previous", str(prev)])
+    assert rc == 0
+    assert _state(out, "north-america-us-north-carolina")["items"] == []
+    assert len(_state(out, "north-america-us-minnesota")["items"]) == 2
+
+
+def test_previous_feeds_download_failure_is_tolerated(monkeypatch):
+    def boom(*a, **k):
+        raise agg.urllib.error.URLError(OSError("unreachable"))
+    monkeypatch.setattr(agg, "fetch_bytes", boom)
+    assert agg.load_previous_feeds(agg.PREVIOUS_FEEDS_URL) == {}

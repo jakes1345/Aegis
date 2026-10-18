@@ -562,10 +562,11 @@ private fun NavMap(
         incidentLayer.items.clear()
         val now = System.currentTimeMillis() / 1000
         val live = incidents.filter { it.expiresAt !in 1 until now }
+        fun drawnAsLine(inc: Incident) = (inc.geom?.size ?: 0) >= 2 && inc.type in LINE_TYPES
         // Stretches first so every marker stays on top of them: closures red and dashed, other work orange.
         for (inc in live) {
-            val geom = inc.geom ?: continue
-            if (geom.size < 2 || inc.type !in LINE_TYPES) continue
+            if (!drawnAsLine(inc)) continue
+            val geom = inc.geom!!
             val closed = inc.type == Incident.CLOSURE
             val line = Polyline(mapView).apply {
                 outlinePaint.color = (if (closed) CLOSURE_LINE else WORK_ZONE_LINE).toArgbInt()
@@ -579,9 +580,10 @@ private fun NavMap(
             }
             incidentLayer.add(line)
         }
-        // Work zones are tapped on their line; a marker each would bury the map in icons.
+        // Work zones drawn as a line are tapped on it; a marker each would bury the map in icons.
+        // A point-only zone has no line, so it keeps its marker.
         for (inc in live) {
-            if (inc.origin == Incident.Origin.WORK_ZONE) continue
+            if (inc.origin == Incident.Origin.WORK_ZONE && drawnAsLine(inc)) continue
             val m = Marker(mapView).apply {
                 position = GeoPoint(inc.lat, inc.lon)
                 icon = ContextCompat.getDrawable(context, incidentIcon(inc.type))

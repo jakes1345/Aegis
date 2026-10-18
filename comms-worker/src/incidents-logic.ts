@@ -339,6 +339,54 @@ export function quotaTake(counter: QuotaCounter | null, now: number, cap: number
   return { allowed: true, counter: { day, count: current + 1 } };
 }
 
+/**
+ * Share of a provider's daily cap one caller (phone) may spend, so one phone,
+ * or one cycling through boxes, cannot use up the shared cap for everyone.
+ */
+export const PER_CALLER_DAILY_SHARE = 0.25;
+/**
+ * Once a provider's calls today reach this share of its cap, only tiles with
+ * nothing to show are fetched; tiles with a usable result keep serving it, so
+ * the rest of the cap goes to areas that would otherwise show nothing.
+ */
+export const HIGH_WATER_SHARE = 0.8;
+
+/** A share in (0, 1] from an env var, or the default. */
+export function parseShare(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : fallback;
+}
+
+/** Upstream calls one caller may make per provider per UTC day: at least one while the cap allows any. */
+export function callerAllowance(cap: number, share: number): number {
+  return cap <= 0 ? 0 : Math.max(1, Math.floor(cap * share));
+}
+
+/** Today's upstream calls for one provider: all callers', and the requesting caller's. */
+export interface UpstreamUsage {
+  globalCount: number;
+  cap: number;
+  callerCount: number;
+  callerAllowance: number;
+}
+
+export function highWater(u: UpstreamUsage): boolean {
+  return u.globalCount >= u.cap * HIGH_WATER_SHARE;
+}
+
+/**
+ * Whether one more upstream call may start: "cap" when the provider's daily
+ * cap is reached, "limited" when the high-water mark (for a tile that has a
+ * usable result) or the caller's allowance stands in the way.
+ */
+export function upstreamGate(u: UpstreamUsage, hasUsable: boolean): "fetch" | "cap" | "limited" {
+  if (u.globalCount >= u.cap) return "cap";
+  if (hasUsable && highWater(u)) return "limited";
+  if (u.callerCount >= u.callerAllowance) return "limited";
+  return "fetch";
+}
+
 /** A positive whole-number cap from an env var, or the default. */
 export function parseCap(raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw.trim() === "") return fallback;
@@ -404,6 +452,60 @@ export function pickTilesToFetch(
     });
   cands.sort((a, b) => a.empty - b.empty || a.goodAt - b.goodAt || a.dist - b.dist);
   return cands.slice(0, Math.max(0, budget)).map((c) => c.key);
+}
+
+/**
+ * What each tile that needs a refresh does on this request:
+ *   fetch    call upstream now
+ *   defer    over this request's budget; serve what it has, a later poll fetches it
+ *   limited  held back by the caller's allowance or the high-water mark; serve what it has
+ *   quota    the provider's daily cap is reached; serve what it has
+ * Tiles that need no refresh (fresh, or backing off after an error) are absent.
+ */
+export type UpstreamPlan = "fetch" | "defer" | "limited" | "quota";
+
+export function planUpstream(
+  tiles: readonly Tile[],
+  rows: ReadonlyMap<string, TileRow | null>,
+  bbox: BBox,
+  now: number,
+  usage: UpstreamUsage,
+  perRequest: number = MAX_UPSTREAM_TILES_PER_REQUEST,
+): Map<string, UpstreamPlan> {
+  const out = new Map<string, UpstreamPlan>();
+  const hw = highWater(usage);
+  const eligible: Tile[] = [];
+  for (const t of tiles) {
+    const row = rows.get(t.key) ?? null;
+    if (decideTile(row, now) !== "fetch") continue;
+    if (hw && usage.globalCount < usage.cap && staleUsable(row, now)) out.set(t.key, "limited");
+    else eligible.push(t);
+  }
+  const capLeft = Math.max(0, usage.cap - usage.globalCount);
+  const callerLeft = Math.max(0, usage.callerAllowance - usage.callerCount);
+  const budget = Math.min(perRequest, capLeft, callerLeft);
+  const picked = new Set(pickTilesToFetch(eligible, rows, bbox, now, budget));
+  // Why the tiles left over were left over: the tightest of the three limits.
+  const leftover: UpstreamPlan = capLeft <= budget ? "quota" : callerLeft <= budget ? "limited" : "defer";
+  for (const t of eligible) out.set(t.key, picked.has(t.key) ? "fetch" : leftover);
+  return out;
+}
+
+/** One tile's part in a reply: its status ("limited" as planned above) and whether it had a result to serve. */
+export interface TileReport {
+  status: ProviderStatus | "limited";
+  served: boolean;
+}
+
+/**
+ * The provider status for one request. Tiles held back by the caller's
+ * allowance or the high-water mark do not count against it as long as the
+ * provider served something: "ok" then, "quota" if nothing at all was served.
+ */
+export function providerStatus(tiles: readonly TileReport[]): ProviderStatus {
+  const base = combineStatus(tiles.filter((t) => t.status !== "limited").map((t) => t.status as ProviderStatus));
+  if (base !== "ok" || !tiles.some((t) => t.status === "limited")) return base;
+  return tiles.some((t) => t.served) ? "ok" : "quota";
 }
 
 /** Durable Object SQLite refuses strings over 2 MB; a tile's cached body stays well below that. */

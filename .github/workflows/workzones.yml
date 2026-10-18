@@ -15,7 +15,8 @@ permissions:
 
 concurrency:
   group: workzones
-  cancel-in-progress: true
+  # A cancelled run could stop mid-upload and leave a mix of old and new release assets.
+  cancel-in-progress: false
 
 jobs:
   aggregate:
@@ -47,10 +48,12 @@ jobs:
           body: |
             Live work zones aggregated from the USDOT WZDx feed registry, refreshed every 15 minutes.
             One workzones-<slug>.json.gz per region; workzones-index.json lists each feed's status.
+            workzones-feeds.json.gz holds each feed's items so a feed that fails briefly is carried forward.
           prerelease: true
           make_latest: false
           overwrite_files: true
           fail_on_unmatched_files: true
+          # dist/workzones-*.json.gz includes workzones-feeds.json.gz.
           files: |
             dist/workzones-*.json.gz
             dist/workzones-index.json

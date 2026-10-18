@@ -375,7 +375,7 @@ async function trafficRoute(env: Env, request: Request, url: URL, path: string, 
     await limit("incidents");
     const parsed = parseBBoxParam(url.searchParams.get("bbox"));
     if ("error" in parsed) throw new HttpError(400, parsed.error);
-    return jsonText(await env.INCIDENTS.get(env.INCIDENTS.idFromName(INCIDENTS_NAME)).incidents(parsed.bbox, now));
+    return jsonText(await env.INCIDENTS.get(env.INCIDENTS.idFromName(INCIDENTS_NAME)).incidents(parsed.bbox, now, number));
   }
 
   if (path === "/v1/traffic/report" && request.method === "POST") {

@@ -6,8 +6,11 @@ is configured in WZDX_KEYS), normalizes the features and writes
 
     <out>/workzones-<slug>.json.gz   for every region slug in tools/graph-builder/us-regions.txt
     <out>/workzones-index.json       per-feed status
+    <out>/workzones-feeds.json.gz    each feed's items, so the next run can carry a feed that
+                                     fails then forward instead of publishing its states empty
 
 usage: aggregate.py [--registry URL|PATH] [--out DIR] [--regions FILE] [--bboxes FILE]
+                    [--previous URL|PATH]
 """
 from __future__ import annotations
 
@@ -32,6 +35,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REGISTRY_URL = "https://data.transportation.gov/resource/69qe-yiui.json?$limit=500"
 DEFAULT_REGIONS = os.path.join(HERE, "..", "graph-builder", "us-regions.txt")
 DEFAULT_BBOXES = os.path.join(HERE, "state_bboxes.json")
+PREVIOUS_FEEDS_URL = "https://github.com/jakes1345/Aegis/releases/download/workzones/workzones-feeds.json.gz"
+# A feed that fails is republished from the previous run's items for at most this long after
+# its last successful fetch.
+CARRY_MAX_AGE_S = 6 * 3600
 
 FETCH_TIMEOUT_S = 60
 MAX_BYTES = 50 * 1024 * 1024
@@ -165,15 +172,26 @@ def load_json_source(src: str):
         return json.loads(f.read().decode("utf-8-sig"))
 
 
-def describe_error(e: Exception) -> str:
-    # Never str() a URLError's URL-bearing pieces: the URL may contain an API key.
+def redact(text: str, secret: str | None) -> str:
+    """text with the secret removed in both its raw and URL-encoded forms."""
+    if not secret:
+        return text
+    for form in sorted({secret, urllib.parse.quote(secret, safe="")}, key=len, reverse=True):
+        text = text.replace(form, "<redacted>")
+    return text
+
+
+def describe_error(e: Exception, secret: str | None = None) -> str:
+    # Never str() a URLError's URL-bearing pieces: the URL may contain an API key. Other
+    # exceptions (ValueError "unknown url type", InvalidURL, ...) can still quote the URL, so the
+    # key is redacted, before truncating so that a cut cannot leave part of it behind.
     if isinstance(e, urllib.error.HTTPError):
         return f"HTTP {e.code}"
     if isinstance(e, urllib.error.URLError):
-        return f"network error: {type(e.reason).__name__}: {e.reason}"[:200]
+        return redact(f"network error: {type(e.reason).__name__}: {e.reason}", secret)[:200]
     if isinstance(e, json.JSONDecodeError):
         return f"invalid JSON: {e.msg} at {e.pos}"
-    return f"{type(e).__name__}: {e}"[:200]
+    return redact(f"{type(e).__name__}: {e}", secret)[:200]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -556,12 +574,14 @@ def write_gz_json(path: str, obj) -> None:
 
 
 def write_outputs(out_dir: str, slugs: list[str], by_state: dict[str, list[dict]],
-                  feeds: list[dict], now: int) -> None:
+                  feeds: list[dict], now: int, feed_items: dict[str, dict] | None = None) -> None:
     os.makedirs(out_dir, exist_ok=True)
     for slug in slugs:
         items = sorted(by_state.get(slug, []), key=lambda i: i["id"])
         write_gz_json(os.path.join(out_dir, f"workzones-{slug}.json.gz"),
                       {"version": 1, "generated": now, "slug": slug, "items": items})
+    write_gz_json(os.path.join(out_dir, "workzones-feeds.json.gz"),
+                  {"version": 1, "generated": now, "feeds": feed_items or {}})
     index = {"generated": now, "feeds": feeds}
     tmp = os.path.join(out_dir, "workzones-index.json.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -595,6 +615,7 @@ def plan_feeds(registry: list, keys: dict[str, str]) -> tuple[list[dict], list[d
                                 "ok": False, "error": "api key not configured"})
                 continue
             row["url"] = apply_key(url, key)
+            row["key"] = key  # kept so errors quoting the URL can be redacted
         to_fetch.append(row)
     return to_fetch, skipped
 
@@ -611,7 +632,7 @@ def process_feed(feed: dict, now: int) -> tuple[dict, list[dict]]:
             raise ValueError("not a GeoJSON FeatureCollection")
         items = parse_feed(doc, feed["name"], feed["source"], now)
     except Exception as e:  # noqa: BLE001 - one bad feed must not sink the run
-        status["error"] = describe_error(e)
+        status["error"] = describe_error(e, feed.get("key"))
         log.warning("feed %s failed: %s", feed["name"], status["error"])
         return status, []
     status["items"] = len(items)
@@ -632,8 +653,59 @@ def parse_keys(env_value: str | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in obj.items() if isinstance(v, (str, int)) and str(v)}
 
 
+def _valid_item(it) -> bool:
+    if not isinstance(it, dict) or not isinstance(it.get("id"), str):
+        return False
+    geom = it.get("geom")
+    if not isinstance(geom, list) or not geom:
+        return False
+    return all(isinstance(p, list) and len(p) == 2 and num(p[0]) is not None
+               and num(p[1]) is not None for p in geom)
+
+
+def load_previous_feeds(src: str | None) -> dict[str, dict]:
+    """feedname -> {"generated", "items"} from a previous run's workzones-feeds.json.gz.
+
+    Any failure (first run, network, corrupt file) means no carry-forward, never a failed run.
+    """
+    if not src:
+        return {}
+    try:
+        if re.match(r"^https?://", src):
+            raw = fetch_bytes(src, retries=1)  # gunzips by magic bytes, both steps size-capped
+        else:
+            with open(src, "rb") as f:
+                raw = read_capped(f, MAX_BYTES)
+            if raw[:2] == b"\x1f\x8b":
+                raw = gunzip_capped(raw, MAX_DECOMPRESSED_BYTES)
+        doc = json.loads(raw.decode("utf-8"))
+        feeds = doc.get("feeds") if isinstance(doc, dict) and doc.get("version") == 1 else None
+        if not isinstance(feeds, dict):
+            raise ValueError("not a version 1 feeds file")
+    except Exception as e:  # noqa: BLE001
+        log.warning("previous feeds unavailable (%s); nothing carried forward", describe_error(e))
+        return {}
+    out = {}
+    for name, entry in feeds.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("items"), list):
+            continue
+        generated = entry.get("generated")
+        if not isinstance(generated, int) or isinstance(generated, bool):
+            continue
+        out[name] = {"generated": generated, "items": [i for i in entry["items"] if _valid_item(i)]}
+    return out
+
+
+def carry_forward(prev: dict | None, now: int) -> list[dict] | None:
+    """The still-current items of a failed feed's previous result, or None if too old/absent."""
+    if prev is None or now - prev["generated"] > CARRY_MAX_AGE_S:
+        return None
+    return [i for i in prev["items"] if not (isinstance(i.get("end"), (int, float)) and i["end"] < now)]
+
+
 def run(registry_src: str, out_dir: str, regions_path: str, bboxes_path: str,
-        keys: dict[str, str], now: int | None = None, workers: int = 8) -> dict:
+        keys: dict[str, str], now: int | None = None, workers: int = 8,
+        previous_src: str | None = None) -> dict:
     now = int(time.time()) if now is None else now
     slugs = region_slugs(regions_path)
     bboxes = load_bboxes(bboxes_path)
@@ -644,16 +716,31 @@ def run(registry_src: str, out_dir: str, regions_path: str, bboxes_path: str,
 
     registry = load_json_source(registry_src)
     to_fetch, statuses = plan_feeds(registry, keys)
+    previous = load_previous_feeds(previous_src)
     all_items: list[dict] = []
+    feed_items: dict[str, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(lambda f: process_feed(f, now), to_fetch))
     for status, items in results:
+        name = status["name"]
+        if status["ok"]:
+            feed_items[name] = {"generated": now, "items": items}
+        else:
+            prev = previous.get(name)
+            carried = carry_forward(prev, now)
+            if carried is not None:
+                items = carried
+                status["items"] = len(items)
+                status["carried_from"] = prev["generated"]
+                # Keeps the original fetch time so repeated failures stop carrying after 6 h.
+                feed_items[name] = {"generated": prev["generated"], "items": items}
+                log.info("feed %s: carried %d items from %d", name, len(items), prev["generated"])
         statuses.append(status)
         all_items.extend(items)
     statuses.sort(key=lambda s: s["name"])
 
     by_state = split_by_state(all_items, bboxes)
-    write_outputs(out_dir, slugs, by_state, statuses, now)
+    write_outputs(out_dir, slugs, by_state, statuses, now, feed_items)
     ok = sum(1 for s in statuses if s["ok"])
     log.info("%d/%d feeds ok, %d items, wrote %d state files to %s",
              ok, len(statuses), len(all_items), len(slugs), out_dir)
@@ -667,11 +754,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default="dist")
     ap.add_argument("--regions", default=DEFAULT_REGIONS)
     ap.add_argument("--bboxes", default=DEFAULT_BBOXES)
+    ap.add_argument("--previous", default=PREVIOUS_FEEDS_URL,
+                    help="previous run's workzones-feeds.json.gz to carry failed feeds from ('' = none)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
 
     result = run(args.registry, args.out, args.regions, args.bboxes,
-                 parse_keys(os.environ.get("WZDX_KEYS")))
+                 parse_keys(os.environ.get("WZDX_KEYS")), previous_src=args.previous)
     if not any(s["ok"] for s in result["feeds"]):
         # Publishing now would replace every state's last good file with an empty one.
         log.error("no feed could be fetched; not publishing")
