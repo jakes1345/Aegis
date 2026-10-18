@@ -2,11 +2,11 @@ name: Maps
 
 # Builds the AGR road graph for each region the app offers and publishes it as
 # graph-<slug>.agr.gz (+ .sha256) on the release tagged maps-<slug>, replacing the
-# previous build. Runs weekly so maps track OpenStreetMap edits, whenever the builder
+# previous build. Runs daily so maps track OpenStreetMap edits, whenever the builder
 # or the region list changes on master, and on demand for one region or all.
 on:
   schedule:
-    - cron: '17 6 * * 0'
+    - cron: '17 6 * * *'
   push:
     branches: [master]
     paths:
@@ -153,7 +153,7 @@ jobs:
           name: Road graph ${{ steps.region.outputs.region }}
           body: |
             Road graph (format v2) for `${{ steps.region.outputs.region }}`, built from the Geofabrik extract
-            by run ${{ github.run_id }} of ${{ github.sha }}. Rebuilt weekly. Map data (c) OpenStreetMap contributors, ODbL.
+            by run ${{ github.run_id }} of ${{ github.sha }}. Rebuilt daily. Map data (c) OpenStreetMap contributors, ODbL.
           files: |
             dist/graph-${{ steps.region.outputs.slug }}.agr.gz
             dist/graph-${{ steps.region.outputs.slug }}.agr.gz.sha256

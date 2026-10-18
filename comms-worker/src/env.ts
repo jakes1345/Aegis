@@ -1,10 +1,13 @@
 import type { Mailbox } from "./mailbox";
+import type { IncidentCache } from "./incidents";
 import type { Traffic } from "./traffic";
 
 export interface Env {
   MAILBOX: DurableObjectNamespace<Mailbox>;
   /** Crowd-sourced traffic, one object per map region ("traffic:<region>") plus "traffic-registry". */
   TRAFFIC: DurableObjectNamespace<Traffic>;
+  /** HERE / TomTom incident tiles and daily quota counters, one object ("incidents"). */
+  INCIDENTS: DurableObjectNamespace<IncidentCache>;
   /** One-time code typed into Aegis when it registers, so the relay is not open to everyone. */
   ENROLL_SECRET: string;
   /** Optional: Cloudflare Realtime TURN key id + API token, for calls. */
@@ -16,11 +19,26 @@ export interface Env {
   ADMIN_SECRET?: string;
   /** Optional: comma-separated URLs of WZDx v4 GeoJSON feeds, polled every 10 minutes for work zones. */
   WZDX_FEEDS?: string;
+  /** Optional: HERE Traffic API v7 key for GET /v1/traffic/incidents. Unset: HERE is "off". */
+  HERE_API_KEY?: string;
+  /** Optional: TomTom Traffic API key for GET /v1/traffic/incidents. Unset: TomTom is "off". */
+  TOMTOM_API_KEY?: string;
+  /** Optional: upstream HERE calls allowed per UTC day (default 1000). */
+  HERE_DAILY_CAP?: string;
+  /** Optional: upstream TomTom calls allowed per UTC day (default 2300). */
+  TOMTOM_DAILY_CAP?: string;
+  /** Optional: share of each provider's daily cap one caller may use, from 0 to 1 (default 0.25). */
+  INCIDENTS_PER_CALLER_DAILY_SHARE?: string;
 }
 
 /** A JSON response with the headers every API reply carries. */
 export function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
+  return jsonText(JSON.stringify(body), status);
+}
+
+/** Like [json] for a body that is already JSON text. */
+export function jsonText(text: string, status = 200): Response {
+  return new Response(text, {
     status,
     headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
   });

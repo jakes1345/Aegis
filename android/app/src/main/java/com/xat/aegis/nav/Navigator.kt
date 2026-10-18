@@ -581,9 +581,12 @@ class Navigator(
         }
         for (a in incidentsAhead(t)) {
             if (a.distanceM > INCIDENT_ALERT_M) break
+            val provider = a.incident.origin == Incident.Origin.PROVIDER
             val text = when (a.incident.type) {
                 Incident.POLICE -> "Police reported ahead"
                 Incident.CRASH -> "Crash reported ahead"
+                Incident.HAZARD -> if (provider) "Hazard reported ahead" else continue
+                Incident.JAM -> if (provider) "Traffic jam reported ahead" else continue
                 else -> continue
             }
             if (alertedIncidents.add(a.incident.id)) speak(text)
@@ -653,7 +656,8 @@ class Navigator(
             ?: traffic.typicalKph(key, epochSec)
             ?: graph.edgeMaxspeedKph(e).takeIf { it > 0 }?.let { it * 0.9 }
             ?: CLASS_KPH[graph.edgeRoadClass(e).coerceIn(0, CLASS_KPH.size - 1)]
-        return kph.coerceIn(MIN_KPH, MAX_KPH)
+        val cap = router.restrictions.speedCapKph(e)
+        return (if (cap != null && cap < kph) cap else kph).coerceIn(MIN_KPH, MAX_KPH)
     }
 
     /** Seconds to drive the rest of [t] from [fromM] at current speeds, with junction and turn delays. */
@@ -722,15 +726,30 @@ class Navigator(
         }
     }
 
-    /** Switches to a fresh route from the current position when it beats the remaining one by 3 minutes. */
+    /** True when an edge of [t] not yet reached from [fromM] is closed. */
+    private fun closedAhead(t: Track, fromM: Double = progressM): Boolean {
+        val r = router.restrictions
+        if (r === EdgeRestrictions.NONE || t.edges.isEmpty()) return false
+        // The edge being driven is skipped: the car is past the point of choosing another way onto it.
+        for (j in (t.edgeIndexAt(fromM) + 1).coerceAtLeast(0) until t.edges.size) if (r.isClosed(t.edges[j])) return true
+        return false
+    }
+
+    /**
+     * Switches to a fresh route from the current position when it beats the remaining one by 3
+     * minutes, or at once when a road ahead on the current one has closed.
+     */
     private suspend fun checkFaster(gen: Int) {
         val fix = lastFix.value ?: return
+        var closed = false
         val (lat, lon, prof) = routeLock.withLock {
-            if (generation != gen || track == null || offCount > 0 || rerouting) return
+            val t = track
+            if (generation != gen || t == null || offCount > 0 || rerouting) return
+            closed = closedAhead(t)
             Triple(destLat, destLon, profile)
         }
         // SHORTEST asked for the shortest drive, not the quickest one; time savings do not apply.
-        if (prof == RouteProfile.SHORTEST) return
+        if (prof == RouteProfile.SHORTEST && !closed) return
         if (!searching.compareAndSet(false, true)) return
         try {
             val now = nowSec()
@@ -741,14 +760,20 @@ class Navigator(
             routeLock.withLock {
                 if (generation != gen) return
                 val cur = track ?: return
+                // A road closed since the route was planned: any route that avoids it beats one that cannot be driven.
+                val blocked = closedAhead(cur) && !closedAhead(altTrack, 0.0)
                 val saving = remainingSec(cur, progressM, now) - altSec
-                if (saving < FASTER_SAVING_SEC) return
+                if (!blocked && (prof == RouteProfile.SHORTEST || saving < FASTER_SAVING_SEC)) return
                 installTrack(altTrack)
                 val p = project(altTrack, fix.latitude, fix.longitude, 0, minOf(altTrack.geometry.size - 1, 50))
                 progressM = p.alongM
                 progressSeg = p.segment
-                val minutes = (saving / 60).roundToInt()
-                speak("Faster route found. Saves $minutes minutes.", flush = true)
+                if (blocked) {
+                    speak("Road closed ahead. Taking a new route.", flush = true)
+                } else {
+                    val minutes = (saving / 60).roundToInt()
+                    speak("Faster route found. Saves $minutes minutes.", flush = true)
+                }
                 publish(fix, null, 0.0, p.lat, p.lon)
             }
             traffic.ensureTypical(alt.edges.map { graph.segmentKey(it) }.toSet())

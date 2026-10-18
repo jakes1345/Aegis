@@ -1,0 +1,46 @@
+{
+  "feed_info": {
+    "update_date": "2026-10-18T02:49:52.371Z",
+    "publisher": "Sample Contractor",
+    "version": "1.0",
+    "license": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "update_frequency": 60,
+    "data_sources": [{"data_source_id": "cwz-1", "organization_name": "Sample Contractor"}]
+  },
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "id": "747474d6-3243-4083-96ad-465b4d643859",
+      "type": "Feature",
+      "properties": {
+        "core_details": {
+          "event_type": "work-zone",
+          "data_source_id": "cwz-1",
+          "road_names": ["E Sixth St"],
+          "direction": "southbound",
+          "name": "E Sixth St southbound",
+          "description": "Road work on E Sixth St southbound; one or more lanes closed; reduced speed limit 35 mph.",
+          "creation_date": "2026-10-12T23:27:16.006377+00:00",
+          "update_date": "2026-10-18T02:49:52.299Z"
+        },
+        "start_date": "2026-10-12T23:23:57.141+00:00",
+        "end_date": "2026-10-23T06:58:00+00:00",
+        "is_start_date_verified": true,
+        "is_end_date_verified": true,
+        "is_start_position_verified": true,
+        "is_end_position_verified": true,
+        "location_method": "channel-device-method",
+        "work_zone_type": "static",
+        "is_moving": false,
+        "vehicle_impact": "unknown",
+        "reduced_speed_limit_kph": 56,
+        "lanes": [
+          {"order": 1, "type": "general", "status": "closed"},
+          {"order": 2, "type": "general", "status": "open"},
+          {"order": 3, "type": "general", "status": "open"}
+        ]
+      },
+      "geometry": {"type": "LineString", "coordinates": [[-97.7380, 30.2672, 150.0], [-97.7375, 30.2668], [-97.7370, 30.2664]]}
+    }
+  ]
+}

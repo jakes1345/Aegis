@@ -15,6 +15,8 @@ class Router(
     private val graph: RoadGraph,
     private val speeds: SpeedSource,
     private val vehicle: VehicleModel = VehicleModel.DEFAULT,
+    /** Closures and work-zone speed caps; read on every query, so updates apply to the next search. */
+    val restrictions: EdgeRestrictions = EdgeRestrictions.NONE,
 ) {
     companion object {
         private const val MAX_KPH = 130.0
@@ -31,8 +33,8 @@ class Router(
         private const val SNAP_SLACK_M = 25.0
         private const val MIN_PARTIAL_M = 1.0
         private const val DEDUP_SHARE = 0.8
+        private const val CLOSED_FACTOR = 100.0
         private val SNAP_RADII = doubleArrayOf(60.0, 250.0, 1_000.0, 3_000.0)
-        private val CLASS_KPH = doubleArrayOf(105.0, 85.0, 65.0, 55.0, 45.0, 40.0, 30.0, 15.0)
 
         /** Bytes per edge [ensureArrays] allocates: g, gTime, pred and speedCache, 4 bytes each. */
         private const val WORK_BYTES_PER_EDGE = 4L * 4
@@ -70,6 +72,7 @@ class Router(
     private var outTime = 0.0
 
     private var profile = RouteProfile.FASTEST
+    private var throughClosures = false
     private var departEpochSec = 0L
 
     @Synchronized
@@ -77,15 +80,17 @@ class Router(
         fromLat: Double, fromLon: Double, toLat: Double, toLon: Double,
         profile: RouteProfile, departEpochSec: Long,
     ): Route? {
+        // Origins are not filtered by preferOpen: see its doc.
         val origins = snap(fromLat, fromLon) ?: return null
-        val dests = snap(toLat, toLon) ?: return null
+        val dests = snap(toLat, toLon)?.let(::preferOpen) ?: return null
         return search(origins, dests, toLat, toLon, profile, departEpochSec)
+            ?: search(origins, dests, toLat, toLon, profile, departEpochSec, throughClosures = true)
     }
 
     @Synchronized
     fun alternatives(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double, departEpochSec: Long): List<Route> {
         val origins = snap(fromLat, fromLon) ?: return emptyList()
-        val dests = snap(toLat, toLon) ?: return emptyList()
+        val dests = snap(toLat, toLon)?.let(::preferOpen) ?: return emptyList()
         val order = listOf(
             RouteProfile.FASTEST, RouteProfile.ECO, RouteProfile.NO_TOLLS,
             RouteProfile.NO_HIGHWAYS, RouteProfile.SHORTEST,
@@ -95,6 +100,7 @@ class Router(
             val r = search(origins, dests, toLat, toLon, p, departEpochSec) ?: continue
             if (kept.none { sharedShare(r, it) > DEDUP_SHARE }) kept.add(r)
         }
+        if (kept.isEmpty()) search(origins, dests, toLat, toLon, RouteProfile.FASTEST, departEpochSec, throughClosures = true)?.let { kept.add(it) }
         kept.sortBy { it.durationSec }
         return kept
     }
@@ -113,6 +119,19 @@ class Router(
         return if (total > 0) shared / total else 1.0
     }
 
+    /**
+     * Drops closed edges from a destination snap when an open one is there too (the open direction
+     * of a road closed one way); a destination only on closed edges still routes.
+     *
+     * Not applied to origins: a car on a road closed in its own direction is already on that edge,
+     * and dropping it would leave only the opposite direction, i.e. a forced U-turn. The search
+     * seeds origin edges without a closure check and only checks the edges it turns onto.
+     */
+    private fun preferOpen(hits: List<EdgeHit>): List<EdgeHit> {
+        val open = hits.filter { !restrictions.isClosed(it.edge) }
+        return open.ifEmpty { hits }
+    }
+
     private fun snap(lat: Double, lon: Double): List<EdgeHit>? {
         for (r in SNAP_RADII) {
             val hits = graph.nearestEdges(lat, lon, r, 16)
@@ -128,10 +147,7 @@ class Router(
 
     // ── Costs ───────────────────────────────────────────────────────────────
 
-    private fun freeFlowKph(e: Int): Double {
-        val max = graph.edgeMaxspeedKph(e)
-        return if (max > 0) max * 0.9 else CLASS_KPH[graph.edgeRoadClass(e).coerceIn(0, CLASS_KPH.size - 1)]
-    }
+    private fun freeFlowKph(e: Int): Double = freeFlowKph(graph, e)
 
     private fun lookupKph(e: Int, elapsedSec: Double): Double {
         val key = graph.segmentKey(e)
@@ -139,8 +155,10 @@ class Router(
         val kph = speeds.liveKph(key)?.takeUnless { it.isNaN() }
             ?: speeds.typicalKph(key, departEpochSec + elapsedSec.toLong())?.takeUnless { it.isNaN() }
             ?: freeFlowKph(e)
+        val cap = restrictions.speedCapKph(e)
+        val capped = if (cap != null && !cap.isNaN() && cap < kph) cap else kph
         // Capped at the heuristic's speed so the A* bound stays admissible.
-        return kph.coerceIn(MIN_KPH, MAX_KPH)
+        return capped.coerceIn(MIN_KPH, MAX_KPH)
     }
 
     private fun kph(e: Int, elapsedSec: Double): Double {
@@ -245,13 +263,19 @@ class Router(
         heap.clear()
     }
 
+    /**
+     * Best route from [origins] to [dests]. Closed edges are impassable unless [throughClosures],
+     * the fallback for a place only reachable through a closure (or a car already inside one):
+     * then they cost [CLOSED_FACTOR] times as much, so the route drives as little of them as it can.
+     */
     private fun search(
         origins: List<EdgeHit>, dests: List<EdgeHit>, toLat: Double, toLon: Double,
-        profile: RouteProfile, departEpochSec: Long,
+        profile: RouteProfile, departEpochSec: Long, throughClosures: Boolean = false,
     ): Route? {
         if (edgeCount == 0) return null
         this.profile = profile
         this.departEpochSec = departEpochSec
+        this.throughClosures = throughClosures
         ensureArrays()
         try {
             return runSearch(origins, dests, toLat, toLon)
@@ -318,11 +342,14 @@ class Router(
 
             for (e2 in graph.firstEdge(node) until graph.lastEdgeExclusive(node)) {
                 if (settled.get(e2)) continue
+                val closed = restrictions.isClosed(e2)
+                if (closed && !throughClosures) continue
                 turn(e, from, e2)
                 val turnCost = outCost
                 val turnTime = outTime
                 traverse(e2, 0.0, 1.0, kph(e2, te + turnTime), arrives = true)
-                val ng = ge + turnCost + outCost
+                // A factor >= 1 only raises costs, so the A* bound stays admissible.
+                val ng = ge + turnCost + (if (closed) outCost * CLOSED_FACTOR else outCost)
                 if (ng < g[e2]) {
                     if (g[e2].isInfinite()) touch(e2)
                     g[e2] = ng.toFloat()

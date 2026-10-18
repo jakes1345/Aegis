@@ -138,6 +138,50 @@ The relay also carries crowd-sourced traffic for Aegis navigation, in a
 WZDX_FEEDS = "https://example-dot.gov/wzdx/v4/feed.geojson"
 ```
 
+### Commercial incidents (HERE, TomTom)
+
+`GET /v1/traffic/incidents?bbox=minLat,minLon,maxLat,maxLon` (at most 1° × 1°)
+proxies the HERE Traffic v7 and TomTom Traffic v5 incident APIs, so the API
+keys stay on the relay. Both are optional; a provider without a key is
+reported as `"off"`:
+
+```sh
+npx wrangler secret put HERE_API_KEY     # HERE Traffic API v7
+npx wrangler secret put TOMTOM_API_KEY   # TomTom Traffic API (incidentDetails v5)
+```
+
+The requested box is snapped outward to 0.25° tiles. Each provider's tile is
+fetched once and cached for five minutes in a single `IncidentCache` Durable
+Object, so every phone in that area shares one upstream call; concurrent
+requests for a tile that is being fetched wait for that same call. One request
+starts at most 3 upstream calls per provider (tiles with nothing cached first,
+then the oldest); the rest of a large box keeps its last result and is filled
+in by the phone's next polls, which keeps a request within the Workers Free
+subrequest and connection limits and a phone within the daily caps. An
+upstream failure is not retried for a minute, and meanwhile a tile's last good
+result (up to 30 minutes old) is still served. Daily caps protect the free
+tiers: `HERE_DAILY_CAP` (default 1000) and `TOMTOM_DAILY_CAP` (default 2300)
+upstream calls per UTC day; at the cap the provider reports `"quota"` until
+UTC midnight. So that one phone cannot spend a cap for everyone, each phone
+(counted under a salted hash of its number) may make at most
+`INCIDENTS_PER_CALLER_DAILY_SHARE` (default 0.25) of a provider's daily calls,
+and once a provider has used 80% of its cap only tiles with nothing cached are
+fetched. A tile held back by either keeps serving its last result; the
+provider then reports `"ok"` if anything was served, else `"quota"`. A failing provider reports `"error"`; the request itself still
+succeeds with whatever the other provider returned.
+
+```json
+{"now": 1760500000,
+ "incidents": [{"id": "tomtom:abc", "type": "jam", "lat": 39.96, "lon": -83.0,
+   "geom": [[39.96, -83.0], [39.97, -83.0]], "road": "I-71", "description": "Stationary traffic",
+   "start": 1760499000, "end": null, "delay_s": 240, "source": "tomtom"}],
+ "providers": {"here": "ok", "tomtom": "ok"}}
+```
+
+`type` is one of `crash`, `closure`, `lane_closure`, `work_zone`, `jam`,
+`hazard`, `police`, `other`; `geom` is `[lat, lon]` pairs (null for a point);
+times are epoch seconds.
+
 ## API
 
 Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
@@ -169,6 +213,7 @@ Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
 | GET | `/v1/traffic/typical?region=&segs=a,b` | `{segments: {seg: {h: [168 × km/h or null]}}}`, up to 500 segments |
 | POST | `/v1/traffic/report` | `{region, type, lat, lon, seg?}` → `{incident}`; merges with a nearby report of the same type |
 | POST | `/v1/traffic/report/vote` | `{region, id, still}` → `{incident}`, null once voted away |
+| GET | `/v1/traffic/incidents?bbox=minLat,minLon,maxLat,maxLon` | `{now, incidents, providers: {here, tomtom}}`: HERE / TomTom incidents in a box of at most 1° × 1°; 10 a minute |
 
 Each Aegis number is a Durable Object holding the keys, the queue (up to 2000
 envelopes of 64 KiB, kept 30 days) and the live sockets. Incident times

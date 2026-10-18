@@ -314,6 +314,34 @@ class RelayClient(
     fun trafficVote(region: String, id: String, still: Boolean): JSONObject =
         signed("POST", "/v1/traffic/report/vote", JSONObject().put("region", region).put("id", id).put("still", still))
 
+    /**
+     * HERE / TomTom incidents the relay proxies for a box of at most 1° × 1°,
+     * [bbox] = [minLat, minLon, maxLat, maxLon]:
+     * {"now","incidents":[{"id","type","lat","lon","geom","road","description","start","end","delay_s","source"}],
+     *  "providers":{"here","tomtom"}} with each provider "ok", "off", "quota" or "error".
+     */
+    fun trafficIncidents(bbox: DoubleArray): JSONObject {
+        require(bbox.size == 4) { "bbox must be [minLat, minLon, maxLat, maxLon]" }
+        val (minLat, minLon, maxLat, maxLon) = bbox.toList()
+        require(minLat < maxLat && minLon < maxLon) { "bbox minimums must be below its maximums" }
+        require(maxLat - minLat <= TRAFFIC_INCIDENTS_MAX_SPAN_DEG && maxLon - minLon <= TRAFFIC_INCIDENTS_MAX_SPAN_DEG) {
+            "bbox may span at most $TRAFFIC_INCIDENTS_MAX_SPAN_DEG° in each direction"
+        }
+        // Rounded inward to 5 decimals so rounding can never push a 1° box over the relay's limit;
+        // fixed-point and Locale.ROOT because Double.toString can give "1.0E-4", and some locales a decimal comma.
+        val inward = listOf(
+            kotlin.math.ceil(minLat * 1e5) / 1e5,
+            kotlin.math.ceil(minLon * 1e5) / 1e5,
+            kotlin.math.floor(maxLat * 1e5) / 1e5,
+            kotlin.math.floor(maxLon * 1e5) / 1e5,
+        )
+        val box = inward.joinToString(",") { String.format(java.util.Locale.ROOT, "%.5f", it) }
+        return signed("GET", "/v1/traffic/incidents?bbox=${query(box)}")
+    }
+
+    fun trafficIncidents(minLat: Double, minLon: Double, maxLat: Double, maxLon: Double): JSONObject =
+        trafficIncidents(doubleArrayOf(minLat, minLon, maxLat, maxLon))
+
     private fun query(value: String): String = java.net.URLEncoder.encode(value, "UTF-8")
 
     /** Opens the live-delivery socket. The caller owns the returned socket. */
@@ -459,6 +487,8 @@ class RelayClient(
         const val INBOX_PAGE = 200
         /** Segments per /v1/traffic/typical request (the relay's limit). */
         const val TRAFFIC_TYPICAL_MAX = 500
+        /** The relay refuses incident boxes larger than this in either direction. */
+        const val TRAFFIC_INCIDENTS_MAX_SPAN_DEG = 1.0
         private const val CLOCK_WARN_MS = 30_000L
         /** The relay mints TURN credentials for 24 h and hands them out for at most 6 h. */
         private const val ICE_CACHE_MS = 5 * 60 * 60_000L

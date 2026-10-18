@@ -1,0 +1,79 @@
+{
+  "road_event_feed_info": {
+    "update_date": "2026-10-18T02:49:00Z",
+    "publisher": "Sample City DOT",
+    "version": "3.1",
+    "data_sources": [{"data_source_id": "SCDOT-1", "organization_name": "Sample City DOT", "location_method": "channel-device-method"}]
+  },
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "id": "v3-closed-1",
+      "type": "Feature",
+      "properties": {
+        "data_source_id": "SCDOT-1",
+        "event_type": "work-zone",
+        "road_names": ["Main St", "SR 12"],
+        "direction": "southbound",
+        "beginning_accuracy": "estimated",
+        "ending_accuracy": "estimated",
+        "start_date": "2026-10-01T11:00:00Z",
+        "end_date": "2026-11-18T21:00:00Z",
+        "start_date_accuracy": "estimated",
+        "end_date_accuracy": "estimated",
+        "event_status": "active",
+        "vehicle_impact": "all-lanes-closed",
+        "reduced_speed_limit": 25,
+        "description": "Main St closed between 1st Ave and 3rd Ave for water main replacement",
+        "lanes": [{"order": 1, "status": "closed", "type": "lane"}, {"order": 2, "status": "closed", "type": "lane"}]
+      },
+      "geometry": {"type": "LineString", "coordinates": [[-93.2650, 44.9778], [-93.2650, 44.9790], [-93.2651, 44.9802]]}
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "data_source_id": "SCDOT-1",
+        "event_type": "work-zone",
+        "road_name": "Oak Ave",
+        "direction": "eastbound",
+        "start_date": "2026-10-10T11:00:00Z",
+        "end_date": "2026-10-30T21:00:00Z",
+        "event_status": "active",
+        "vehicle_impact": "unknown",
+        "description": "Right shoulder closed",
+        "lanes": [{"order": 1, "status": "open", "type": "lane"}, {"order": 2, "status": "closed", "type": "right-shoulder"}]
+      },
+      "geometry": {"type": "MultiPoint", "coordinates": [[-93.2700, 44.9700], [-93.2600, 44.9700]]}
+    },
+    {
+      "id": "v3-expired",
+      "type": "Feature",
+      "properties": {
+        "data_source_id": "SCDOT-1",
+        "event_type": "work-zone",
+        "road_names": ["Elm St"],
+        "direction": "northbound",
+        "start_date": "2026-09-01T11:00:00Z",
+        "end_date": "2026-10-01T21:00:00Z",
+        "event_status": "completed",
+        "vehicle_impact": "some-lanes-closed",
+        "description": "Finished job"
+      },
+      "geometry": {"type": "LineString", "coordinates": [[-93.25, 44.95], [-93.25, 44.96]]}
+    },
+    {
+      "id": "v3-no-geometry",
+      "type": "Feature",
+      "properties": {
+        "data_source_id": "SCDOT-1",
+        "event_type": "work-zone",
+        "road_names": ["Pine St"],
+        "direction": "northbound",
+        "start_date": "2026-10-01T11:00:00Z",
+        "end_date": "2026-12-01T21:00:00Z",
+        "vehicle_impact": "all-lanes-open"
+      },
+      "geometry": null
+    }
+  ]
+}

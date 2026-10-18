@@ -135,6 +135,12 @@ private val TRAFFIC_UNKNOWN = Color(0xFF2F6FEB)
 private val ROUTE_ALT = Color(0xFF8A94A6)
 private val ROUTE_CASING = Color(0xFF0D1B33)
 private val DANGER = Color(0xFFE5392F)
+private val WORK_ZONE_LINE = Color(0xFFF57C00)
+private val CLOSURE_LINE = Color(0xFFD32F2F)
+/** Incident types that cover a stretch of road and are drawn along it. */
+private val LINE_TYPES = setOf(
+    Incident.CLOSURE, Incident.LANE_CLOSURE, Incident.WORK_ZONE, Incident.DETOUR, Incident.RESTRICTION,
+)
 
 private fun levelColor(level: TrafficLevel): Color = when (level) {
     TrafficLevel.FREE -> TRAFFIC_FREE
@@ -148,7 +154,7 @@ private fun levelColor(level: TrafficLevel): Color = when (level) {
 private fun incidentIcon(type: String): Int = when (type) {
     Incident.POLICE -> R.drawable.ic_incident_police
     Incident.CRASH -> R.drawable.ic_incident_crash
-    Incident.CLOSURE -> R.drawable.ic_incident_closure
+    Incident.CLOSURE, Incident.LANE_CLOSURE -> R.drawable.ic_incident_closure
     Incident.JAM -> R.drawable.ic_incident_jam
     else -> R.drawable.ic_incident_hazard
 }
@@ -169,6 +175,38 @@ private fun fmtDuration(sec: Double): String {
 
 private fun fmtClock(context: Context, epochMs: Long): String =
     android.text.format.DateFormat.getTimeFormat(context).format(Date(epochMs))
+
+/** An end time: the clock time when it is today, else date and time. */
+private fun fmtUntil(context: Context, epochSec: Long): String {
+    val ms = epochSec * 1000
+    val today = android.text.format.DateUtils.isToday(ms)
+    return if (today) fmtClock(context, ms)
+    else DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, Locale.getDefault()).format(Date(ms))
+}
+
+private fun sourceLabel(inc: Incident): String = when (inc.origin) {
+    Incident.Origin.RELAY -> "Driver reports"
+    Incident.Origin.PROVIDER -> when (inc.source) {
+        "here" -> "HERE"
+        "tomtom" -> "TomTom"
+        else -> inc.source
+    }
+    Incident.Origin.WORK_ZONE -> inc.source
+}
+
+/** What a tap on an incident shows: description, road, source and when it ends. */
+private fun incidentSnippet(context: Context, inc: Incident, now: Long): String = buildString {
+    fun part(text: String) { if (isNotEmpty()) append(" · "); append(text) }
+    inc.description?.let { part(it) }
+    inc.road?.takeIf { r -> inc.description?.contains(r, ignoreCase = true) != true }?.let { part(it) }
+    part(sourceLabel(inc))
+    if (inc.origin == Incident.Origin.RELAY) {
+        part(if (inc.confirmations == 1) "1 report" else "${inc.confirmations} reports")
+        if (inc.createdAt > 0) part(fmtDuration((now - inc.createdAt).toDouble()) + " ago")
+    }
+    inc.delaySec?.takeIf { it >= 60 }?.let { part("delay ${fmtDuration(it.toDouble())}") }
+    if (inc.expiresAt > 0) part("until ${fmtUntil(context, inc.expiresAt)}")
+}
 
 private fun limitMph(kph: Int): Int = ((kph * MPH_PER_KPH) / 5).roundToInt() * 5
 
@@ -319,7 +357,7 @@ private fun NavMapLayer(
             }
             if (nav != null) {
                 val prompt = nav.incidentsAhead.firstOrNull {
-                    it.distanceM <= INCIDENT_PROMPT_M && it.incident.id !in answered
+                    it.distanceM <= INCIDENT_PROMPT_M && it.incident.votable && it.incident.id !in answered
                 }
                 if (prompt != null) {
                     IncidentPrompt(
@@ -523,18 +561,35 @@ private fun NavMap(
     LaunchedEffect(incidents) {
         incidentLayer.items.clear()
         val now = System.currentTimeMillis() / 1000
-        for (inc in incidents) {
-            if (inc.expiresAt in 1 until now) continue
+        val live = incidents.filter { it.expiresAt !in 1 until now }
+        fun drawnAsLine(inc: Incident) = (inc.geom?.size ?: 0) >= 2 && inc.type in LINE_TYPES
+        // Stretches first so every marker stays on top of them: closures red and dashed, other work orange.
+        for (inc in live) {
+            if (!drawnAsLine(inc)) continue
+            val geom = inc.geom!!
+            val closed = inc.type == Incident.CLOSURE
+            val line = Polyline(mapView).apply {
+                outlinePaint.color = (if (closed) CLOSURE_LINE else WORK_ZONE_LINE).toArgbInt()
+                outlinePaint.strokeWidth = dp(5f)
+                outlinePaint.strokeCap = android.graphics.Paint.Cap.BUTT
+                outlinePaint.strokeJoin = android.graphics.Paint.Join.ROUND
+                if (closed) outlinePaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(dp(10f), dp(6f)), 0f)
+                setPoints(geom.map { it.geo() })
+                title = incidentLabel(inc.type)
+                snippet = incidentSnippet(context, inc, now)
+            }
+            incidentLayer.add(line)
+        }
+        // Work zones drawn as a line are tapped on it; a marker each would bury the map in icons.
+        // A point-only zone has no line, so it keeps its marker.
+        for (inc in live) {
+            if (inc.origin == Incident.Origin.WORK_ZONE && drawnAsLine(inc)) continue
             val m = Marker(mapView).apply {
                 position = GeoPoint(inc.lat, inc.lon)
                 icon = ContextCompat.getDrawable(context, incidentIcon(inc.type))
                 setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                 title = incidentLabel(inc.type)
-                snippet = buildString {
-                    inc.description?.let { append(it).append(" · ") }
-                    append(if (inc.confirmations == 1) "1 report" else "${inc.confirmations} reports")
-                    if (inc.createdAt > 0) append(" · ").append(fmtDuration((now - inc.createdAt).toDouble())).append(" ago")
-                }
+                snippet = incidentSnippet(context, inc, now)
             }
             incidentLayer.add(m)
         }

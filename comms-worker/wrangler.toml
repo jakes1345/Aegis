@@ -6,6 +6,9 @@
 #   TURN_KEY_ID          Optional, for calls: Cloudflare Realtime TURN key id
 #   TURN_KEY_API_TOKEN   Optional, for calls: its API token
 #   ADMIN_SECRET         Optional, for AegisCoin: lets the operator mint coins (POST /v1/admin/coin/mint)
+#   HERE_API_KEY         Optional, for navigation: HERE Traffic API v7 key; GET /v1/traffic/incidents
+#                        reports HERE as "off" without it
+#   TOMTOM_API_KEY       Optional, for navigation: TomTom Traffic API key; likewise "off" without it
 #
 # Plain variables (may go in [vars] below):
 #   COIN_INITIAL_BALANCE AegisCoin every new registration starts with, e.g. "100"; unset: none
@@ -13,6 +16,12 @@
 #                        feeds (state DOT work-zone feeds). The cron below fetches them every
 #                        10 minutes and adds work zones as traffic incidents to every region
 #                        whose area (learned from positioned reports) contains them.
+#   HERE_DAILY_CAP       Upstream HERE incident calls allowed per UTC day, default "1000"
+#   TOMTOM_DAILY_CAP     Upstream TomTom incident calls allowed per UTC day, default "2300"
+#                        (at the cap the provider reports "quota" until UTC midnight)
+#   INCIDENTS_PER_CALLER_DAILY_SHARE
+#                        Share of each daily cap one phone may use, default "0.25"; past 80% of a
+#                        cap only tiles with nothing cached are fetched
 
 name = "aegis-comms"
 main = "src/index.ts"
@@ -30,6 +39,10 @@ class_name = "Mailbox"
 name = "TRAFFIC"
 class_name = "Traffic"
 
+[[durable_objects.bindings]]
+name = "INCIDENTS"
+class_name = "IncidentCache"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Mailbox"]
@@ -37,6 +50,10 @@ new_sqlite_classes = ["Mailbox"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["Traffic"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["IncidentCache"]
 
 [triggers]
 crons = ["*/10 * * * *"]

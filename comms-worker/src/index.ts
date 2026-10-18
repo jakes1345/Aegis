@@ -1,11 +1,13 @@
 import { parseSigned, verifyEd25519 } from "./auth";
-import { HttpError, json, normaliseNumber, randomNumber, requireSecret, timingSafeEqual, type Env } from "./env";
+import { HttpError, json, jsonText, normaliseNumber, randomNumber, requireSecret, timingSafeEqual, type Env } from "./env";
 import { INVITE_TTL_MS, Mailbox, type CoinTx, type Profile, type SignedKey } from "./mailbox";
 import { invitePage } from "./invite-page";
+import { INCIDENTS_NAME, IncidentCache } from "./incidents";
+import { parseBBoxParam } from "./incidents-logic";
 import { REGISTRY_NAME, Traffic, type ProbeSample } from "./traffic";
 import { INCIDENT_TYPES, PROBE_MAX_AGE_SEC, REGION_RE, SEGMENT_RE, bboxContains, fnv1a, parseWzdx, readTextCapped, type BBox, type IncidentType } from "./traffic-logic";
 
-export { Mailbox, Traffic };
+export { IncidentCache, Mailbox, Traffic };
 
 /**
  * Aegis comms relay: store-and-forward for end-to-end encrypted envelopes
@@ -45,6 +47,9 @@ export { Mailbox, Traffic };
  *   GET    /v1/traffic/typical?region=&segs=a,b            → {segments: {seg: {h: [168]}}}
  *   POST   /v1/traffic/report  {region, type, lat, lon, seg|null} → {incident}
  *   POST   /v1/traffic/report/vote {region, id, still}     → {incident|null}
+ *   GET    /v1/traffic/incidents?bbox=minLat,minLon,maxLat,maxLon (≤ 1°×1°)
+ *                              → {now, incidents, providers: {here, tomtom}}: HERE / TomTom incidents,
+ *                                cached per 0.25° tile for 5 minutes in the IncidentCache object
  * Cron (every 10 minutes): WZDx work zones from WZDX_FEEDS into every known region.
  */
 export default {
@@ -314,6 +319,7 @@ const TRAFFIC_LIMITS = {
   read: { perMinute: 30, burst: 30 },
   report: { perMinute: 6, burst: 10 },
   vote: { perMinute: 30, burst: 30 },
+  incidents: { perMinute: 10, burst: 20 },
 } as const;
 const MAX_PROBE_SAMPLES = 60;
 const MAX_TYPICAL_SEGS = 500;
@@ -363,6 +369,13 @@ async function trafficRoute(env: Env, request: Request, url: URL, path: string, 
     for (const seg of segs) if (!SEGMENT_RE.test(seg)) throw new HttpError(400, `bad segment ${seg.slice(0, 40)}`);
     if (segs.length === 0) return json({ segments: {} });
     return json(await regionStub(region).typical(segs));
+  }
+
+  if (path === "/v1/traffic/incidents" && request.method === "GET") {
+    await limit("incidents");
+    const parsed = parseBBoxParam(url.searchParams.get("bbox"));
+    if ("error" in parsed) throw new HttpError(400, parsed.error);
+    return jsonText(await env.INCIDENTS.get(env.INCIDENTS.idFromName(INCIDENTS_NAME)).incidents(parsed.bbox, now, number));
   }
 
   if (path === "/v1/traffic/report" && request.method === "POST") {
