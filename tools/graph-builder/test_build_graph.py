@@ -1,6 +1,7 @@
 import math
 import os
 import struct
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -323,3 +324,13 @@ def test_region_longer_than_header_is_refused(tmp_path):
     osm.write_text('<?xml version="1.0"?><osm version="0.6"></osm>', encoding="utf-8")
     with pytest.raises(SystemExit):
         build_graph.main([str(osm), str(tmp_path / "r.agr"), "--region", "a" * 65])
+
+
+def test_region_list_matches_the_app():
+    """The maps workflow builds exactly the regions the app offers for download."""
+    here = Path(__file__).resolve().parent
+    listed = [l.strip() for l in (here / "us-regions.txt").read_text().splitlines() if l.strip()]
+    store = (here.parents[1] / "android/app/src/main/java/com/xat/aegis/nav/GraphStore.kt").read_text()
+    offered = ["north-america/us/" + m for m in re.findall(r'us\("([a-z-]+)"', store)]
+    assert listed == offered
+    assert len(set(listed)) == len(listed)
