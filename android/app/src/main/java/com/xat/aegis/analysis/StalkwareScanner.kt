@@ -2,6 +2,7 @@ package com.xat.aegis.analysis
 
 import android.Manifest
 import android.app.AppOpsManager
+import android.app.admin.DevicePolicyManager
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.ComponentName
@@ -13,6 +14,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.provider.Settings
+import android.view.inputmethod.InputMethodManager
 import com.xat.aegis.Severity
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -52,6 +54,8 @@ object StalkwareScanner {
         val vpnCapable: Boolean,
         val notificationListener: Boolean,
         val accessibilityEnabled: Boolean,
+        val imeEnabled: Boolean,
+        val deviceAdminActive: Boolean,
         val installerPackage: String?
     ) {
         val severity: Severity
@@ -70,6 +74,10 @@ object StalkwareScanner {
         val accessibilityServices: List<String>,
         /** Every app that can act as the device VPN. */
         val vpnApps: List<String>,
+        /** IME packages that are enabled but not in the known-safe list. */
+        val suspiciousImes: List<String>,
+        /** Packages that have an active device-admin grant (can resist uninstall). */
+        val activeDeviceAdmins: List<String>,
         val usageAccessGranted: Boolean,
         val scannedAt: Long
     ) {
@@ -179,6 +187,34 @@ object StalkwareScanner {
         "com.xat.aegis"
     )
 
+    /** IME packages considered stock or well-known-safe. */
+    private val KNOWN_IMES = setOf(
+        "com.google.android.inputmethod.latin",       // Gboard
+        "com.samsung.android.honeyboard",              // Samsung Keyboard
+        "com.swiftkey.swiftkeyapp",                    // SwiftKey (Microsoft)
+        "com.touchtype.swiftkey",
+        "com.nuance.swype.dtc",                        // Swype
+        "com.nuance.swype.trial",
+        "com.lge.ime",                                  // LG Keyboard
+        "com.motorola.process.system",                 // Moto Keyboard
+        "com.htc.sense.ime",                           // HTC Sense
+        "jp.co.omronsoft.openwnn",
+        "com.sec.android.inputmethod",                 // Samsung default
+        "com.android.inputmethod.latin",               // AOSP Latin IME
+        "com.android.inputmethod.pinyin",
+        "com.google.android.inputmethod.pinyin",
+        "com.google.android.inputmethod.japanese",
+        "com.google.android.inputmethod.korean",
+        "com.google.android.inputmethod.hindi",
+        "com.samsung.android.svoice",
+        "com.greyc.greyckeyboard",
+        "com.fleksy.app",
+        "com.minuum.keyboard",
+        "com.syntellia.fleksy.kb",
+        "io.verbit.keyboards",
+        "com.xat.aegis"
+    )
+
     private val SUSPECT_PERMISSIONS = linkedMapOf(
         Manifest.permission.BIND_ACCESSIBILITY_SERVICE to (2 to "declares an accessibility service (reads every screen, every tap)"),
         Manifest.permission.READ_SMS to (2 to "can read SMS (including one-time codes)"),
@@ -229,6 +265,8 @@ object StalkwareScanner {
         val accessibilityPkgs = accessibility.map { it.packageName }.toSet()
         val vpnPkgs = vpnCapablePackages(pm)
         val launcherPkgs = launcherPackages(pm)
+        val imePkgs = imePackages(app)
+        val deviceAdminPkgs = activeDeviceAdminPackages(app)
 
         val usageAccess = hasUsageAccess(app)
         val (fgsPkgs, resumedPkgs) = if (usageAccess) usageSignals(app) else emptySet<String>() to emptySet()
@@ -256,7 +294,8 @@ object StalkwareScanner {
             if (system) {
                 val oddListener = listener && name !in KNOWN_LISTENERS
                 val oddA11y = a11y && name !in KNOWN_ACCESSIBILITY
-                if (!oddListener && !oddA11y) continue
+                val oddIme = name in imePkgs && name !in KNOWN_IMES
+                if (!oddListener && !oddA11y && !oddIme) continue
             }
 
             val reasons = ArrayList<String>()
@@ -304,6 +343,24 @@ object StalkwareScanner {
                     reasons += "notification access is on (a known app)"
                 }
             }
+            val imeActive = name in imePkgs
+            if (imeActive) {
+                if (name !in KNOWN_IMES) {
+                    score += 4
+                    reasons += "is an active keyboard (enabled IME — can log every keystroke)"
+                } else {
+                    reasons += "is an active keyboard (a known safe app)"
+                }
+            }
+
+            val adminActive = name in deviceAdminPkgs
+            if (adminActive) {
+                // Permission check already adds 1 point if BIND_DEVICE_ADMIN is declared;
+                // active grant is a much stronger signal.
+                score += 3
+                reasons += "device admin grant is ACTIVE (can resist uninstall and wipe the device)"
+            }
+
             if (vpn) {
                 score += if (sideloaded || !hasLauncher) 2 else 1
                 reasons += "can act as the VPN and see all traffic"
@@ -327,6 +384,8 @@ object StalkwareScanner {
                 vpnCapable = vpn,
                 notificationListener = listener,
                 accessibilityEnabled = a11y,
+                imeEnabled = imeActive,
+                deviceAdminActive = adminActive,
                 installerPackage = installer
             )
         }
@@ -336,6 +395,8 @@ object StalkwareScanner {
             notificationListeners = listenerPkgs.sorted(),
             accessibilityServices = accessibilityPkgs.sorted(),
             vpnApps = vpnPkgs.sorted(),
+            suspiciousImes = imePkgs.filter { it !in KNOWN_IMES }.sorted(),
+            activeDeviceAdmins = deviceAdminPkgs.sorted(),
             usageAccessGranted = usageAccess,
             scannedAt = System.currentTimeMillis()
         )
@@ -404,5 +465,26 @@ object StalkwareScanner {
             }
         }
         return fgs to resumed
+    }
+
+    /**
+     * Returns the package names of all currently enabled input methods (keyboards).
+     * An enabled IME that is not in KNOWN_IMES is a potential keystroke logger.
+     */
+    private fun imePackages(context: Context): Set<String> {
+        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        return imm.enabledInputMethodList.mapTo(HashSet()) { it.packageName }
+    }
+
+    /**
+     * Returns the package names of every component that currently holds an active
+     * device-admin grant. An active device admin can block uninstall and, if
+     * granted further privileges, wipe the device — a common stalkerware technique
+     * for persistence.
+     */
+    private fun activeDeviceAdminPackages(context: Context): Set<String> {
+        val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+        val admins = runCatching { dpm.activeAdmins }.getOrNull() ?: return emptySet()
+        return admins.mapTo(HashSet()) { it.packageName }
     }
 }
