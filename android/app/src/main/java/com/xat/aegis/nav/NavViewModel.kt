@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
@@ -92,6 +93,10 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
         const val DEFAULT_FUEL_PRICE = 3.50f
         const val RECOLOR_INTERVAL_MS = 30_000L
         const val IDLE_TRAFFIC_INTERVAL_MS = 60_000L
+        /** HERE / TomTom incidents while previewing routes; the navigator refreshes them every 2 min while driving. */
+        const val PROVIDER_PREVIEW_INTERVAL_MS = 5 * 60_000L
+        /** How often closures are re-evaluated, so work zones take effect and lapse on time. */
+        const val CLOSURE_TICK_MS = 60_000L
         const val LOCATION_INTERVAL_MS = 2_000L
         const val FIRST_FIX_WAIT_MS = 20_000L
         const val LIVE_TRAFFIC_WAIT_MS = 4_000L
@@ -111,6 +116,8 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
         val traffic: TrafficClient,
         val router: Router,
         val navigator: Navigator,
+        val workZones: WorkZoneFeed,
+        val closures: RoadClosures,
     )
 
     private val ctx: Context get() = getApplication()
@@ -203,8 +210,24 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             while (isActive) {
                 val s = session.value
-                if (s != null && navState.value !is NavState.Navigating && locationActive) s.traffic.refreshLive()
+                val navigating = navState.value is NavState.Navigating
+                val previewing = _options.value != null
+                if (s != null && !navigating && locationActive) s.traffic.refreshLive()
+                if (s != null && previewing && !navigating) s.traffic.refreshProviders(PROVIDER_PREVIEW_INTERVAL_MS)
+                if (s != null && (navigating || previewing)) s.workZones.refreshIfStale()
                 delay(IDLE_TRAFFIC_INTERVAL_MS)
+            }
+        }
+        // Work zones and provider closures feed both the map and the router's closed and slowed edges.
+        viewModelScope.launch {
+            session.collectLatest { s ->
+                if (s == null) return@collectLatest
+                val minutes = flow { while (true) { emit(Unit); delay(CLOSURE_TICK_MS) } }
+                combine(s.workZones.zones, s.traffic.providerIncidents, minutes) { z, p, _ -> z to p }
+                    .collect { (zones, provider) ->
+                        s.traffic.setWorkZones(zones)
+                        withContext(Dispatchers.Default) { s.closures.update(zones, provider, System.currentTimeMillis() / 1000) }
+                    }
             }
         }
         viewModelScope.launch {
@@ -257,15 +280,18 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
                     // Builds the spatial index now rather than on the first tap or route request.
                     graph.nearestEdges((graph.minLat + graph.maxLat) / 2, (graph.minLon + graph.maxLon) / 2, 50.0, 1)
                     val traffic = TrafficClient(ctx, slug)
-                    val router = Router(graph, traffic)
+                    traffic.focus = ::providerFocus
+                    val closures = RoadClosures(graph)
+                    val router = Router(graph, traffic, restrictions = closures)
                     val probe = ProbeReporter(ctx, slug)
                     val navigator = Navigator(ctx, graph, router, traffic, probe)
                     navigator.muted = _muted.value
-                    Session(slug, graph, traffic, router, navigator)
+                    Session(slug, graph, traffic, router, navigator, WorkZoneFeed(ctx, slug), closures)
                 }
                 session.value = s
                 _graph.value = GraphState.Ready(slug, name, s.graph)
                 if (locationActive) launch { s.traffic.refreshLive() }
+                launch { s.workZones.refresh() }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -390,6 +416,32 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Where HERE / TomTom incidents are worth fetching: the route ahead while driving, the
+     * previewed route (or the line to the chosen place while it is still being planned), else
+     * the current position.
+     */
+    private fun providerFocus(): List<LatLon>? {
+        val nav = navState.value
+        if (nav is NavState.Navigating) return routeAhead(nav.route.geometry, nav.progressM)
+        val pos = currentPosition()?.let { LatLon(it.first, it.second) }
+        _options.value?.let { o ->
+            o.selectedRoute?.let { return it.geometry }
+            return listOfNotNull(pos, LatLon(o.dest.lat, o.dest.lon))
+        }
+        return pos?.let { listOf(it) }
+    }
+
+    /** The part of [geometry] from [progressM] along it onward. */
+    private fun routeAhead(geometry: List<LatLon>, progressM: Double): List<LatLon> {
+        var along = 0.0
+        for (i in 1 until geometry.size) {
+            along += RoadGeo.haversineM(geometry[i - 1].lat, geometry[i - 1].lon, geometry[i].lat, geometry[i].lon)
+            if (along >= progressM) return geometry.subList(i - 1, geometry.size)
+        }
+        return geometry.takeLast(1)
+    }
+
     /** Best known position: the navigator's snapped one while driving, else the latest fix. */
     private fun currentPosition(): Triple<Double, Double, Float?>? {
         val nav = navState.value
@@ -490,6 +542,8 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
             }
             // Offline routing must not wait on a stalled connection; stale traffic is better than none.
             val liveRefresh = launch { s.traffic.refreshLive() }
+            launch { s.traffic.refreshProviders(PROVIDER_PREVIEW_INTERVAL_MS) }
+            launch { s.workZones.refreshIfStale() }
             withTimeoutOrNull(LIVE_TRAFFIC_WAIT_MS) { liveRefresh.join() }
             val now = System.currentTimeMillis() / 1000
             var routes = withContext(Dispatchers.Default) { s.router.alternatives(from.first, from.second, dest.lat, dest.lon, now) }
@@ -720,5 +774,10 @@ fun incidentLabel(type: String): String = when (type) {
     Incident.HAZARD -> "Hazard"
     Incident.CLOSURE -> "Closure"
     Incident.JAM -> "Traffic jam"
+    Incident.LANE_CLOSURE -> "Lane closure"
+    Incident.WORK_ZONE -> "Work zone"
+    Incident.DETOUR -> "Detour"
+    Incident.RESTRICTION -> "Road restriction"
+    Incident.OTHER -> "Incident"
     else -> type.replaceFirstChar { it.titlecase(Locale.US) }
 }
