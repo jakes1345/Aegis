@@ -19,6 +19,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -39,6 +40,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xat.aegis.nav.NavScreen
 import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.roundToInt
@@ -51,8 +53,45 @@ private const val COOLANT_COLD_C = 70
 private const val COOLANT_HOT_C = 100
 private const val KPH_TO_MPH = 0.621f
 
+private const val SECTION_NAVIGATE = 0
+private const val SECTION_SENSORS = 1
+
+/** The Drive tab: turn-by-turn navigation, or the in-car sensors (scanner, ADS-B, OBD). */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DriveScreen(viewModel: DriveViewModel = viewModel()) {
+    var section by rememberSaveable { mutableIntStateOf(SECTION_NAVIGATE) }
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            SingleChoiceSegmentedButtonRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+            ) {
+                SegmentedButton(
+                    selected = section == SECTION_NAVIGATE,
+                    onClick = { section = SECTION_NAVIGATE },
+                    shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)
+                ) { Text("Navigate") }
+                SegmentedButton(
+                    selected = section == SECTION_SENSORS,
+                    onClick = { section = SECTION_SENSORS },
+                    shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)
+                ) { Text("Sensors") }
+            }
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                if (section == SECTION_NAVIGATE) {
+                    NavScreen(modifier = Modifier.fillMaxSize())
+                } else {
+                    DriveSensors(viewModel)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DriveSensors(viewModel: DriveViewModel) {
     val obd by viewModel.obdData.collectAsStateWithLifecycle()
     val sdrState by viewModel.sdrState.collectAsStateWithLifecycle()
     val channels by viewModel.scannerChannels.collectAsStateWithLifecycle()

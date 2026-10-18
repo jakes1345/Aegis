@@ -1,7 +1,10 @@
 import type { Mailbox } from "./mailbox";
+import type { Traffic } from "./traffic";
 
 export interface Env {
   MAILBOX: DurableObjectNamespace<Mailbox>;
+  /** Crowd-sourced traffic, one object per map region ("traffic:<region>") plus "traffic-registry". */
+  TRAFFIC: DurableObjectNamespace<Traffic>;
   /** One-time code typed into Aegis when it registers, so the relay is not open to everyone. */
   ENROLL_SECRET: string;
   /** Optional: Cloudflare Realtime TURN key id + API token, for calls. */
@@ -11,6 +14,8 @@ export interface Env {
   COIN_INITIAL_BALANCE?: string;
   /** Optional: protects POST /v1/admin/coin/mint. Unset: minting is off. */
   ADMIN_SECRET?: string;
+  /** Optional: comma-separated URLs of WZDx v4 GeoJSON feeds, polled every 10 minutes for work zones. */
+  WZDX_FEEDS?: string;
 }
 
 /** A JSON response with the headers every API reply carries. */
