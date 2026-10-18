@@ -117,7 +117,8 @@
         </intent>
     </queries>
 
-    <application>
+    <!-- largeHeap: a state's road graph and its routing arrays run to hundreds of MB. -->
+    <application android:largeHeap="true">
 
         <!-- NFC tags tapped while Aegis is not in reader mode arrive as intents. -->
         <activity android:name=".MainActivity">
@@ -148,6 +149,15 @@
             android:name=".DriveService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice|location" />
+
+        <!--
+            Turn-by-turn navigation: keeps location fixes coming once per second with
+            the screen off. Started and stopped by the navigation session only.
+        -->
+        <service
+            android:name=".nav.NavigationService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
 
         <service
             android:name=".ScanService"

@@ -1,0 +1,109 @@
+name: Maps
+
+# Builds the AGR1 road graph for one Geofabrik region and publishes it as
+# graph-<slug>.agr.gz on the release tagged maps-<slug> (created or replaced).
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Geofabrik region path (e.g. north-america/us/ohio)'
+        required: true
+        default: 'north-america/us/ohio'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve region
+        id: region
+        env:
+          REGION: ${{ github.event.inputs.region }}
+        run: |
+          # Matched in bash, not grep: grep tests each line, so a value with a newline would pass.
+          if [[ ! "$REGION" =~ ^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*$ ]]; then
+            echo "::error::region must look like north-america/us/ohio (got '$REGION')"
+            exit 1
+          fi
+          slug="${REGION//\//-}"
+          echo "region=$REGION" >> "$GITHUB_OUTPUT"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+          echo "Region $REGION -> slug $slug"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: tools/graph-builder/requirements.txt
+
+      - name: Install builder dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tools/graph-builder/requirements.txt pytest
+
+      - name: Test graph builder
+        run: python -m pytest -q tools/graph-builder/test_build_graph.py
+
+      - name: Download OSM extract
+        env:
+          REGION: ${{ steps.region.outputs.region }}
+        run: |
+          url="https://download.geofabrik.de/${REGION}-latest.osm.pbf"
+          echo "Downloading $url"
+          curl -fL --retry 5 --retry-delay 10 --retry-all-errors -o "$RUNNER_TEMP/region.osm.pbf" "$url"
+          ls -l "$RUNNER_TEMP/region.osm.pbf"
+
+      - name: Build graph
+        env:
+          SLUG: ${{ steps.region.outputs.slug }}
+        run: |
+          mkdir -p dist
+          # File-backed node index keeps RAM free for the graph arrays on large states.
+          python3 tools/graph-builder/build_graph.py "$RUNNER_TEMP/region.osm.pbf" "dist/graph-$SLUG.agr" \
+            --region "$SLUG" --index "sparse_file_array,$RUNNER_TEMP/nodes.idx"
+          rm -f "$RUNNER_TEMP/nodes.idx" "$RUNNER_TEMP/region.osm.pbf"
+
+      - name: Compress and report
+        env:
+          SLUG: ${{ steps.region.outputs.slug }}
+        run: |
+          agr="dist/graph-$SLUG.agr"
+          file="$agr.gz"
+          read -r version nodes edges shape <<< "$(od -An -tu4 -j4 -N16 "$agr")"
+          raw=$(stat -c %s "$agr")
+          gzip -9 -f "$agr"
+          (cd dist && sha256sum "graph-$SLUG.agr.gz" > "graph-$SLUG.agr.gz.sha256")
+          size=$(stat -c %s "$file")
+          echo "AGR version $version: $nodes nodes, $edges edges, $shape shape points"
+          echo "uncompressed $raw bytes, compressed $size bytes"
+          {
+            echo "### Road graph \`$SLUG\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Nodes | $nodes |"
+            echo "| Edges | $edges |"
+            echo "| Shape points | $shape |"
+            echo "| Uncompressed | $raw bytes |"
+            echo "| graph-$SLUG.agr.gz | $size bytes |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: maps-${{ steps.region.outputs.slug }}
+          name: Road graph ${{ steps.region.outputs.region }}
+          body: |
+            AGR1 road graph for `${{ steps.region.outputs.region }}`, built from the Geofabrik extract
+            by run ${{ github.run_id }} of ${{ github.sha }}. Map data (c) OpenStreetMap contributors, ODbL.
+          files: |
+            dist/graph-${{ steps.region.outputs.slug }}.agr.gz
+            dist/graph-${{ steps.region.outputs.slug }}.agr.gz.sha256
+          overwrite_files: true
+          make_latest: false
