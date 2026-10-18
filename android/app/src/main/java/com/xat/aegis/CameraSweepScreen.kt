@@ -255,7 +255,7 @@ private fun OpticalTab(findings: List<CameraFinding>) {
             if (mode == OpticalMode.GLINT) {
                 Text("How glint works", color = CInk, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 Text(
-                    "The torch is on. A lens — even a pinhole — sends light straight back along its own axis, so it shows as a tiny round spot that stays put while you move. Screw heads, glass edges and chrome flash too, but their highlights slide. Keep the phone moving slowly at arm's length; a circle turns red once a spot has held still for ${LensGlintAnalyzer.MIN_PERSISTENCE} frames with the scene steady.",
+                    "The torch is on. A lens — even a pinhole — sends light straight back along its own axis, so it shows as a tiny round spot that stays put while you move. Screw heads, glass edges and chrome flash too, but their highlights slide. Hold the phone still for about a second over a suspect area; a circle turns red once a spot has held completely still for ${LensGlintAnalyzer.MIN_PERSISTENCE} consecutive frames.",
                     color = CInkDim, fontSize = 12.sp, lineHeight = 16.sp
                 )
             } else {
