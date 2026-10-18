@@ -220,8 +220,10 @@ class LensGlintAnalyzer(
         private const val IR_THRESHOLD = 200
         /** IR mode: above this mean luma the room has visible light in it and a dot means nothing. */
         private const val IR_MAX_AMBIENT = 60f
-        // Minimum 4 grid cells (16 × 16 source pixels) eliminates sensor noise and dust specks.
-        private const val MIN_AREA = 4
+        // GLINT: minimum 4 grid cells (16 × 16 source pixels) eliminates sensor noise and dust specks.
+        private const val MIN_AREA_GLINT = 4
+        // IR dots are often smaller; 2 grid cells (8 × 8 source pixels) avoids missing faint emitters.
+        private const val MIN_AREA_IR = 2
         private const val MAX_AREA = 60
         // Lens retroreflectors are nearly perfect circles; 0.72 cuts highlights from screw heads
         // and glossy edges while keeping genuine round glints.
@@ -241,9 +243,6 @@ class LensGlintAnalyzer(
 
     private class Track(var gx: Float, var gy: Float, var radius: Float, var persistence: Int, val id: Int) {
         var reportedAt = 0
-        // Previous-frame position, used for the pan-motion veto.
-        var prevGx = gx
-        var prevGy = gy
     }
 
     private class Blob {
@@ -334,7 +333,8 @@ class LensGlintAnalyzer(
                 if (grid[i].toInt() == 1 && labels[i] == 0) flood(i, ++label)
             }
             for (b in blobs) {
-                if (b.area < MIN_AREA || b.area > MAX_AREA) continue
+                val minArea = if (mode == OpticalMode.GLINT) MIN_AREA_GLINT else MIN_AREA_IR
+                if (b.area < minArea || b.area > MAX_AREA) continue
                 val p = b.perimeter.toFloat()
                 val circularity = (4f * PI.toFloat() * b.area) / (p * p)
                 if (circularity < MIN_CIRCULARITY) continue
@@ -347,8 +347,8 @@ class LensGlintAnalyzer(
         // means *consecutive* frames; a spot that blinks is not a lens.
         val matched = BooleanArray(tracks.size)
         val next = ArrayList<Track>(candidates.size)
-        // For the pan-motion veto, record each matched track's displacement before updating.
-        data class Disp(val dx: Float, val dy: Float)
+        // Record (dx, dy, track) for every matched track so the pan vetoes can use them.
+        data class Disp(val dx: Float, val dy: Float, val track: Track)
         val displacements = ArrayList<Disp>()
         for (c in candidates) {
             var best = -1
@@ -364,8 +364,10 @@ class LensGlintAnalyzer(
             if (best >= 0) {
                 matched[best] = true
                 val t = tracks[best]
-                displacements.add(Disp(c.gx - t.prevGx, c.gy - t.prevGy))
-                t.prevGx = t.gx; t.prevGy = t.gy
+                // Displacement is from the track's last-known position (one frame ago).
+                val ddx = c.gx - t.gx
+                val ddy = c.gy - t.gy
+                displacements.add(Disp(ddx, ddy, t))
                 t.gx = c.gx; t.gy = c.gy; t.radius = c.radius
                 t.persistence = if (stable) t.persistence + 1 else 1
                 next.add(t)
@@ -373,17 +375,26 @@ class LensGlintAnalyzer(
                 next.add(Track(c.gx, c.gy, c.radius, 1, nextId++))
             }
         }
-        // Pan veto: if ≥ 3 matched tracks all moved in the same direction by more than
-        // PAN_VETO_GRID_PX, the phone moved, not the scene. Reset persistence for every track
-        // so a genuine glint still has to hold still through a stationary frame.
-        if (displacements.size >= 3) {
-            val meanDx = displacements.sumOf { it.dx.toDouble() }.toFloat() / displacements.size
-            val meanDy = displacements.sumOf { it.dy.toDouble() }.toFloat() / displacements.size
+        // Per-track veto: a single highlight that keeps moving can still be a false positive
+        // even when fewer than three tracks are present. Reset any track that moved individually.
+        for ((ddx, ddy, t) in displacements) {
+            if (sqrt(ddx * ddx + ddy * ddy) > PAN_VETO_GRID_PX) {
+                t.persistence = 1
+                t.reportedAt = 0
+            }
+        }
+        // Global pan veto: if ≥ 3 tracks that each exceeded the motion threshold all moved in
+        // the same direction, the phone panned. Reset ALL tracks so a genuine glint must hold
+        // still through a fresh stationary interval.
+        val movers = displacements.filter { sqrt(it.dx * it.dx + it.dy * it.dy) > PAN_VETO_GRID_PX }
+        if (movers.size >= 3) {
+            val meanDx = movers.sumOf { it.dx.toDouble() }.toFloat() / movers.size
+            val meanDy = movers.sumOf { it.dy.toDouble() }.toFloat() / movers.size
             val meanMag = sqrt(meanDx * meanDx + meanDy * meanDy)
             if (meanMag > PAN_VETO_GRID_PX) {
-                // Check that the displacement vectors cluster tightly around the mean direction.
+                // Only movers contribute to the spread test; stationary tracks cannot block the veto.
                 val meanAngle = kotlin.math.atan2(meanDy.toDouble(), meanDx.toDouble())
-                val spreadOk = displacements.all { d ->
+                val spreadOk = movers.all { d ->
                     val angle = kotlin.math.atan2(d.dy.toDouble(), d.dx.toDouble())
                     var diff = Math.toDegrees(angle - meanAngle)
                     while (diff > 180.0) diff -= 360.0
@@ -391,7 +402,7 @@ class LensGlintAnalyzer(
                     abs(diff.toFloat()) < PAN_VETO_ANGULAR_SPREAD_DEG
                 }
                 if (spreadOk) {
-                    for (t in next) t.persistence = 1
+                    for (t in next) { t.persistence = 1; t.reportedAt = 0 }
                 }
             }
         }
