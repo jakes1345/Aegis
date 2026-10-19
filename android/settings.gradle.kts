@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Aegis"
+rootProject.name = "Clairix"
 include(":app")

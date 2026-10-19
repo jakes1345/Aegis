@@ -5,8 +5,8 @@
  * invite code) travels in the URL fragment, which browsers never send to a
  * server, so this page is the same static file for everyone and the relay
  * learns nothing from it being opened. The page reads the fragment, says who
- * sent the invite, links to the Aegis download, and hands the invite to the
- * app with an Android intent link. Copying the invite text into Aegis by
+ * sent the invite, links to the Clairix download, and hands the invite to the
+ * app with an Android intent link. Copying the invite text into Clairix by
  * hand works too, for browsers that will not open the app.
  */
 export function invitePage(): string {
@@ -16,7 +16,7 @@ export function invitePage(): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Aegis invite</title>
+<title>Clairix invite</title>
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; background: #0e1116; color: #e6eaf1; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow-wrap: anywhere; }
@@ -40,8 +40,8 @@ export function invitePage(): string {
 </head>
 <body>
 <main>
-  <h1>AEGIS INVITE</h1>
-  <p class="muted">End-to-end encrypted messages and calls between Aegis apps.</p>
+  <h1>CLAIRIX INVITE</h1>
+  <p class="muted">End-to-end encrypted messages and calls between Clairix apps.</p>
 
   <div id="bad" class="card warn" hidden>This invite link is incomplete. Ask for it to be sent again, and open the whole link.</div>
 
@@ -50,33 +50,33 @@ export function invitePage(): string {
       <div class="muted">You were invited by</div>
       <div class="from" id="from"></div>
       <div class="num" id="number"></div>
-      <p class="muted">Joining gives you your own Aegis number on this relay, with <span id="who"></span> already in your contacts.
+      <p class="muted">Joining gives you your own Clairix number on this relay, with <span id="who"></span> already in your contacts.
         The invite works once and expires seven days after it was made.</p>
     </div>
 
     <div class="card">
       <ol>
-        <li><b>Install Aegis</b> (Android 12 or newer). Skip this if you have it.
-          <a class="button secondary" href="https://github.com/jakes1345/Aegis/releases/latest" rel="noopener">DOWNLOAD AEGIS</a></li>
-        <li><b>Open the invite in Aegis.</b> It fills everything in; tap REGISTER.
-          <a class="button primary" id="open" href="#">OPEN IN AEGIS</a></li>
+        <li><b>Install Clairix</b> (Android 12 or newer). Skip this if you have it.
+          <a class="button secondary" href="https://github.com/jakes1345/Aegis/releases/latest" rel="noopener">DOWNLOAD CLAIRIX</a></li>
+        <li><b>Open the invite in Clairix.</b> It fills everything in; tap REGISTER.
+          <a class="button primary" id="open" href="#">OPEN IN CLAIRIX</a></li>
       </ol>
     </div>
 
     <div class="card">
-      <div class="muted">If the button does nothing: copy this, then in Aegis go to COMMS → HAVE AN INVITE? → PASTE.</div>
+      <div class="muted">If the button does nothing: copy this, then in Clairix go to COMMS → HAVE AN INVITE? → PASTE.</div>
       <textarea id="text" readonly></textarea>
       <button class="secondary" id="copy">COPY INVITE</button>
     </div>
   </div>
 
-  <p class="muted">An Aegis number is not a phone number: it reaches only other Aegis apps on the same relay.</p>
+  <p class="muted">A Clairix number is not a phone number: it reaches only other Clairix apps on the same relay.</p>
 </main>
 <script>
 (function () {
   var raw = "";
   try { raw = decodeURIComponent(location.hash.slice(1)); } catch (e) { raw = ""; }
-  var prefix = "aegis:v1?";
+  var prefix = "clairix:v1?";
   if (raw.indexOf(prefix) !== 0) { document.getElementById("bad").hidden = false; return; }
   var params = {};
   raw.slice(prefix.length).split("&").forEach(function (part) {
@@ -87,11 +87,11 @@ export function invitePage(): string {
   var number = params.n.slice(0, 3) + " " + params.n.slice(3, 6) + " " + params.n.slice(6);
   var name = (params.d || "").trim();
   document.getElementById("from").textContent = name || number;
-  document.getElementById("number").textContent = name ? "Aegis number " + number : "Aegis number";
+  document.getElementById("number").textContent = name ? "Clairix number " + number : "Clairix number";
   document.getElementById("who").textContent = name || number;
   document.getElementById("text").value = raw;
   document.getElementById("open").href =
-    "intent://invite?c=" + encodeURIComponent(raw) + "#Intent;scheme=aegis;package=com.xat.aegis;end";
+    "intent://invite?c=" + encodeURIComponent(raw) + "#Intent;scheme=clairix;package=app.clairix;end";
   document.getElementById("copy").addEventListener("click", function () {
     var t = document.getElementById("text");
     t.select();

@@ -4,7 +4,7 @@
     encrypted with them is useless on another device. A "copy apps & data"
     transfer used to carry the COMMS identity and its wrapped key across
     without the Keystore key: the new phone looked registered under the old
-    Aegis number but could not send, receive or unpair. These stay behind;
+    Clairix number but could not send, receive or unpair. These stay behind;
     the new phone registers its own identity. The card vault is sealed the
     same way. Cloud backup is off entirely (allowBackup="false").
 -->

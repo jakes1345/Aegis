@@ -41,7 +41,7 @@
     <uses-permission android:name="android.permission.NFC" />
 
     <!-- Unlock ledger: the platform's own record of the keyguard going away and
-         the screen turning on, which fills in unlocks from before Aegis's device
+         the screen turning on, which fills in unlocks from before Clairix's device
          admin was enabled (and any while it was switched off). A special-access
          permission the owner grants in Settings → Usage access; nothing is read
          without it. -->
@@ -50,7 +50,7 @@
         tools:ignore="ProtectedPermissions" />
 
     <!-- Screen-recording detection on Android 15+: a normal permission that lets
-         the window manager tell Aegis when its own screen is inside a recording. -->
+         the window manager tell Clairix when its own screen is inside a recording. -->
     <uses-permission android:name="android.permission.DETECT_SCREEN_RECORDING" />
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
@@ -120,7 +120,7 @@
     <!-- largeHeap: a state's road graph and its routing arrays run to hundreds of MB. -->
     <application android:largeHeap="true">
 
-        <!-- NFC tags tapped while Aegis is not in reader mode arrive as intents. -->
+        <!-- NFC tags tapped while Clairix is not in reader mode arrive as intents. -->
         <activity android:name=".MainActivity">
             <intent-filter>
                 <action android:name="android.nfc.action.NDEF_DISCOVERED" />
@@ -204,18 +204,18 @@
         <!--
             Fake incoming call: a pretend ring the owner schedules as a reason to
             leave. Its screen shows over the lock screen like a real call and is kept
-            out of recents; only Aegis's own alarm and notification can open it.
+            out of recents; only Clairix's own alarm and notification can open it.
         -->
         <activity
             android:name=".security.FakeCallActivity"
             android:exported="false"
             android:launchMode="singleTop"
-            android:taskAffinity="com.xat.aegis.fakecall"
+            android:taskAffinity="app.clairix.fakecall"
             android:excludeFromRecents="true"
             android:showOnLockScreen="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
-            android:theme="@style/Theme.Aegis" />
+            android:theme="@style/Theme.Clairix" />
 
         <!-- The fake call's alarm and its Decline button. -->
         <receiver

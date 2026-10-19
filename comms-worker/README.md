@@ -1,20 +1,20 @@
-# Aegis comms relay
+# Clairix comms relay
 
 A Cloudflare Worker that stores and forwards end-to-end encrypted envelopes
-between Aegis apps. It is the only server in the design, and it is built to
+between Clairix apps. It is the only server in the design, and it is built to
 know as little as possible.
 
-**Aegis numbers are not phone numbers.** Each Aegis identity gets a random
-nine-digit Aegis number from this relay at registration. It works only between
-Aegis apps paired with the same relay. It cannot call or text a phone, and a
+**Clairix numbers are not phone numbers.** Each Clairix identity gets a random
+nine-digit Clairix number from this relay at registration. It works only between
+Clairix apps paired with the same relay. It cannot call or text a phone, and a
 phone cannot reach it. What it buys is a handle you can give someone without
 giving them your real number or your identity key.
 
 ## What the relay sees
 
 - The public keys of each registered identity (they are public by design).
-- For each envelope: the recipient's Aegis number, a size and a timestamp, and,
-  at the moment it is sent, the sender's Aegis number, because the send request
+- For each envelope: the recipient's Clairix number, a size and a timestamp, and,
+  at the moment it is sent, the sender's Clairix number, because the send request
   is signed by the sender. The relay does not store the sender with the
   envelope, and a queued envelope names only its recipient, but a relay
   operator who logs requests can see who sent to whom and when. Never the
@@ -33,22 +33,22 @@ verify. There are no passwords or tokens to leak.
 cd comms-worker
 npm install
 npx wrangler login              # or set CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID
-npx wrangler secret put ENROLL_SECRET   # a long random string typed into Aegis once
+npx wrangler secret put ENROLL_SECRET   # a long random string typed into Clairix once
 npm run deploy                  # prints the Worker URL
 ```
 
-In Aegis, open the COMMS tab, enter the Worker URL and the enrollment secret.
-The app generates its identity on the phone, registers it, and shows the Aegis
+In Clairix, open the COMMS tab, enter the Worker URL and the enrollment secret.
+The app generates its identity on the phone, registers it, and shows the Clairix
 number it was given. Two people pair by scanning each other's QR code in
-person, or by typing a listed Aegis number and then comparing safety numbers.
+person, or by typing a listed Clairix number and then comparing safety numbers.
 
 ### Inviting people
 
 Only the relay's owner needs the URL and the enrollment secret. Everyone else
-joins by invite: in Aegis, COMMS → INVITE makes a one-time invite. Someone
+joins by invite: in Clairix, COMMS → INVITE makes a one-time invite. Someone
 standing next to you scans its QR code from COMMS setup (SCAN INVITE); someone
-far away gets a link, `https://<relay>/i#…`, which opens a page with the Aegis
-download and an OPEN IN AEGIS button. The invite registers exactly one phone,
+far away gets a link, `https://<relay>/i#…`, which opens a page with the Clairix
+download and an OPEN IN CLAIRIX button. The invite registers exactly one phone,
 expires after seven days, and never reveals the enrollment secret. The new
 phone starts with the inviter as a verified contact, since the invite carries
 the inviter's keys, and sends them a first message. The part after `#` never
@@ -72,10 +72,10 @@ npx wrangler secret put TURN_KEY_API_TOKEN
 The Worker then mints short-lived TURN credentials for `GET /v1/turn`. A TURN
 server forwards encrypted packets it cannot decrypt.
 
-### AegisCoin (optional)
+### ClairixCoin (optional)
 
-Every relay is its own small currency community. Each Aegis number holds a
-balance of AegisCoin (`AC`) in its mailbox, and a phone pays another by a
+Every relay is its own small currency community. Each Clairix number holds a
+balance of ClairixCoin (`AC`) in its mailbox, and a phone pays another by a
 signed request; the relay moves the coins between the two mailboxes. The
 recipient then hears about the payment, with whatever note the payer wrote,
 inside an encrypted envelope: the relay records who paid whom how much, but
@@ -93,7 +93,7 @@ COIN_INITIAL_BALANCE = "100"    # coins every new registration starts with
 npx wrangler secret put ADMIN_SECRET   # 16+ characters; lets the operator mint
 ```
 
-Minting is `POST /v1/admin/coin/mint` with `{"to": "<Aegis number>", "amount": 50}`,
+Minting is `POST /v1/admin/coin/mint` with `{"to": "<Clairix number>", "amount": 50}`,
 signed like any request by a registered identity (the operator's own phone,
 say) and carrying `X-Admin-Secret`. Without `ADMIN_SECRET` the endpoint is off.
 A single transfer moves at most 1,000,000 AC; each mailbox keeps its last 100
@@ -101,13 +101,13 @@ transactions.
 
 ### Traffic (navigation)
 
-The relay also carries crowd-sourced traffic for Aegis navigation, in a
+The relay also carries crowd-sourced traffic for Clairix navigation, in a
 `Traffic` Durable Object per map region (`traffic:<region>`, e.g.
 `traffic:north-america-us-ohio`). Roads are identified by directed OSM way,
 `"<wayId>:<dir>"`.
 
 - **Probes** (`POST /v1/traffic/probe`, up to 60 samples, each at most 15
-  minutes old) give a segment's speed. The sender's Aegis number is used for
+  minutes old) give a segment's speed. The sender's Clairix number is used for
   rate limiting in its own mailbox and is never stored by the traffic object:
   each sample carries a SHA-256 of the number with a salt that exists only
   inside that region's object. Raw probes are deleted after two hours.
@@ -140,13 +140,13 @@ WZDX_FEEDS = "https://example-dot.gov/wzdx/v4/feed.geojson"
 
 ## API
 
-Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
-`X-Aegis-Nonce` (single use) and `X-Aegis-Sig`, an Ed25519 signature over
+Signed requests carry `X-Clairix-Number`, `X-Clairix-Ts` (epoch millis, ±5 min),
+`X-Clairix-Nonce` (single use) and `X-Clairix-Sig`, an Ed25519 signature over
 `number\nts\nnonce\nMETHOD\npath?query\nsha256hex(body)`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| POST | `/v1/register` | Body signed by the new identity's key, with `secret` or a one-time `invite`; allocates an Aegis number |
+| POST | `/v1/register` | Body signed by the new identity's key, with `secret` or a one-time `invite`; allocates a Clairix number |
 | POST | `/v1/invites` | Makes a one-time invite: `{code, expiresAt}` (seven days) |
 | GET | `/i` | Invite landing page (unsigned); the invite is in the URL fragment |
 | GET | `/v1/me` | Own profile and one-time-key count |
@@ -160,7 +160,7 @@ Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
 | POST | `/v1/ack` | Delete envelopes the app has stored |
 | GET | `/v1/ws` | Live delivery over a hibernatable WebSocket: `envelope` frames (acked with `{"type":"ack","ids":[…]}`), a `ready` frame after the backlog, a `hb` heartbeat every two minutes, and `pong` for a client's `{"type":"ping"}` |
 | GET | `/v1/turn` | ICE servers for a call: STUN, plus short-lived TURN credentials when a TURN key is configured |
-| GET | `/v1/coin/balance` | `{balance, symbol: "AC"}`: this identity's AegisCoin |
+| GET | `/v1/coin/balance` | `{balance, symbol: "AC"}`: this identity's ClairixCoin |
 | POST | `/v1/coin/pay` | `{to, amount, note?}` → `{txid, balance, ok}`: pays a contact; 30 a minute |
 | GET | `/v1/coin/history` | `{txs}`: the last transactions, newest first (`?limit=`, up to 100) |
 | POST | `/v1/admin/coin/mint` | `{to, amount}` with `X-Admin-Secret` → `{ok, balance}`; off unless `ADMIN_SECRET` is set |
@@ -170,7 +170,7 @@ Signed requests carry `X-Aegis-Number`, `X-Aegis-Ts` (epoch millis, ±5 min),
 | POST | `/v1/traffic/report` | `{region, type, lat, lon, seg?}` → `{incident}`; merges with a nearby report of the same type |
 | POST | `/v1/traffic/report/vote` | `{region, id, still}` → `{incident}`, null once voted away |
 
-Each Aegis number is a Durable Object holding the keys, the queue (up to 2000
+Each Clairix number is a Durable Object holding the keys, the queue (up to 2000
 envelopes of 64 KiB, kept 30 days) and the live sockets. Incident times
 (`createdAt`, `expiresAt`) and probe times are epoch seconds.
 

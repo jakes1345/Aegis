@@ -1,20 +1,20 @@
-# Aegis comms relay: store-and-forward for end-to-end encrypted envelopes
-# between Aegis apps, addressed by Aegis number (not a phone number).
+# Clairix comms relay: store-and-forward for end-to-end encrypted envelopes
+# between Clairix apps, addressed by Clairix number (not a phone number).
 #
 # Secrets (set with `wrangler secret put <NAME>`, never in this file):
-#   ENROLL_SECRET        One-time code typed into Aegis when it registers
+#   ENROLL_SECRET        One-time code typed into Clairix when it registers
 #   TURN_KEY_ID          Optional, for calls: Cloudflare Realtime TURN key id
 #   TURN_KEY_API_TOKEN   Optional, for calls: its API token
-#   ADMIN_SECRET         Optional, for AegisCoin: lets the operator mint coins (POST /v1/admin/coin/mint)
+#   ADMIN_SECRET         Optional, for ClairixCoin: lets the operator mint coins (POST /v1/admin/coin/mint)
 #
 # Plain variables (may go in [vars] below):
-#   COIN_INITIAL_BALANCE AegisCoin every new registration starts with, e.g. "100"; unset: none
+#   COIN_INITIAL_BALANCE ClairixCoin every new registration starts with, e.g. "100"; unset: none
 #   WZDX_FEEDS           Optional, for navigation: comma-separated URLs of WZDx v4 GeoJSON
 #                        feeds (state DOT work-zone feeds). The cron below fetches them every
 #                        10 minutes and adds work zones as traffic incidents to every region
 #                        whose area (learned from positioned reports) contains them.
 
-name = "aegis-comms"
+name = "clairix-comms"
 main = "src/index.ts"
 compatibility_date = "2025-09-01"
 compatibility_flags = ["nodejs_compat"]

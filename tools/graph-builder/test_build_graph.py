@@ -330,7 +330,7 @@ def test_region_list_matches_the_app():
     """The maps workflow builds exactly the regions the app offers for download."""
     here = Path(__file__).resolve().parent
     listed = [l.strip() for l in (here / "us-regions.txt").read_text().splitlines() if l.strip()]
-    store = (here.parents[1] / "android/app/src/main/java/com/xat/aegis/nav/GraphStore.kt").read_text()
+    store = (here.parents[1] / "android/app/src/main/java/app/clairix/nav/GraphStore.kt").read_text()
     offered = ["north-america/us/" + m for m in re.findall(r'us\("([a-z-]+)"', store)]
     assert listed == offered
     assert len(set(listed)) == len(listed)

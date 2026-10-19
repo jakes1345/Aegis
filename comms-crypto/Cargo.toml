@@ -1,13 +1,13 @@
 [package]
-name = "aegis_comms_crypto"
+name = "clairix_comms_crypto"
 version = "1.0.0"
 edition = "2021"
-description = "End-to-end encryption for Aegis comms: vodozemac (Olm double ratchet) identities and sessions, plus a sealed-sender envelope layer, exposed to Kotlin through UniFFI."
+description = "End-to-end encryption for Clairix comms: vodozemac (Olm double ratchet) identities and sessions, plus a sealed-sender envelope layer, exposed to Kotlin through UniFFI."
 license = "MIT"
 publish = false
 
 [lib]
-name = "aegis_comms_crypto"
+name = "clairix_comms_crypto"
 crate-type = ["cdylib", "lib"]
 
 [[bin]]

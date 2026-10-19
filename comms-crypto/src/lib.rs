@@ -1,11 +1,11 @@
-//! End-to-end encryption for Aegis comms.
+//! End-to-end encryption for Clairix comms.
 //!
 //! Two layers, both standard constructions:
 //!
 //! 1. **Olm double ratchet** (vodozemac, the audited Rust implementation used by
 //!    Matrix), in its version-2 session format, which authenticates every
 //!    message with a full-length HMAC rather than libolm's truncated one. Both
-//!    ends are Aegis, so libolm interoperability is not needed. A long-term identity (Ed25519 signing key + Curve25519 identity
+//!    ends are Clairix, so libolm interoperability is not needed. A long-term identity (Ed25519 signing key + Curve25519 identity
 //!    key), signed one-time and fallback keys, and per-peer sessions that ratchet
 //!    forward with every message. This gives forward secrecy and post-compromise
 //!    security for message content.
@@ -125,7 +125,7 @@ pub struct Decrypted {
 // ── Sealed envelope ────────────────────────────────────────────────────────
 
 const ENVELOPE_VERSION: u8 = 1;
-const SEAL_INFO: &[u8] = b"aegis-comms-seal-v1";
+const SEAL_INFO: &[u8] = b"clairix-comms-seal-v1";
 
 /// Serialised inside the sealed box; only the recipient reads it.
 #[derive(Serialize, Deserialize)]
@@ -553,7 +553,7 @@ pub fn verify(ed25519: String, message: Vec<u8>, signature: String) -> bool {
 pub fn safety_number_for(a_ed25519: &str, b_ed25519: &str) -> String {
     let (first, second) = if a_ed25519 <= b_ed25519 { (a_ed25519, b_ed25519) } else { (b_ed25519, a_ed25519) };
     let mut hasher = Sha512::new();
-    hasher.update(b"aegis-safety-number-v1");
+    hasher.update(b"clairix-safety-number-v1");
     hasher.update(first.as_bytes());
     hasher.update(b"|");
     hasher.update(second.as_bytes());

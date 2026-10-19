@@ -5,12 +5,12 @@ export interface Env {
   MAILBOX: DurableObjectNamespace<Mailbox>;
   /** Crowd-sourced traffic, one object per map region ("traffic:<region>") plus "traffic-registry". */
   TRAFFIC: DurableObjectNamespace<Traffic>;
-  /** One-time code typed into Aegis when it registers, so the relay is not open to everyone. */
+  /** One-time code typed into Clairix when it registers, so the relay is not open to everyone. */
   ENROLL_SECRET: string;
   /** Optional: Cloudflare Realtime TURN key id + API token, for calls. */
   TURN_KEY_ID?: string;
   TURN_KEY_API_TOKEN?: string;
-  /** Optional: AegisCoin minted for every new registration (a whole number, e.g. "100"). Unset or "0": none. */
+  /** Optional: ClairixCoin minted for every new registration (a whole number, e.g. "100"). Unset or "0": none. */
   COIN_INITIAL_BALANCE?: string;
   /** Optional: protects POST /v1/admin/coin/mint. Unset: minting is off. */
   ADMIN_SECRET?: string;
@@ -69,7 +69,7 @@ export function timingSafeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-/** Aegis numbers are nine digits, never starting with 0, e.g. "482 913 605". */
+/** Clairix numbers are nine digits, never starting with 0, e.g. "482 913 605". */
 export const NUMBER_RE = /^[1-9][0-9]{8}$/;
 
 export function normaliseNumber(raw: string): string | null {

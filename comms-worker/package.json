@@ -1,8 +1,8 @@
 {
-  "name": "aegis-comms-worker",
+  "name": "clairix-comms-worker",
   "version": "2.0.0",
   "private": true,
-  "description": "Cloudflare Worker relay for Aegis comms: store-and-forward of end-to-end encrypted envelopes between Aegis apps, addressed by Aegis number.",
+  "description": "Cloudflare Worker relay for Clairix comms: store-and-forward of end-to-end encrypted envelopes between Clairix apps, addressed by Clairix number.",
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",

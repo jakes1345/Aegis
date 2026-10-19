@@ -32,7 +32,7 @@ import {
  * so the WZDx cron knows where to deliver work zones.
  *
  * Probes arrive keyed by directed OSM way ("<wayId>:<dir>"). The sender's
- * Aegis number is never stored: each probe carries a salted SHA-256 of it,
+ * Clairix number is never stored: each probe carries a salted SHA-256 of it,
  * with a salt that lives only in this object, so samples from one phone can be
  * told apart from another's (one vote per phone per segment, sudden-stop
  * detection) without the relay being able to say whose they were.

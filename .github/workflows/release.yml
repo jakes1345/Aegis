@@ -156,8 +156,8 @@ jobs:
             # never will, whatever their version numbers say.
             "$APKSIGNER" verify --print-certs "$OUT"
           }
-          sign full  "aegis-${TAG}.apk"
-          sign comms "aegis-comms-${TAG}.apk"
+          sign full  "clairix-${TAG}.apk"
+          sign comms "clairix-comms-${TAG}.apk"
 
       - name: Compose release notes
         env:
@@ -165,28 +165,28 @@ jobs:
           STABLE: ${{ steps.signing.outputs.stable }}
         run: |
           {
-            echo "## Aegis ${TAG}"
+            echo "## Clairix ${TAG}"
             echo
-            echo "**Two APKs.** \`aegis-${TAG}.apk\` is the whole app. \`aegis-comms-${TAG}.apk\`"
-            echo "is **Aegis Comms**: the encrypted messages, calls, groups and SOS and nothing else —"
+            echo "**Two APKs.** \`clairix-${TAG}.apk\` is the whole app. \`clairix-comms-${TAG}.apk\`"
+            echo "is **Clairix Comms**: the encrypted messages, calls, groups and SOS and nothing else —"
             echo "no scanner, no tools, and none of their permissions — for people you want to be able"
             echo "to reach but not to hand the full toolkit. Both share one package name and one"
             echo "signing key, so the full APK installs straight over a comms install and keeps its"
             echo "number, contacts and messages."
             echo
-            echo "Aegis — defensive security monitor for Android. Detects BLE tracker tags,"
+            echo "Clairix — defensive security monitor for Android. Detects BLE tracker tags,"
             echo "Wi-Fi bait networks, IMSI-catcher anomalies, and sweeps NFC/RFID cards."
             echo "Stores captured cards in an on-device AES-256 vault and can replay them"
             echo "via Host Card Emulation. Detection data stays on the phone; the Map tab"
             echo "downloads OpenStreetMap tiles, which exposes your IP and the area viewed."
             echo
-            echo "**COMMS: end-to-end encrypted messaging and calls between Aegis apps.**"
+            echo "**COMMS: end-to-end encrypted messaging and calls between Clairix apps.**"
             echo "Messages use the Olm double ratchet (vodozemac) and are sealed so your"
             echo "relay sees neither content nor sender; calls are WebRTC audio keyed inside"
             echo "that same encrypted session. Contacts are pinned by key and verified by QR"
             echo "code or safety number. No Google services and no phone carrier are involved."
-            echo "An **Aegis number is not a phone number**: it is a random nine-digit ID your"
-            echo "relay hands out, and it only reaches other Aegis apps on the same relay."
+            echo "An **Clairix number is not a phone number**: it is a random nine-digit ID your"
+            echo "relay hands out, and it only reaches other Clairix apps on the same relay."
             echo "Push wake-ups use UnifiedPush (install ntfy or another distributor);"
             echo "keeping COMMS \"Online\" makes incoming calls ring reliably."
             echo
@@ -196,14 +196,14 @@ jobs:
             echo "the relay URL or its enrollment secret. Camera is asked"
             echo "for when scanning a contact's code; Microphone as soon as you have a number, so"
             echo "a call can be answered straight from the lock screen. On Android 14+, allow"
-            echo "full-screen calls when COMMS settings asks, and set Aegis's battery use to"
+            echo "full-screen calls when COMMS settings asks, and set Clairix's battery use to"
             echo "Unrestricted so the background connection survives the screen being off."
             echo
             echo "**Install**"
             echo
             if [ "$STABLE" = "true" ]; then
-              echo "1. Download \`aegis-${TAG}.apk\` below and tap it."
-              echo "2. It installs straight over an earlier Aegis release and keeps your baseline, event log and trusted devices."
+              echo "1. Download \`clairix-${TAG}.apk\` below and tap it."
+              echo "2. It installs straight over an earlier Clairix release and keeps your baseline, event log and trusted devices."
               echo "3. First install only: Settings → Apps → Special app access → Install unknown apps → allow your file manager."
               echo "4. Grant Nearby devices and Location (precise). Notifications is optional — declining it costs the alert, not the detector."
             else
@@ -212,8 +212,8 @@ jobs:
               echo "> over an earlier release. You have to uninstall the old version first, which"
               echo "> clears the cell baseline, the event log and the trusted-device list."
               echo
-              echo "1. Uninstall any existing Aegis."
-              echo "2. Download \`aegis-${TAG}.apk\` below and tap it."
+              echo "1. Uninstall any existing Clairix."
+              echo "2. Download \`clairix-${TAG}.apk\` below and tap it."
               echo "3. Settings → Apps → Special app access → Install unknown apps → allow your file manager."
               echo "4. Grant Nearby devices and Location (precise). Notifications is optional — declining it costs the alert, not the detector."
             fi
@@ -225,11 +225,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          name: Aegis ${{ steps.tag.outputs.name }}
+          name: Clairix ${{ steps.tag.outputs.name }}
           body_path: ${{ runner.temp }}/notes.md
           generate_release_notes: true
           files: |
-            android/app/build/outputs/apk/signed/aegis-${{ steps.tag.outputs.name }}.apk
-            android/app/build/outputs/apk/signed/aegis-comms-${{ steps.tag.outputs.name }}.apk
+            android/app/build/outputs/apk/signed/clairix-${{ steps.tag.outputs.name }}.apk
+            android/app/build/outputs/apk/signed/clairix-comms-${{ steps.tag.outputs.name }}.apk
           draft: false
           prerelease: false

@@ -8,15 +8,15 @@ import { INCIDENT_TYPES, PROBE_MAX_AGE_SEC, REGION_RE, SEGMENT_RE, bboxContains,
 export { Mailbox, Traffic };
 
 /**
- * Aegis comms relay: store-and-forward for end-to-end encrypted envelopes
- * between Aegis apps, addressed by Aegis number.
+ * Clairix comms relay: store-and-forward for end-to-end encrypted envelopes
+ * between Clairix apps, addressed by Clairix number.
  *
- * An Aegis number is not a phone number. It is a random nine-digit ID this
- * relay hands out at registration, and it works only between Aegis apps
+ * A Clairix number is not a phone number. It is a random nine-digit ID this
+ * relay hands out at registration, and it works only between Clairix apps
  * paired with this relay.
  *
  *   POST   /v1/register        {secret | invite, ed25519, curve25519, sealing, signature, fallback, oneTimeKeys, listed}
- *                              signed by ed25519 (X-Aegis-Sig over the body) → {number}
+ *                              signed by ed25519 (X-Clairix-Sig over the body) → {number}
  *   GET    /i                                              → invite page; the invite itself is in the URL fragment,
  *                                                            which browsers never send to the relay
  * Signed (see auth.ts):
@@ -34,7 +34,7 @@ export { Mailbox, Traffic };
  *   POST   /v1/ack             {ids}
  *   GET    /v1/ws                                          → live delivery (hibernatable WebSocket)
  *   GET    /v1/turn                                        → ICE servers for a call
- * AegisCoin (each relay is its own coin community; balances live in the mailboxes):
+ * ClairixCoin (each relay is its own coin community; balances live in the mailboxes):
  *   GET    /v1/coin/balance                                → {balance, symbol: "AC"}
  *   POST   /v1/coin/pay        {to, amount, note?}         → {txid, balance, ok}: moves coins to a contact
  *   GET    /v1/coin/history                                → {txs: [...]}, newest first
@@ -84,7 +84,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   const path = url.pathname.replace(/\/+$/, "") || "/";
 
   if (request.method === "GET" && path === "/") {
-    return json({ service: "aegis-comms", version: 2, ok: true, note: "Aegis numbers are not phone numbers." });
+    return json({ service: "clairix-comms", version: 2, ok: true, note: "Clairix numbers are not phone numbers." });
   }
 
   const bodyText = request.method === "GET" || request.method === "HEAD" ? "" : await request.text();
@@ -180,7 +180,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       const p = await them.profile();
       if (p && timingSafeEqual(await fingerprint(p.ed25519), pin)) bundle = await them.bundle(false);
     }
-    if (!bundle) throw new HttpError(404, "No such Aegis number, or it is unlisted");
+    if (!bundle) throw new HttpError(404, "No such Clairix number, or it is unlisted");
     return json({ bundle });
   }
 
@@ -201,7 +201,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       const p = await them.profile();
       if (p && timingSafeEqual(await fingerprint(p.ed25519), pin)) identity = await them.identity(false);
     }
-    if (!identity) throw new HttpError(404, "No such Aegis number, or it is unlisted");
+    if (!identity) throw new HttpError(404, "No such Clairix number, or it is unlisted");
     return json({ identity });
   }
 
@@ -211,7 +211,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (!allowed.ok) throw new HttpError(429, "Too many messages; try again shortly", allowed.retryAfter);
     const body = parseJson<{ to?: unknown; envelope?: unknown }>(bodyText);
     const to = typeof body.to === "string" ? normaliseNumber(body.to) : null;
-    if (!to) throw new HttpError(400, "to must be an Aegis number");
+    if (!to) throw new HttpError(400, "to must be a Clairix number");
     if (typeof body.envelope !== "string" || body.envelope.length === 0 || !/^[A-Za-z0-9+/=]+$/.test(body.envelope)) {
       throw new HttpError(400, "envelope must be base64");
     }
@@ -249,7 +249,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     return trafficRoute(env, request, url, path, bodyText, me, profile.number);
   }
 
-  // ── AegisCoin ─────────────────────────────────────────────────────────
+  // ── ClairixCoin ─────────────────────────────────────────────────────────
   if (path === "/v1/coin/balance" && request.method === "GET") {
     return json({ balance: await me.getBalance(), symbol: COIN_SYMBOL });
   }
@@ -259,12 +259,12 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (!allowed.ok) throw new HttpError(429, "Too many payments; try again in a minute", allowed.retryAfter);
     const body = parseJson<{ to?: unknown; amount?: unknown; note?: unknown }>(bodyText);
     const to = typeof body.to === "string" ? normaliseNumber(body.to) : null;
-    if (!to) throw new HttpError(400, "to must be an Aegis number");
+    if (!to) throw new HttpError(400, "to must be a Clairix number");
     if (to === profile.number) throw new HttpError(400, "You cannot pay yourself");
     const amount = coinAmount(body.amount);
     const note = coinNote(body.note);
     const them = env.MAILBOX.get(env.MAILBOX.idFromName(to));
-    if (!(await them.profile())) throw new HttpError(404, "No such Aegis number on this relay");
+    if (!(await them.profile())) throw new HttpError(404, "No such Clairix number on this relay");
     const txid = crypto.randomUUID();
     const debited = await me.debit(to, amount, txid, note);
     if (!debited.ok) throw new HttpError(400, debited.reason ?? "Payment refused");
@@ -297,10 +297,10 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (!timingSafeEqual(given, secret)) throw new HttpError(403, "Admin secret rejected");
     const body = parseJson<{ to?: unknown; amount?: unknown }>(bodyText);
     const to = typeof body.to === "string" ? normaliseNumber(body.to) : null;
-    if (!to) throw new HttpError(400, "to must be an Aegis number");
+    if (!to) throw new HttpError(400, "to must be a Clairix number");
     const amount = coinAmount(body.amount);
     const them = env.MAILBOX.get(env.MAILBOX.idFromName(to));
-    if (!(await them.profile())) throw new HttpError(404, "No such Aegis number on this relay");
+    if (!(await them.profile())) throw new HttpError(404, "No such Clairix number on this relay");
     const balance = await them.credit("mint", amount, crypto.randomUUID(), `Minted by ${profile.number}`);
     return json({ ok: true, balance });
   }
@@ -522,7 +522,7 @@ function coinNote(raw: unknown): string {
 /**
  * Registration. The body is signed by the new identity's Ed25519 key (proof of
  * possession), carries the enrollment secret, and the relay allocates a fresh
- * Aegis number. The curve25519 and sealing keys must be signed by the Ed25519
+ * Clairix number. The curve25519 and sealing keys must be signed by the Ed25519
  * key, and every one-time key must be too: the relay checks so it never stores
  * a bundle a contact would reject.
  */
@@ -554,7 +554,7 @@ async function register(env: Env, request: Request, bodyText: string): Promise<R
   const sealing = body.sealing as string;
   const signature = body.signature as string;
 
-  const bodySig = request.headers.get("x-aegis-sig") ?? "";
+  const bodySig = request.headers.get("x-clairix-sig") ?? "";
   if (!(await verifyEd25519(ed25519, bodyText, bodySig))) throw new HttpError(401, "Body signature does not match ed25519");
   if (!(await verifyEd25519(ed25519, `${curve25519}|${sealing}`, signature))) throw new HttpError(400, "Key binding signature invalid");
   const fallback = body.fallback === undefined || body.fallback === null ? null : (await checkedKeys(ed25519, [body.fallback]))[0] ?? null;

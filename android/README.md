@@ -1,4 +1,4 @@
-# Aegis — Android
+# Clairix — Android
 
 A real BLE tracker detector, not a port. The Node tool in this repo is a
 terminal application and does not run on Android, so this is a native Kotlin
@@ -22,7 +22,7 @@ Every push builds one in CI.
 
 1. Open the **Actions** tab on GitHub
 2. Pick the most recent **Android APK** run
-3. Download the `aegis-debug-apk` artifact
+3. Download the `clairix-debug-apk` artifact
 4. Unzip it and install the `.apk` on your phone
 
 You will need to allow installation from unknown sources. It is a debug build,

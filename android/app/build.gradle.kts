@@ -73,7 +73,7 @@ val uniffiBindgen by tasks.registering(Exec::class) {
     // The binding metadata is architecture-independent; the arm64 library is read.
     commandLine(
         "cargo", "run", "--quiet", "--release", "--bin", "uniffi-bindgen", "--",
-        "generate", "--library", rustJniLibs.get().file("arm64-v8a/libaegis_comms_crypto.so").asFile.absolutePath,
+        "generate", "--library", rustJniLibs.get().file("arm64-v8a/libclairix_comms_crypto.so").asFile.absolutePath,
         "--language", "kotlin", "--out-dir", rustBindings.get().asFile.absolutePath
     )
 }
@@ -97,17 +97,17 @@ tasks.withType<Test>().configureEach {
     dependsOn(cargoHostBuild)
     systemProperty("jna.library.path", rustHostLib.absolutePath)
     // The relay round-trip tests run only when a relay and enrollment secret are
-    // given in the environment (AEGIS_RELAY_URL, AEGIS_ENROLL_SECRET); they are
+    // given in the environment (CLAIRIX_RELAY_URL, CLAIRIX_ENROLL_SECRET); they are
     // forwarded from the build's own environment and never stored in the repo.
     testLogging { events("passed", "skipped", "failed"); showStandardStreams = true; exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL }
 }
 
 android {
-    namespace = "com.xat.aegis"
+    namespace = "app.clairix"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.xat.aegis"
+        applicationId = "app.clairix"
         minSdk = 31
         targetSdk = 35
         versionCode = 20
@@ -121,7 +121,7 @@ android {
     //
     // Both carry the same applicationId and are signed with the same key, so a
     // comms install upgrades to full in place (install the full APK over it) and
-    // keeps its Aegis number, contacts and message history. The comms manifest
+    // keeps its Clairix number, contacts and message history. The comms manifest
     // (src/main) declares only what COMMS needs; the scanner's permissions and
     // components are added by src/full/AndroidManifest.xml. FULL_ACCESS is what
     // the code reads to decide which screens exist.
@@ -214,7 +214,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.biometric:biometric:1.1.0")
 
-    // COMMS — end-to-end encrypted messaging between Aegis apps.
+    // COMMS — end-to-end encrypted messaging between Clairix apps.
     // OkHttp talks to the owner's relay (signed HTTPS and a WebSocket); JNA is
     // how the UniFFI binding reaches the Rust crypto library; zxing renders and
     // scans the pairing QR codes; the UnifiedPush connector wakes the app through

@@ -3,7 +3,7 @@ import { verifyEd25519 } from "./auth";
 import type { Env } from "./env";
 
 /**
- * One Durable Object per Aegis number: the device's published keys, its queue
+ * One Durable Object per Clairix number: the device's published keys, its queue
  * of sealed envelopes, its live WebSocket(s) and its push endpoint.
  *
  * The relay never sees a message: envelopes are opaque bytes sealed to the
@@ -82,9 +82,9 @@ const HEARTBEAT_MS = 120_000;
 const DELETE_BATCH = 128;
 /** How long an invite can be used. */
 export const INVITE_TTL_MS = 7 * 24 * 60 * 60_000;
-/** AegisCoin: transactions kept per mailbox, newest first. */
+/** ClairixCoin: transactions kept per mailbox, newest first. */
 const MAX_TX_HISTORY = 100;
-/** AegisCoin: the most one transfer may move. */
+/** ClairixCoin: the most one transfer may move. */
 const MAX_SINGLE_TRANSFER = 1_000_000;
 
 /** An invite: one registration without the enrollment secret. Stored in its own object, named after its code. */
@@ -105,7 +105,7 @@ interface WakeCheck {
 }
 
 /**
- * One AegisCoin transfer as this mailbox's owner saw it. Every relay is its
+ * One ClairixCoin transfer as this mailbox's owner saw it. Every relay is its
  * own coin community: a balance lives in the owner's mailbox and moves only
  * through requests signed by the owner's identity key. The relay learns who
  * paid whom and how much; the note the payer wrote travels end-to-end
@@ -300,7 +300,7 @@ export class Mailbox extends DurableObject<Env> {
     return removed;
   }
 
-  // ── AegisCoin ───────────────────────────────────────────────────────
+  // ── ClairixCoin ───────────────────────────────────────────────────────
 
   static readonly MAX_SINGLE_TRANSFER = MAX_SINGLE_TRANSFER;
   /** Payments per minute per payer: plenty for a person, a brake on a script. */

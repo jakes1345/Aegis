@@ -33,7 +33,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
-    <!-- COMMS: lets the owner exempt Aegis from battery optimisation, which on
+    <!-- COMMS: lets the owner exempt Clairix from battery optimisation, which on
          many phones (Samsung especially) otherwise cuts the background relay
          connection so incoming calls never ring. Asked for from COMMS settings. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
@@ -53,7 +53,7 @@
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Theme.Aegis">
+        android:theme="@style/Theme.Clairix">
 
         <!--
             Portrait only: the whole UI is laid out for it, and a rotation would
@@ -66,17 +66,17 @@
             android:label="@string/app_name"
             android:launchMode="singleTop"
             android:screenOrientation="portrait"
-            android:theme="@style/Theme.Aegis">
+            android:theme="@style/Theme.Clairix">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- COMMS invites: the relay's invite page opens aegis://invite?c=… -->
+            <!-- COMMS invites: the relay's invite page opens clairix://invite?c=… -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="aegis" android:host="invite" />
+                <data android:scheme="clairix" android:host="invite" />
             </intent-filter>
         </activity>
 
@@ -85,19 +85,19 @@
             alone shows over the lock screen and turns the display on (declared
             here as well, so the system opens it from a locked phone without asking
             for the PIN first), and runs in its own task so ending the call returns
-            to wherever the owner was. Not exported: only Aegis's own notifications
-            can open it, so no other app can make Aegis answer a call.
+            to wherever the owner was. Not exported: only Clairix's own notifications
+            can open it, so no other app can make Clairix answer a call.
         -->
         <activity
             android:name=".CallActivity"
             android:exported="false"
             android:launchMode="singleTop"
-            android:taskAffinity="com.xat.aegis.call"
+            android:taskAffinity="app.clairix.call"
             android:excludeFromRecents="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
             android:screenOrientation="portrait"
-            android:theme="@style/Theme.Aegis" />
+            android:theme="@style/Theme.Clairix" />
 
         <receiver
             android:name=".BootReceiver"
@@ -123,7 +123,7 @@
 
         <!--
             UnifiedPush receiver: a distributor app the owner installs (ntfy, for
-            example) wakes Aegis here. The push carries nothing; the app then
+            example) wakes Clairix here. The push carries nothing; the app then
             fetches its inbox over the signed relay channel. No Google service.
         -->
         <service
@@ -136,7 +136,7 @@
 
         <!--
             An encrypted call in progress: holds the microphone and the WebRTC
-            connection while the owner talks. Started only from an Aegis screen
+            connection while the owner talks. Started only from a Clairix screen
             (placing a call, or answering one on the call screen).
         -->
         <service
