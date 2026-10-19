@@ -55,7 +55,7 @@ class Geocoder(context: Context) {
         } catch (e: android.content.pm.PackageManager.NameNotFoundException) {
             null
         } ?: BuildConfig.VERSION_NAME
-        "Clairix/$version (github.com/jakes1345/Aegis)"
+        "Clairix/$version (github.com/jakes1345/Clairix)"
     }
 
     /**

@@ -57,7 +57,7 @@ export function invitePage(): string {
     <div class="card">
       <ol>
         <li><b>Install Clairix</b> (Android 12 or newer). Skip this if you have it.
-          <a class="button secondary" href="https://github.com/jakes1345/Aegis/releases/latest" rel="noopener">DOWNLOAD CLAIRIX</a></li>
+          <a class="button secondary" href="https://github.com/jakes1345/Clairix/releases/latest" rel="noopener">DOWNLOAD CLAIRIX</a></li>
         <li><b>Open the invite in Clairix.</b> It fills everything in; tap REGISTER.
           <a class="button primary" id="open" href="#">OPEN IN CLAIRIX</a></li>
       </ol>

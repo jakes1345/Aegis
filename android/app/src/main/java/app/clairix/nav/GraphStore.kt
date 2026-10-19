@@ -54,7 +54,7 @@ sealed interface GraphDownload {
 class GraphStore(context: Context) {
 
     companion object {
-        private const val RELEASE_BASE = "https://github.com/jakes1345/Aegis/releases/download"
+        private const val RELEASE_BASE = "https://github.com/jakes1345/Clairix/releases/download"
         private const val HEADER_BYTES = 128
         private const val GRAPH_VERSION = 2
         private val SHA256_RE = Regex("^[0-9a-fA-F]{64}$")

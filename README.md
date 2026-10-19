@@ -23,7 +23,7 @@ There are two ways to run it:
 
 | | What | Where |
 |---|---|---|
-| **Android app** | Tracker, Wi-Fi, cell, NFC and hidden-camera detection; stalkerware and device health checks; card vault; COMMS with groups, shared threats and SOS | `android/`, APK on the [Releases](https://github.com/jakes1345/Aegis/releases) page |
+| **Android app** | Tracker, Wi-Fi, cell, NFC and hidden-camera detection; stalkerware and device health checks; card vault; COMMS with groups, shared threats and SOS | `android/`, APK on the [Releases](https://github.com/jakes1345/Clairix/releases) page |
 | **Desktop tool** (`track-detect`) | Bluetooth, Wi-Fi, SDR radio sweep, cellular and GPS detection from a laptop, including hidden LTE and satellite trackers found by radio sweep | `src/` (Node.js) |
 
 The COMMS relay (`comms-worker/`) and its encryption library (`comms-crypto/`) support the app.
@@ -33,7 +33,7 @@ The COMMS relay (`comms-worker/`) and its encryption library (`comms-crypto/`) s
 ## Android app
 
 Android 12 or newer. Download the latest `clairix-vX.Y.Z.apk` from
-[Releases](https://github.com/jakes1345/Aegis/releases/latest) and tap it. Updates install
+[Releases](https://github.com/jakes1345/Clairix/releases/latest) and tap it. Updates install
 over the previous version.
 
 ### Two editions
